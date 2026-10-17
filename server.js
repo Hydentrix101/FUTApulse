@@ -17,6 +17,7 @@ const CLIENT_DIST = path.join(ROOT, "client", "dist");
 const DATA_DIR = path.join(ROOT, "data");
 const DATA_FILE = process.env.FUTAPULSE_DATA_FILE || path.join(DATA_DIR, "futapulse.json");
 const app = express();
+let databaseBackend = "local";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 // Google Identity Services popup code flow exchanges the code against the
@@ -81,12 +82,22 @@ function ensureDatabase() {
   }
 }
 
+function assertLocalStorageAvailable() {
+  if (databaseBackend === "mongodb" && mongoose.connection.readyState !== 1) {
+    const error = new Error("MongoDB is temporarily unavailable; refusing to use stale local JSON data.");
+    error.code = "MONGO_UNAVAILABLE";
+    throw error;
+  }
+}
+
 function readDatabase() {
+  assertLocalStorageAvailable();
   ensureDatabase();
   return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
 }
 
 function writeDatabase(database) {
+  assertLocalStorageAvailable();
   ensureDatabase();
   const temporaryFile = `${DATA_FILE}.tmp`;
   fs.writeFileSync(temporaryFile, JSON.stringify(database, null, 2));
@@ -318,10 +329,10 @@ eventReportSchema.index({ status: 1, updatedAt: -1 });
 const EventReport = mongoose.models.FutapulseEventReport
   || mongoose.model("FutapulseEventReport", eventReportSchema, "event_reports");
 
-// Keep production blocked until event/report/engagement route handlers have
-// completed their MongoDB repository cutover. This prevents a Mongo-connected
-// production API from silently serving event state out of a local JSON file.
-const OPERATIONAL_MONGO_CUTOVER_COMPLETE = false;
+// Production remains gated until the local migration has been applied and the
+// Mongo-backed auth, events, reports, and engagement paths have been smoke-tested.
+// This is an explicit deployment acknowledgment, not an automatic migration.
+const OPERATIONAL_MONGO_CUTOVER_COMPLETE = process.env.FUTAPULSE_MONGO_CUTOVER_COMPLETE === "true";
 
 function isMongoConnected() {
   return mongoose.connection.readyState === 1;
@@ -469,11 +480,13 @@ async function deleteStoredEventsForOwner(ownerUserId) {
   }
   const ownedRecords = await EventRecord.find({ ownerUserId }).select("eventId").lean().exec();
   const eventIds = ownedRecords.map((item) => item.eventId);
-  if (!eventIds.length) return;
   await Promise.all([
-    EventRecord.deleteMany({ eventId: { $in: eventIds } }).exec(),
-    EventReport.deleteMany({ eventId: { $in: eventIds } }).exec(),
-    EngagementAction.deleteMany({ eventId: { $in: eventIds } }).exec()
+    eventIds.length ? EventRecord.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
+    eventIds.length ? EventReport.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
+    EngagementAction.deleteMany({ $or: [
+      { userId: ownerId },
+      ...(eventIds.length ? [{ eventId: { $in: eventIds } }] : [])
+    ] }).exec()
   ]);
 }
 
@@ -768,8 +781,8 @@ app.get("/api/health", (request, response) => {
   response.json({
     ok: true,
     service: "futapulse-api",
-    database: isMongoConnected() ? "mongodb" : "local-fallback",
-    databaseConnected: isMongoConnected(),
+    database: databaseBackend === "mongodb" ? "mongodb" : "local-fallback",
+    databaseConnected: databaseBackend === "mongodb" ? isMongoConnected() : true,
     timestamp: new Date().toISOString()
   });
 });
@@ -794,7 +807,7 @@ app.post("/api/auth/username-availability", async (request, response) => {
     return response.status(400).json({
       valid: false,
       available: false,
-      message: "Use 3–24 characters with at least one letter. Accents and letters from any language are supported."
+      message: "Use 3â€“24 characters with at least one letter. Accents and letters from any language are supported."
     });
   }
   try {
@@ -865,7 +878,7 @@ app.post("/api/profile/setup", async (request, response) => {
       ? body.displayName.trim()
       : submittedName || user.profile?.name || user.username;
     if (!isValidUsername(displayName) || !isValidUsername(requestedUsername)) {
-      return response.status(400).json({ error: "Use 3–24 characters with at least one letter. Accents and letters from any language are supported." });
+      return response.status(400).json({ error: "Use 3â€“24 characters with at least one letter. Accents and letters from any language are supported." });
     }
     const usernameChanges = Number(user.usernameChanges) || 0;
     const usernameChanged = requestedUsername !== user.username;
@@ -947,7 +960,7 @@ app.patch("/api/auth/profile", async (request, response) => {
       ? profile.name.trim()
       : submittedName;
     if (!isValidUsername(displayName) || !isValidUsername(requestedUsername)) {
-      return response.status(400).json({ error: "Use 3–24 characters with at least one letter. Accents and letters from any language are supported." });
+      return response.status(400).json({ error: "Use 3â€“24 characters with at least one letter. Accents and letters from any language are supported." });
     }
     const profileWithUsername = { ...profile, name: displayName };
     if (!validateProfile(profileWithUsername)) {
@@ -1225,7 +1238,7 @@ app.post("/api/auth/signup", async (request, response) => {
   const password = typeof body.password === "string" ? body.password : "";
   const remember = body.remember === true;
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return response.status(400).json({ error: "Enter a valid email address." });
-  if (!isValidUsername(displayName)) return response.status(400).json({ error: "Use 3–24 characters with at least one letter. Accents and letters from any language are supported." });
+  if (!isValidUsername(displayName)) return response.status(400).json({ error: "Use 3â€“24 characters with at least one letter. Accents and letters from any language are supported." });
   if (!isValidNewPassword(password)) return response.status(400).json({ error: "Use more than 6 characters, at least one uppercase letter, and at least one number." });
 
   try {
@@ -1446,7 +1459,7 @@ app.post("/api/auth/google", async (request, response) => {
         return response.status(200).json({ usernameRequired: true, email, name: identity.name || "", signupToken });
       }
       if (!isValidUsername(displayName)) {
-        return response.status(400).json({ error: "Use 3–24 characters with at least one letter. Accents and letters from any language are supported." });
+        return response.status(400).json({ error: "Use 3â€“24 characters with at least one letter. Accents and letters from any language are supported." });
       }
       if (await findUserByUsername(username)) return response.status(409).json({ error: "That username is already taken." });
       user = await createUser({
@@ -1478,10 +1491,11 @@ app.get("/api/events", async (request, response) => {
     const authorization = request.get("authorization") || "";
     const user = authorization.startsWith("Bearer ") ? await getAuthenticatedUser(request) : null;
     if (authorization.startsWith("Bearer ") && !user) return response.status(401).json({ error: "Session is no longer valid." });
-    const database = readDatabase();
+    const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
+    const viewerId = user ? String(user._id || user.id) : "";
+    const storedEvents = await listStoredEvents(viewerId);
     const level = request.query.level;
     const category = request.query.category;
-    const storedEvents = await listStoredEvents(user ? String(user._id || user.id) : "");
     let events = storedEvents.filter((event) => {
       const isOwnerDraft = Boolean(user && event.status === "Draft" && String(event.createdByUserId || "") === String(user._id || user.id));
       return isOwnerDraft
@@ -1490,7 +1504,6 @@ app.get("/api/events", async (request, response) => {
     if (level) events = events.filter((event) => !event.audience || event.audience.includes("all") || event.audience.includes(level));
     if (category && category !== "all") events = events.filter((event) => event.category === category);
     events = await decorateEventsWithCurrentOrganizers(events, database);
-    const viewerId = user ? String(user._id || user.id) : "";
     return response.json({ events: events.map((event) => toPublicEvent(event, viewerId)) });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
@@ -1847,6 +1860,7 @@ app.post("/api/admin/event-reports/:eventId/decision", async (request, response)
 });
 
 app.patch("/api/events/:eventId/engagement", async (request, response) => {
+  try {
   const type = request.body?.type;
   const counter = ENGAGEMENT_COUNTERS[type];
   if (!counter) {
@@ -1869,24 +1883,43 @@ app.patch("/api/events/:eventId/engagement", async (request, response) => {
     return response.status(400).json({ error: "Hype and reminder interactions must specify enabled as true or false." });
   }
 
-  const database = readDatabase();
-  const eventIndex = database.events.findIndex((item) => item.id === request.params.eventId);
-  if (eventIndex < 0) return response.status(404).json({ error: "Event not found." });
+  const eventId = String(request.params.eventId);
+  const userId = String(user._id || user.id);
+  const enabled = type === "rsvp" ? request.body.attending : request.body.enabled;
+  if (isMongoConnected()) {
+    const event = await findStoredEvent(eventId);
+    if (!event) return response.status(404).json({ error: "Event not found." });
+    const action = { eventId, userId, type };
+    if (enabled) {
+      try {
+        await EngagementAction.updateOne(action, { $set: { faculty: String(user.profile?.faculty || "").trim().slice(0, 80) } }, { upsert: true }).exec();
+      } catch (error) {
+        // The unique compound index makes repeated or racing enables idempotent.
+        if (error.code !== 11000) throw error;
+      }
+    } else {
+      await EngagementAction.deleteOne(action).exec();
+    }
+    const updatedEvent = (await listStoredEvents(userId)).find((item) => String(item.id) === eventId);
+    if (!updatedEvent) return response.status(404).json({ error: "Event not found." });
+    const [decoratedEvent] = await decorateEventsWithCurrentOrganizers([updatedEvent], { users: [], events: [] });
+    return response.json({ event: toPublicEvent(decoratedEvent, userId) });
+  }
 
+  const database = readDatabase();
+  const eventIndex = database.events.findIndex((item) => String(item.id) === eventId);
+  if (eventIndex < 0) return response.status(404).json({ error: "Event not found." });
   const event = database.events[eventIndex];
   let changed = false;
-  const userId = String(user._id || user.id);
   if (type === "rsvp") {
     const attendeeUserIds = Array.isArray(event.attendeeUserIds) ? event.attendeeUserIds.map(String) : [];
     const alreadyAttending = attendeeUserIds.includes(userId);
-    const enabled = request.body.attending;
     if (alreadyAttending !== enabled) {
       event.attendeeUserIds = enabled
         ? [...new Set([...attendeeUserIds, userId])]
         : attendeeUserIds.filter((attendeeId) => attendeeId !== userId);
-      const currentCount = Number(event.rsvpCount ?? event.turnoutCount) || 0;
       const attendanceDelta = enabled ? 1 : -1;
-      event.rsvpCount = Math.max(0, currentCount + attendanceDelta);
+      event.rsvpCount = Math.max(0, (Number(event.rsvpCount ?? event.turnoutCount) || 0) + attendanceDelta);
       event.turnoutCount = event.rsvpCount;
       const faculty = String(user.profile?.faculty || "").trim().slice(0, 80);
       if (faculty) event.turnoutBreakdown = updateFacultyTurnoutBreakdown(event.turnoutBreakdown, faculty, attendanceDelta);
@@ -1896,7 +1929,6 @@ app.patch("/api/events/:eventId/engagement", async (request, response) => {
     const userIdsKey = type === "flame" ? "hypedUserIds" : "reminderUserIds";
     const userIds = Array.isArray(event[userIdsKey]) ? [...new Set(event[userIdsKey].map(String))] : [];
     const wasEnabled = userIds.includes(userId);
-    const enabled = request.body.enabled;
     if (wasEnabled !== enabled) {
       event[userIdsKey] = enabled ? [...userIds, userId] : userIds.filter((id) => id !== userId);
       event[counter] = Math.max(0, (Number(event[counter]) || 0) + (enabled ? 1 : -1));
@@ -1909,12 +1941,14 @@ app.patch("/api/events/:eventId/engagement", async (request, response) => {
     event.isHot = event.hotScore >= HOT_EVENT_THRESHOLD;
     writeDatabase(database);
   }
-  try {
-    const [updatedEvent] = await decorateEventsWithCurrentOrganizers([event], database);
-    return response.json({ event: toPublicEvent(updatedEvent, userId) });
+  const [updatedEvent] = await decorateEventsWithCurrentOrganizers([event], database);
+  return response.json({ event: toPublicEvent(updatedEvent, userId) });
   } catch (error) {
-    console.error("Event engagement was saved but organizer details could not be refreshed.", error);
-    return response.status(500).json({ error: "Engagement was saved, but updated event details could not be loaded." });
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
+    }
+    console.error("Event engagement update failed.", error);
+    return response.status(500).json({ error: "Unable to update this event interaction right now." });
   }
 });
 
@@ -1923,11 +1957,31 @@ app.post("/api/events/:eventId/hype", async (request, response) => {
     const user = await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in to hype this event." });
     if (typeof request.body?.enabled !== "boolean") return response.status(400).json({ error: "Specify whether hype should be turned on or off." });
+    const eventId = String(request.params.eventId);
+    const userId = String(user._id || user.id);
+    if (isMongoConnected()) {
+      const event = await findStoredEvent(eventId);
+      if (!event) return response.status(404).json({ error: "Event not found." });
+      const action = { eventId, userId, type: "flame" };
+      if (request.body.enabled) {
+        try {
+          await EngagementAction.updateOne(action, { $set: { faculty: String(user.profile?.faculty || "").trim().slice(0, 80) } }, { upsert: true }).exec();
+        } catch (error) {
+          if (error.code !== 11000) throw error;
+        }
+      } else {
+        await EngagementAction.deleteOne(action).exec();
+      }
+      const updatedEvent = (await listStoredEvents(userId)).find((item) => String(item.id) === eventId);
+      if (!updatedEvent) return response.status(404).json({ error: "Event not found." });
+      const [decoratedEvent] = await decorateEventsWithCurrentOrganizers([updatedEvent], { users: [], events: [] });
+      return response.json({ event: toPublicEvent(decoratedEvent, userId), hypeCount: updatedEvent.flameCount || 0 });
+    }
+
     const database = readDatabase();
-    const eventIndex = database.events.findIndex((item) => item.id === request.params.eventId);
+    const eventIndex = database.events.findIndex((item) => String(item.id) === eventId);
     if (eventIndex < 0) return response.status(404).json({ error: "Event not found." });
     const event = database.events[eventIndex];
-    const userId = String(user._id || user.id);
     const hypedUserIds = Array.isArray(event.hypedUserIds) ? [...new Set(event.hypedUserIds.map(String))] : [];
     const wasHyped = hypedUserIds.includes(userId);
     if (wasHyped !== request.body.enabled) {
@@ -1942,7 +1996,7 @@ app.post("/api/events/:eventId/hype", async (request, response) => {
     return response.json({ event: toPublicEvent(updatedEvent, userId), hypeCount: event.flameCount || 0 });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
-    console.error("Event hype was saved but organizer details could not be refreshed.", error);
+    console.error("Event hype update failed.", error);
     return response.status(500).json({ error: "Unable to update event hype right now." });
   }
 });
@@ -1986,6 +2040,7 @@ function startServer() {
   return mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 5000 })
     .then(async () => {
       await Promise.all([User.init(), EmailChallenge.init(), EventRecord.init(), EngagementAction.init(), EventReport.init()]);
+      databaseBackend = "mongodb";
       console.log("FUTApulse connected to MongoDB and verified indexes.");
       return listen();
     })
