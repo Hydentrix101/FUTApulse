@@ -66,6 +66,8 @@ function FacultyBadge({ faculty, count }) {
           <img
             src={logoSrc}
             alt={`${faculty} crest`}
+            loading="lazy"
+            decoding="async"
             className="h-full w-full object-cover"
             onError={() => setImageFallbackStage((stage) => Math.min(stage + 1, 3))}
           />
@@ -225,6 +227,8 @@ function EventCard({ event, onComing, onRemind, onReport, viewerProfile, isHot =
               <img
                 src={organizerImageSrc}
                 alt=""
+                loading="lazy"
+                decoding="async"
                 className="organizer-avatar relative z-[1] h-full w-full object-cover"
                 onError={() => setOrganizerFallback((current) => ({
                   source: organizerPicture,
@@ -258,6 +262,8 @@ function EventCard({ event, onComing, onRemind, onReport, viewerProfile, isHot =
           <img
             src={bannerSource}
             alt={`${title} event`}
+            loading="lazy"
+            decoding="async"
             className="h-full w-full object-contain"
             onError={() => setUnavailableBannerSource(bannerSource)}
           />

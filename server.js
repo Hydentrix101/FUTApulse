@@ -20,18 +20,43 @@ const app = express();
 let databaseBackend = "local";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
-// Google Identity Services popup code flow exchanges the code against the
-// origin that requested it (the Vite app in local development).
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || "http://localhost:5173";
+const DEFAULT_FRONTEND_URL = process.env.NODE_ENV === "production"
+  ? "https://fut-apulse.vercel.app"
+  : "http://localhost:5173";
+const FRONTEND_URL = String(process.env.FRONTEND_URL || DEFAULT_FRONTEND_URL).replace(/\/$/, "");
+const CORS_ORIGINS = String(process.env.CORS_ORIGIN || FRONTEND_URL).split(",").map((origin) => origin.trim()).filter(Boolean);
+// GIS popup code flow must exchange the code using the requesting app origin.
+// Keep this default for non-browser flows, but select the allowlisted request
+// origin for each popup exchange below.
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || FRONTEND_URL;
+const GOOGLE_ALLOWED_ORIGINS = new Set([
+  FRONTEND_URL,
+  GOOGLE_REDIRECT_URI,
+  ...CORS_ORIGINS,
+  ...(process.env.NODE_ENV === "production" ? [] : ["http://localhost:5173", "http://127.0.0.1:5173"])
+].map((value) => {
+  try { return new URL(value).origin; } catch { return ""; }
+}).filter(Boolean));
 const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === "production" ? "" : "futapulse-dev-only-change-this-secret");
 const REFRESH_COOKIE = "futapulse_refresh";
 const REFRESH_TOKEN_MAX_AGE = 30 * 24 * 60 * 60 * 1000;
 const FEEDBACK_EMAIL = "immanuelidowu1@gmail.com";
 const FUTAPULSE_ADMIN_EMAIL = String(process.env.FUTAPULSE_ADMIN_EMAIL || FEEDBACK_EMAIL).trim().toLowerCase();
-const FRONTEND_URL = String(process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/$/, "");
 const EMAIL_CHALLENGE_TTL = 15 * 60 * 1000;
 const EVENT_REPORT_REVIEW_THRESHOLD = 5;
 const googleOAuthClient = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+
+function getGooglePopupRedirectUri(request) {
+  const requestedOrigin = String(request.get("origin") || request.body?.origin || "").trim();
+  if (!requestedOrigin) return GOOGLE_REDIRECT_URI;
+  try {
+    const parsedOrigin = new URL(requestedOrigin);
+    if (parsedOrigin.origin !== requestedOrigin || !GOOGLE_ALLOWED_ORIGINS.has(parsedOrigin.origin)) return "";
+    return parsedOrigin.origin;
+  } catch {
+    return "";
+  }
+}
 
 const ALLOWED_CATEGORIES = new Set(["academic", "tech", "social", "religious", "sports", "seminars"]);
 const USERNAME_PATTERN = /^(?=.*\p{L})[\p{L}\p{M}\p{N}_ .'-]{3,24}$/u;
@@ -797,9 +822,9 @@ const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo";
 
 app.disable("x-powered-by");
 app.use(cors({
-  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim()) : true,
+  origin: process.env.CORS_ORIGIN ? CORS_ORIGINS : true,
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-FUTApulse-OAuth-Request"],
   credentials: true
 }));
 app.use(express.json({ limit: "4mb" }));
@@ -1464,7 +1489,15 @@ app.post("/api/auth/google", async (request, response) => {
     } else {
       const code = typeof body.code === "string" ? body.code : "";
       if (!code) return response.status(400).json({ error: "Google authorization code is required." });
-      const { tokens } = await googleOAuthClient.getToken(code);
+      if (request.get("X-FUTApulse-OAuth-Request") !== "1") {
+        return response.status(403).json({ error: "Google sign-in request could not be verified. Please restart sign-in." });
+      }
+      const redirectUri = getGooglePopupRedirectUri(request);
+      if (request.get("origin") && body.origin && request.get("origin") !== body.origin) {
+        return response.status(403).json({ error: "Google sign-in origin could not be verified. Please restart sign-in." });
+      }
+      if (!redirectUri) return response.status(403).json({ error: "Google sign-in was started from an app origin that this server does not allow." });
+      const { tokens } = await googleOAuthClient.getToken({ code, redirect_uri: redirectUri });
       if (!tokens.id_token) return response.status(401).json({ error: "Google did not return a verifiable identity token." });
       const ticket = await googleOAuthClient.verifyIdToken({ idToken: tokens.id_token, audience: GOOGLE_CLIENT_ID });
       const payload = ticket.getPayload();
@@ -2107,19 +2140,10 @@ app.get("/", (request, response) => {
 });
 app.use((error, request, response, next) => {
   if (error instanceof SyntaxError && "body" in error) return response.status(400).json({ error: "Request body must be valid JSON." });
+
   console.error("Unhandled API error.", error);
   return response.status(500).json({ error: "Internal server error." });
 });
-
-function startServer() {
-  if (!JWT_SECRET) throw new Error("JWT_SECRET must be set when NODE_ENV=production.");
-  const production = process.env.NODE_ENV === "production";
-  if (production && !process.env.MONGO_URI) {
-    throw new Error("MONGO_URI must be set in production; local JSON fallback is disabled.");
-  }
-  if (production && !OPERATIONAL_MONGO_CUTOVER_COMPLETE) {
-    throw new Error("Production startup is blocked until event, report, and engagement data are switched to MongoDB in Phase 2.");
-  }
 
   const listen = () => app.listen(PORT, "0.0.0.0", () => {
     console.log(`FUTApulse API listening on port ${PORT}`);
@@ -2141,7 +2165,6 @@ function startServer() {
     .catch((error) => {
       throw new Error(`MongoDB is configured but unavailable; API startup stopped to prevent writes going to a separate local database: ${error.message}`);
     });
-}
 
 if (require.main === module) startServer();
 

@@ -107,10 +107,10 @@ These are accepted product requirements or queued design tasks. They are not all
 
 **Purpose:** Make the app reachable from student phones over the internet.
 
-- **Selected hosts:** Render for the Express API and Vercel for the Vite + React client. Keep this phase as deployment preparation until the Render service URL and Vercel project URL are known.
+- **Selected hosts:** Render for the Express API at `https://futapulse.onrender.com` and Vercel for the Vite + React client. Deployment preparation is recorded; the Vercel production origin is still needed for the final OAuth/CORS allowlist.
 - Deploy the Express API on Render from the repository root with `npm start`, the platform-provided `PORT`, and health check `/api/ready`. The server binds to `0.0.0.0`; keep `/api/ready` dependent on MongoDB readiness and the cutover flag.
 - Deploy the Vite client on Vercel with the project Root Directory set to `client`, build command `npm run build`, and output directory `dist`. Put Vercel routing configuration in `client/vercel.json` because `client/` is the Vercel project root.
-- **Use a same-origin API proxy for production cookies.** Configure `client/vercel.json` with an external rewrite from `/api/:path*` to `https://<your-render-service>.onrender.com/api/:path*`. This keeps the browser request URL on the Vercel origin while Vercel forwards it to Render. The exact Render hostname must be filled in after the Render service is created; do not use a guessed hostname.
+- **Use a same-origin API proxy for production cookies.** `client/vercel.json` rewrites `/api/:path*` to `https://futapulse.onrender.com/api/:path*`. This keeps the browser request URL on the Vercel origin while Vercel forwards it to Render.
 - In Vercel Production (and Preview only when preview deployments are intentionally supported), leave `VITE_API_BASE_URL` unset or set it to an empty value. The client then sends `/api/...` requests to its own origin, through the rewrite. Do **not** set this variable to the unrelated `*.onrender.com` host for the browser client: that makes auth cross-site and prevents the current `SameSite=Lax` refresh cookie from being sent reliably. Keep `http://localhost:3001` only in local development. Vite variables are embedded at build time, so changes require a new deployment.
 - The API uses a host-only, `HttpOnly`, `Secure` production refresh cookie with `SameSite=Lax` and path `/api/auth`. With the Vercel proxy, the browser receives it from and sends it to the Vercel origin; no cross-site cookie relaxation or cookie `Domain` override should be needed. Keep `credentials: 'include'` on client requests.
 - Set Render `CORS_ORIGIN` to the exact Vercel production origin (for example, `https://<project>.vercel.app`) and, only if needed, explicitly listed Vercel preview/custom origins. Never use `*` with credentialed requests. The Vercel proxy makes normal API calls same-origin from the browser; the allowlist remains a defense-in-depth configuration for direct requests and future clients.
@@ -122,7 +122,6 @@ These are accepted product requirements or queued design tasks. They are not all
 
 ### Phase 3 deployment values still needed
 
-- Render public API origin, used as the target in `client/vercel.json` (for example, `https://<service>.onrender.com`).
 - Vercel production origin, used in Render `CORS_ORIGIN`, `FRONTEND_URL`, `GOOGLE_REDIRECT_URI`, and Google Authorized JavaScript origins.
 - Optional custom app domain and any preview origins that should be allowed to sign in.
 

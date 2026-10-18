@@ -1,0 +1,426 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Clock3, Sparkles, X } from 'lucide-react'
+
+const MAX_LOCAL_DRAFT_CHARACTERS = 650_000
+
+function readStored(key, fallback) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || 'null')
+    return value ?? fallback
+  } catch {
+    return fallback
+  }
+}
+
+function safeSetStored(key, value) {
+  try {
+    localStorage.setItem(key, value)
+    return true
+  } catch (error) {
+    console.warn('Could not save the event draft in browser storage.', error)
+    return false
+  }
+}
+
+function createEmptyEvent() {
+  return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', audience: [], status: 'Draft', banner: '', turnoutCount: 0, turnoutBreakdown: [] }
+}
+
+function getEventId(event) {
+  return event.id ?? event._id
+}
+function toLocalDateAndTime(value) {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return { date: '', time: '' }
+  const pad = (number) => String(number).padStart(2, '0')
+  return {
+    date: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    time: `${pad(date.getHours())}:${pad(date.getMinutes())}`,
+  }
+}
+
+function TimeWheelPicker({ label, value, onChange }) {
+  const [open, setOpen] = useState(false)
+  const [hour, setHour] = useState('00')
+  const [minute, setMinute] = useState('00')
+  const hoursRef = useRef(null)
+  const minutesRef = useRef(null)
+  const previousFocusRef = useRef(null)
+  const initialSelectionRef = useRef({ hour: '00', minute: '00' })
+  const hours = useMemo(() => Array.from({ length: 24 }, (_, index) => String(index).padStart(2, '0')), [])
+  const minutes = useMemo(() => Array.from({ length: 60 }, (_, index) => String(index).padStart(2, '0')), [])
+  const openPicker = () => {
+    const valueMatch = /^((?:[01]\d|2[0-3])):([0-5]\d)$/.exec(value || '')
+    const selectedHour = valueMatch?.[1] || '00'
+    const selectedMinute = valueMatch?.[2] || '00'
+    initialSelectionRef.current = { hour: selectedHour, minute: selectedMinute }
+    previousFocusRef.current = document.activeElement
+    setHour(selectedHour)
+    setMinute(selectedMinute)
+    setOpen(true)
+  }
+
+  useEffect(() => {
+    if (!open) return undefined
+    const previousOverflow = document.body.style.overflow
+    let frameId = 0
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.body.style.overflow = 'hidden'
+    window.addEventListener('keydown', closeOnEscape)
+    frameId = requestAnimationFrame(() => {
+      if (hoursRef.current) hoursRef.current.scrollTop = Number(initialSelectionRef.current.hour) * 44
+      if (minutesRef.current) minutesRef.current.scrollTop = Number(initialSelectionRef.current.minute) * 44
+      hoursRef.current?.focus({ preventScroll: true })
+    })
+    return () => {
+      cancelAnimationFrame(frameId)
+      window.removeEventListener('keydown', closeOnEscape)
+      document.body.style.overflow = previousOverflow
+      if (previousFocusRef.current instanceof HTMLElement && previousFocusRef.current.isConnected) {
+        previousFocusRef.current.focus({ preventScroll: true })
+      }
+    }
+  }, [open])
+
+  const updateFromScroll = (items, setSelected) => (event) => {
+    const index = Math.min(items.length - 1, Math.max(0, Math.round(event.currentTarget.scrollTop / 44)))
+    setSelected(items[index])
+  }
+  const onWheelKeyDown = (items, setSelected, selected) => (event) => {
+    const currentIndex = items.indexOf(selected)
+    const nextIndex = event.key === 'ArrowDown' ? Math.min(items.length - 1, currentIndex + 1)
+      : event.key === 'ArrowUp' ? Math.max(0, currentIndex - 1) : -1
+    if (nextIndex < 0) return
+    event.preventDefault()
+    setSelected(items[nextIndex])
+    event.currentTarget.scrollTo({ top: nextIndex * 44, behavior: 'smooth' })
+  }
+
+  return (
+    <>
+      <label className="event-time-label">{label}</label>
+      <button type="button" className="event-time-trigger" aria-haspopup="dialog" aria-label={`${label}: ${value || 'Select time'}`} onClick={openPicker}>
+        <Clock3 size={17} aria-hidden="true" />
+        <span>{value || 'Select time'}</span>
+        <small>24-hour time</small>
+      </button>
+      {open && (
+        <div className="time-picker-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setOpen(false) }}>
+          <section className="time-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="time-picker-title">
+            <span className="explore-eyebrow">SET EVENT TIME</span>
+            <h2 id="time-picker-title">{label}</h2>
+            <div className="time-wheel-group">
+              {[{ label: 'Hours', items: hours, selected: hour, setSelected: setHour, ref: hoursRef },
+                { label: 'Minutes', items: minutes, selected: minute, setSelected: setMinute, ref: minutesRef }].map((wheel) => (
+                <div key={wheel.label} className="time-wheel-column">
+                  <span className="time-wheel-caption">{wheel.label}</span>
+                  <div
+                    className="time-wheel-scroll"
+                    ref={wheel.ref}
+                    role="listbox"
+                    aria-label={`${wheel.label} selection`}
+                    aria-activedescendant={`${wheel.label}-${wheel.selected}`}
+                    tabIndex={0}
+                    onScroll={updateFromScroll(wheel.items, wheel.setSelected)}
+                    onKeyDown={onWheelKeyDown(wheel.items, wheel.setSelected, wheel.selected)}
+                  >
+                    {wheel.items.map((item, index) => (
+                      <div key={item} id={`${wheel.label}-${item}`} className={`time-wheel-option ${wheel.selected === item ? 'is-selected' : ''}`} role="option" aria-selected={wheel.selected === item} onClick={() => { wheel.setSelected(item); wheel.ref.current?.scrollTo({ top: index * 44, behavior: 'smooth' }) }}>
+                        {item}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="time-picker-actions">
+              <button type="button" className="profile-edit-pill" onClick={() => setOpen(false)}>Cancel</button>
+              <button type="button" className="setup-submit" onClick={() => { onChange(`${hour}:${minute}`); setOpen(false) }}>Done</button>
+            </div>
+          </section>
+        </div>
+      )}
+    </>
+  )
+}
+
+function EventEditor({
+  categories = [],
+  event,
+  saving,
+  compressBanner,
+  bannerInput,
+  owner,
+  duplicateState,
+  onClearDuplicates,
+  onOpenDuplicate,
+  onClose,
+  onAutoSave,
+  onSave,
+}) {
+  const draftKey = `futapulse-event-editor-draft:${owner}:${event.id || 'new'}`
+  const publishedAtOpen = ['Published', 'Live'].includes(event.status)
+  const [form, setForm] = useState(() => {
+    const start = toLocalDateAndTime(event.startTime || event.date || '')
+    const end = toLocalDateAndTime(event.endTime || '')
+    const initial = {
+      ...createEmptyEvent(),
+      ...event,
+      audience: Array.isArray(event.audience) ? event.audience : String(event.audience || '').split(',').filter(Boolean),
+      date: start.date,
+      startClock: start.time,
+      endDateTime: end.date,
+      endClock: end.time,
+    }
+    if (publishedAtOpen) return initial
+    const savedDraft = readStored(draftKey, null)
+    return savedDraft && typeof savedDraft === 'object'
+      ? { ...initial, ...savedDraft, id: event.id || savedDraft.id || '' }
+      : initial
+  })
+  const [banner, setBanner] = useState('')
+  const formRef = useRef(form)
+  const bannerRef = useRef(banner)
+  useEffect(() => { formRef.current = form }, [form])
+  useEffect(() => { bannerRef.current = banner }, [banner])
+  const [error, setError] = useState('')
+  const [draftSaved, setDraftSaved] = useState(false)
+  const [draftSyncing, setDraftSyncing] = useState(false)
+  const [draftSyncError, setDraftSyncError] = useState('')
+  const hasEditedRef = useRef(Boolean(event.id || form.title || form.category || form.activity || form.date || form.venue || form.meetingUrl || form.banner))
+  const onAutoSaveRef = useRef(onAutoSave)
+  const draftAutoSaveTimerRef = useRef(null)
+  useEffect(() => { onAutoSaveRef.current = onAutoSave }, [onAutoSave])
+  const persistLocalDraft = useCallback((draftForm = formRef.current, draftBanner = bannerRef.current) => {
+    if (publishedAtOpen || !hasEditedRef.current) return false
+    const snapshot = { ...draftForm, status: 'Draft', banner: draftBanner || draftForm.banner || '' }
+    const serialized = JSON.stringify(snapshot)
+    if (serialized.length > MAX_LOCAL_DRAFT_CHARACTERS) {
+      setDraftSaved(false)
+      setError('This draft is too large to save on this device. Use a smaller banner image.')
+      return false
+    }
+    const saved = safeSetStored(draftKey, serialized)
+    setDraftSaved(saved)
+    if (!saved) setError('This draft could not be autosaved on this device. Check available browser storage.')
+    return saved
+  }, [draftKey, publishedAtOpen])
+  const update = (field, value) => {
+    onClearDuplicates?.()
+    hasEditedRef.current = true
+    const next = { ...formRef.current, [field]: value }
+    formRef.current = next
+    setForm(next)
+  }
+  const updateBanner = (value) => {
+    hasEditedRef.current = true
+    bannerRef.current = value
+    setBanner(value)
+  }
+  const createSavePayload = (status, allowSimilar = false) => {
+    const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
+    const endDateTime = form.endDateTime && form.endClock ? `${form.endDateTime}T${form.endClock}` : ''
+    return { ...form, date: startDateTime, endDateTime, status, allowSimilar }
+  }
+
+  useEffect(() => {
+    if (publishedAtOpen || saving) return undefined
+    const snapshot = { ...form, status: 'Draft', banner: banner || form.banner || '' }
+    if (!hasEditedRef.current) return undefined
+    const localSaved = () => {
+      try {
+        const serialized = JSON.stringify(snapshot)
+        if (serialized.length > MAX_LOCAL_DRAFT_CHARACTERS) {
+          setDraftSaved(false)
+          setError('This draft is too large to save on this device. Use a smaller banner image.')
+          return
+        }
+        const saved = safeSetStored(draftKey, serialized)
+        setDraftSaved(saved)
+        if (!saved) setError('This draft could not be autosaved on this device. Check available browser storage.')
+      } catch (saveError) {
+        console.error('Unable to autosave this event draft locally.', saveError)
+        setDraftSaved(false)
+        setError('This draft could not be autosaved on this device. Check available browser storage.')
+      }
+    }
+    const localSaveTimer = window.setTimeout(localSaved, 250)
+    draftAutoSaveTimerRef.current = window.setTimeout(async () => {
+      localSaved()
+      setDraftSyncing(true)
+      try {
+        const startDateTime = snapshot.date && snapshot.startClock ? `${snapshot.date}T${snapshot.startClock}` : ''
+        const endDateTime = snapshot.endDateTime && snapshot.endClock ? `${snapshot.endDateTime}T${snapshot.endClock}` : ''
+        const saved = await onAutoSaveRef.current({ ...snapshot, date: startDateTime, endDateTime }, snapshot.banner)
+        if (saved?.id) {
+          const syncedSnapshot = { ...snapshot, id: saved.id }
+          safeSetStored(draftKey, JSON.stringify(syncedSnapshot))
+          setForm((current) => current.id ? current : { ...current, id: saved.id })
+        }
+        setDraftSyncError('')
+      } catch (saveError) {
+        setDraftSyncError(saveError.message || 'Draft sync failed. It is saved on this device.')
+      } finally {
+        setDraftSyncing(false)
+      }
+    }, 850)
+    return () => {
+      window.clearTimeout(localSaveTimer)
+      window.clearTimeout(draftAutoSaveTimerRef.current)
+    }
+  }, [draftKey, form, banner, publishedAtOpen, saving])
+
+  useEffect(() => {
+    const flushDraft = () => { persistLocalDraft(formRef.current, bannerRef.current) }
+    window.addEventListener('pagehide', flushDraft)
+    document.addEventListener('visibilitychange', flushDraft)
+    return () => {
+      window.removeEventListener('pagehide', flushDraft)
+      document.removeEventListener('visibilitychange', flushDraft)
+    }
+  }, [draftKey, publishedAtOpen, persistLocalDraft])
+
+  const closeEditor = async () => {
+    window.clearTimeout(draftAutoSaveTimerRef.current)
+    if (!publishedAtOpen && hasEditedRef.current) {
+      const currentForm = formRef.current
+      const currentBanner = bannerRef.current || currentForm.banner || ''
+      persistLocalDraft(currentForm, currentBanner)
+      const startDateTime = currentForm.date && currentForm.startClock ? `${currentForm.date}T${currentForm.startClock}` : ''
+      const endDateTime = currentForm.endDateTime && currentForm.endClock ? `${currentForm.endDateTime}T${currentForm.endClock}` : ''
+      try {
+        const saved = await onAutoSaveRef.current({ ...currentForm, date: startDateTime, endDateTime, status: 'Draft' }, currentBanner)
+        if (saved?.id) {
+          const syncedDraft = { ...currentForm, id: saved.id, status: 'Draft', banner: currentBanner }
+          formRef.current = syncedDraft
+          setForm((current) => current.id ? current : { ...current, id: saved.id })
+          safeSetStored(draftKey, JSON.stringify(syncedDraft))
+        }
+      } catch (saveError) {
+        setDraftSyncError(saveError.message || 'Draft sync failed. It is saved on this device.')
+      }
+    }
+    onClose()
+  }
+
+  const submit = async (eventSubmit) => {
+    eventSubmit.preventDefault()
+    setError('')
+    try {
+      const status = eventSubmit.nativeEvent.submitter?.dataset.status || 'Published'
+      const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
+      const endDateTime = form.endDateTime && form.endClock ? `${form.endDateTime}T${form.endClock}` : ''
+      if (status === 'Published' && (!startDateTime || !endDateTime)) throw new Error('Choose both the event start and end date and time.')
+      if (status === 'Published' && new Date(endDateTime).getTime() <= new Date(startDateTime).getTime()) {
+        throw new Error('The event end time must be later than the start time.')
+      }
+      const saved = await onSave({ ...form, date: startDateTime, endDateTime, status, allowSimilar: false }, banner)
+      if (saved) {
+        localStorage.removeItem(draftKey)
+        setDraftSaved(false)
+      }
+    } catch (saveError) {
+      setError(saveError.message || 'Unable to save event.')
+    }
+  }
+
+  const saveDraft = async () => {
+    const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
+    const endDateTime = form.endDateTime && form.endClock ? `${form.endDateTime}T${form.endClock}` : ''
+    try {
+      const saved = await onSave({ ...form, date: startDateTime, endDateTime, status: 'Draft' }, banner)
+      if (saved) {
+        localStorage.removeItem(draftKey)
+        setDraftSaved(false)
+      }
+    } catch (saveError) {
+      setError(saveError.message || 'Unable to save event draft.')
+    }
+  }
+
+  return (
+    <div className="sheet-backdrop" role="presentation" onMouseDown={(eventClick) => { if (eventClick.target === eventClick.currentTarget) void closeEditor() }}>
+      <section className="event-creation-panel glass-panel" role="dialog" aria-modal="true" aria-labelledby="event-editor-title">
+        <button type="button" className="sheet-close" aria-label="Close event creation" onClick={() => { void closeEditor() }}><X size={18} /></button>
+        <span className="eyebrow-label">EVENT STUDIO</span>
+        <h2 id="event-editor-title">{form.id ? 'Edit campus event' : 'Create a campus event'}</h2>
+        <form className="profile-form" onSubmit={submit}>
+          <label htmlFor="event-title">Event title</label><input id="event-title" value={form.title} onChange={(eventChange) => update('title', eventChange.target.value)} placeholder="Name your event" required />
+          <label htmlFor="event-category">Category</label><select id="event-category" value={form.category} onChange={(eventChange) => update('category', eventChange.target.value)} required><option value="">Select category</option>{categories.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select>
+          <label htmlFor="event-activity">Event activity</label><textarea id="event-activity" rows={3} value={form.activity} onChange={(eventChange) => update('activity', eventChange.target.value)} placeholder="What should students expect?" required />
+          <label htmlFor="event-date">Start date</label><input id="event-date" type="date" value={form.date} onChange={(eventChange) => update('date', eventChange.target.value)} required={form.status !== 'Draft'} />
+          <TimeWheelPicker label="Start time" value={form.startClock} onChange={(value) => update('startClock', value)} />
+          <label htmlFor="event-end-date">End date</label><input id="event-end-date" type="date" value={form.endDateTime} onChange={(eventChange) => update('endDateTime', eventChange.target.value)} required={form.status !== 'Draft'} />
+          <TimeWheelPicker label="End time" value={form.endClock} onChange={(value) => update('endClock', value)} />
+          <label htmlFor="event-venue">Venue</label><input id="event-venue" value={form.venue} onChange={(eventChange) => update('venue', eventChange.target.value)} maxLength={120} placeholder="e.g. LT1 / SEET Complex" required />
+          <label htmlFor="event-landmark">Landmark &amp; directions <span className="optional-field-label">Optional</span></label><textarea id="event-landmark" rows={2} value={form.venueLandmark} onChange={(eventChange) => update('venueLandmark', eventChange.target.value)} maxLength={240} placeholder="Add a nearby landmark or directions students can follow" />
+          {form.category === 'seminars' && <><label htmlFor="event-meeting-url">Online seminar link (optional)</label><input id="event-meeting-url" type="url" inputMode="url" autoComplete="url" maxLength={2048} value={form.meetingUrl || ''} onChange={(eventChange) => update('meetingUrl', eventChange.target.value)} placeholder="https://meet.google.com/..." /><small className="profile-edit-limit">Students can open this link from the full event card.</small></>}
+          <label htmlFor="event-banner">Event banner (optional)</label>
+          <input ref={bannerInput} id="event-banner" type="file" accept="image/*" hidden onChange={async (eventChange) => {
+            const file = eventChange.target.files?.[0]
+            eventChange.target.value = ''
+            if (!file) return
+            if (file.size > 3 * 1024 * 1024) { setError('Choose an event banner smaller than 3 MB.'); eventChange.target.value = ''; return }
+            try {
+              const dataUrl = compressBanner ? await compressBanner(file) : await new Promise((resolve, reject) => {
+                const reader = new FileReader()
+                reader.onload = () => resolve(reader.result)
+                reader.onerror = () => reject(new Error('Unable to read the event banner.'))
+                reader.readAsDataURL(file)
+              })
+              hasEditedRef.current = true
+              updateBanner(dataUrl)
+            } catch (readError) { setError(readError.message) }
+          }} />
+          <button
+            type="button"
+            className={`event-banner-upload ${(banner || form.banner) ? 'has-banner' : ''}`}
+            aria-label={(banner || form.banner) ? 'Change event banner' : 'Upload image'}
+            onClick={() => bannerInput.current?.click()}
+          >
+            {banner || form.banner
+              ? <><img src={banner || form.banner} alt="Selected event banner preview" /><span className="event-banner-action-label">Change event banner</span></>
+              : <><Sparkles size={24} /><strong>Event banner</strong><span>Optional · choose a JPG or PNG up to 3 MB</span><b>Upload image</b></>}
+          </button>
+          {(banner || form.banner) && <button type="button" className="event-banner-clear" onClick={() => { updateBanner(''); update('banner', '') }}>Clear banner</button>}
+          <fieldset className="audience-levels"><legend>Target audience levels</legend>{[['all', 'All levels'], ['100', '100'], ['200', '200'], ['300', '300'], ['400', '400'], ['500', '500']].map(([value, label]) => <label key={value}><input type="checkbox" checked={form.audience.includes(value)} onChange={(eventChange) => update('audience', eventChange.target.checked ? [...form.audience.filter((level) => level !== 'all' && value !== 'all'), value] : form.audience.filter((level) => level !== value))} /> {label}</label>)}</fieldset>
+          {draftSaved && !publishedAtOpen && <p className="event-draft-status" role="status">{draftSyncing ? 'Saving draft…' : draftSyncError ? 'Draft saved on this device; server sync will retry.' : 'Draft saved automatically.'}</p>}
+          {draftSyncError && <p className="form-error" role="status">{draftSyncError}</p>}
+          {duplicateState?.matches?.length > 0 && (
+            <section className={`event-duplicate-notice ${duplicateState.code === 'DUPLICATE_EVENT' ? 'is-blocked' : 'is-advisory'}`} role="alert">
+              <strong>{duplicateState.code === 'DUPLICATE_EVENT' ? 'This event is already posted.' : 'A similar event was found.'}</strong>
+              <p>{duplicateState.code === 'DUPLICATE_EVENT'
+                ? 'The title, category, venue, start and end times, and event description match an existing post. Review it below before continuing.'
+                : 'Review these close matches before confirming that your event is different.'}</p>
+              <div className="event-duplicate-matches">
+                {duplicateState.matches.map(({ event: match, score }) => (
+                  <button key={getEventId(match)} type="button" className="event-duplicate-match" onClick={() => onOpenDuplicate?.(match)}>
+                    <span><strong>{match.title}</strong><small>{match.category} · {match.venue}</small><small>{new Date(match.date || match.startTime).toLocaleString()} – {new Date(match.endTime).toLocaleString()}</small><small>{match.activity}</small></span>
+                    <b>{score}%</b>
+                  </button>
+                ))}
+              </div>
+              {duplicateState.code === 'POSSIBLE_DUPLICATE' && (
+                <button type="button" className="setup-submit event-duplicate-confirm" disabled={saving} onClick={async () => {
+                  const saved = await onSave(createSavePayload('Published', true), banner)
+                  if (saved) {
+                    localStorage.removeItem(draftKey)
+                    setDraftSaved(false)
+                  }
+                }}>
+                  This is a different event — continue publishing
+                </button>
+              )}
+            </section>
+          )}
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="event-form-actions">{!publishedAtOpen && <button type="button" className="event-draft-btn" disabled={saving} onClick={saveDraft}>Save draft</button>}<button className="setup-submit" type="submit" data-status="Published" disabled={saving}>Publish event <span>→</span></button></div>
+        </form>
+      </section>
+    </div>
+  )
+}
+
+export default EventEditor

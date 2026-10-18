@@ -4505,3 +4505,34 @@ button {
 .theme-light .event-report-modal textarea { border-color: #cbd5e1; color: #0f172a; background: #fff; }
 .theme-light .event-report-review-card { border-color: rgba(220, 38, 38, 0.25); background: rgba(255, 255, 255, 0.84); }
 .theme-light .event-report-review-card > strong { color: #0f172a; }
+
+.event-card-loading-placeholder {
+  width: min(100%, 480px);
+  min-height: 420px;
+  margin-inline: auto;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 1.25rem;
+  background: linear-gradient(110deg, rgba(15, 23, 42, 0.75) 8%, rgba(30, 41, 59, 0.8) 18%, rgba(15, 23, 42, 0.75) 33%);
+  background-size: 200% 100%;
+  animation: event-card-loading 1.2s linear infinite;
+}
+
+.feed-load-more {
+  display: block;
+  min-height: 44px;
+  margin: 16px auto 24px;
+  padding: 0 20px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 999px;
+  background: rgba(30, 41, 59, 0.78);
+  color: #f8fafc;
+  font-weight: 700;
+}
+
+@keyframes event-card-loading {
+  to { background-position-x: -200%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .event-card-loading-placeholder { animation: none; }
+}

@@ -410,7 +410,8 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
           try {
             const result = await request('/api/auth/google', {
               method: 'POST',
-              body: JSON.stringify({ code: googleResponse.code, remember }),
+              headers: { 'X-FUTApulse-OAuth-Request': '1' },
+              body: JSON.stringify({ code: googleResponse.code, remember, origin: window.location.origin }),
             })
             if (result.usernameRequired) {
               if (!result.signupToken || !result.email) {

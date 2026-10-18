@@ -1,17 +1,23 @@
-﻿import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, lazy, startTransition, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Bell, Building2, Check, ChevronLeft, ChevronRight, Clock3, Download, Eye, EyeOff, Flame, Heart, Home, LogOut,
   MapPin, Search, Shield, Sparkles, Trash2, User, X,
 } from 'lucide-react'
 import AuthScreen from './components/AuthScreen'
 import CountdownPill from './components/CountdownPill'
-import EventCard from './components/EventCard'
 import AdSlot from './components/AdSlot'
 import LaunchAdGate from './components/LaunchAdGate'
 import BrandHeart from './components/BrandHeart'
-import ProfileSetupModal from './components/ProfileSetupModal'
-import ProfilePhotoCropper from './components/ProfilePhotoCropper'
 import { API_BASE_URL } from './config/api'
+
+const EventCard = lazy(() => import('./components/EventCard'))
+const EventEditor = lazy(() => import('./components/EventEditor'))
+const ProfileSetupModal = lazy(() => import('./components/ProfileSetupModal'))
+const ProfilePhotoCropper = lazy(() => import('./components/ProfilePhotoCropper'))
+
+function LazyEventCard(props) {
+  return <Suspense fallback={<div className="event-card-loading-placeholder" aria-hidden="true" />}><EventCard {...props} /></Suspense>
+}
 
 const CATEGORY_DATA = [
   { id: 'academic', label: 'Academic', className: 'category-academic', description: 'Study sessions and workshops' },
@@ -28,6 +34,9 @@ const NAV_ITEMS = [
   { id: 'profile', label: 'Profile', Icon: User },
 ]
 const FUTAPULSE_ADMIN_EMAIL = 'immanuelidowu1@gmail.com'
+const EVENT_LIST_PAGE_SIZE = 12
+const MAX_CACHED_EVENTS = 40
+const MAX_EVENT_CACHE_CHARACTERS = 360_000
 const REPORT_REASON_LABELS = {
   misleading: 'Misleading or false details',
   inappropriate: 'Inappropriate or harmful content',
@@ -53,11 +62,14 @@ function readStoredValue(key, fallback = '') {
 }
 
 function readInitialEventCache() {
-  const cacheVersion = '2'
+  const cacheVersion = '3'
   if (readStoredValue('futapulse-events-cache-version') !== cacheVersion) {
     try {
-      localStorage.removeItem('futapulse-events')
-      localStorage.removeItem('futapulse-organizer-events')
+      for (const key of Object.keys(localStorage)) {
+        if (key === 'futapulse-events' || key === 'futapulse-organizer-events'
+          || key === 'futapulse-auth-user' || key === 'futapulse-profile'
+          || key.startsWith('futapulse-profile-')) localStorage.removeItem(key)
+      }
       localStorage.setItem('futapulse-events-cache-version', cacheVersion)
     } catch {
       // The server remains the source of truth if browser storage is unavailable.
@@ -65,9 +77,8 @@ function readInitialEventCache() {
     return []
   }
   const cachedEvents = readStored('futapulse-events', [])
-  return Array.isArray(cachedEvents) ? cachedEvents : []
+  return Array.isArray(cachedEvents) ? cachedEvents.slice(0, MAX_CACHED_EVENTS) : []
 }
-
 const reportedStorageWriteFailures = new Set()
 
 function safeSetStored(key, value) {
@@ -92,10 +103,49 @@ function withoutInlineImages(value) {
   return value
 }
 
-function storeEventCache(key, events) {
-  return safeSetStored(key, JSON.stringify(withoutInlineImages(events)))
+function storeEventCache(events) {
+  const compactEvents = []
+  let cacheCharacters = 2
+  for (const event of (Array.isArray(events) ? events : []).slice(0, MAX_CACHED_EVENTS)) {
+    const serializedEvent = JSON.stringify(withoutInlineImages(event))
+    const nextSize = cacheCharacters + serializedEvent.length + (compactEvents.length ? 1 : 0)
+    if (nextSize > MAX_EVENT_CACHE_CHARACTERS) break
+    compactEvents.push(serializedEvent)
+    cacheCharacters = nextSize
+  }
+  return safeSetStored('futapulse-events', `[${compactEvents.join(',')}]`)
 }
 
+async function compressEventBanner(file) {
+  const sourceUrl = URL.createObjectURL(file)
+  try {
+    const image = new Image()
+    await new Promise((resolve, reject) => {
+      image.onload = resolve
+      image.onerror = () => reject(new Error('Unable to open that event banner.'))
+      image.src = sourceUrl
+    })
+    const scale = Math.min(1, 1280 / Math.max(image.naturalWidth, image.naturalHeight))
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale))
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale))
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Your phone could not prepare this banner. Try another image.')
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/webp', 0.78))
+    if (!blob) throw new Error('Unable to prepare this banner. Try another image.')
+    if (blob.size > 600 * 1024) throw new Error('This banner is still too large after compression. Choose a smaller image.')
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(reader.result)
+      reader.onerror = () => reject(new Error('Unable to read the compressed banner.'))
+      reader.readAsDataURL(blob)
+    })
+    return String(dataUrl)
+  } finally {
+    URL.revokeObjectURL(sourceUrl)
+  }
+}
 function getEventId(event) {
   return event.id ?? event._id
 }
@@ -206,7 +256,7 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
           <div className="home-featured-banner" style={event.banner || event.image ? { backgroundImage: `linear-gradient(90deg, rgba(2,6,23,.94), rgba(2,6,23,.64) 54%, rgba(2,6,23,.22)), url("${event.banner || event.image}")` } : undefined}>
             <span className="preview-category-badge">{category?.label || String(event.category || 'EVENT').toUpperCase()}</span>
             <div className="home-preview-organizer">
-              <span className="organizer-micro-avatar">{avatarFailed ? <Building2 size={16} /> : <img src={event.organizerPicture || fallback} alt="" onError={(error) => { const image = error.currentTarget; if (image.dataset.fallback) { setAvatarFailed(true); return } image.dataset.fallback = 'true'; image.src = fallback }} />}</span>
+            <span className="organizer-micro-avatar">{avatarFailed ? <Building2 size={16} /> : <img loading="lazy" decoding="async" src={event.organizerPicture || fallback} alt="" onError={(error) => { const image = error.currentTarget; if (image.dataset.fallback) { setAvatarFailed(true); return } image.dataset.fallback = 'true'; image.src = fallback }} />}</span>
               <span className="home-organizer-name">{event.organizerName || event.organizer?.name || 'Campus Organizer'}</span>
             </div>
             <h3 className="preview-title">{event.title}</h3>
@@ -218,8 +268,8 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
       ) : homeVariant === 'home-category-preview' ? (
         <>
           <div className="home-category-banner">
-            {bannerFailed || !(event.banner || event.image) ? <span className="preview-fallback"><Sparkles size={24} /></span> : <img src={event.banner || event.image} alt="" onError={() => setBannerFailed(true)} />}
-            <span className="home-preview-organizer"><span className="organizer-micro-avatar">{avatarFailed ? <Building2 size={14} /> : <img src={event.organizerPicture || fallback} alt="" onError={(error) => { const image = error.currentTarget; if (image.dataset.fallback) { setAvatarFailed(true); return } image.dataset.fallback = 'true'; image.src = fallback }} />}</span><span className="home-organizer-name">{event.organizerName || event.organizer?.name || 'Campus Organizer'}</span></span>
+            {bannerFailed || !(event.banner || event.image) ? <span className="preview-fallback"><Sparkles size={24} /></span> : <img loading="lazy" decoding="async" src={event.banner || event.image} alt="" onError={() => setBannerFailed(true)} />}
+            <span className="home-preview-organizer"><span className="organizer-micro-avatar">{avatarFailed ? <Building2 size={14} /> : <img loading="lazy" decoding="async" src={event.organizerPicture || fallback} alt="" onError={(error) => { const image = error.currentTarget; if (image.dataset.fallback) { setAvatarFailed(true); return } image.dataset.fallback = 'true'; image.src = fallback }} />}</span><span className="home-organizer-name">{event.organizerName || event.organizer?.name || 'Campus Organizer'}</span></span>
             <span className="home-category-countdown"><CountdownPill startTime={getStartTime(event)} endTime={event.endTime} /></span>
           </div>
           <h3 className="preview-title">{event.title}</h3>
@@ -230,7 +280,7 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
       <span className="preview-category-badge">{category?.label || String(event.category || 'EVENT').toUpperCase()}</span>
       <div className="preview-heading">
         <span className="organizer-micro-avatar">
-          {avatarFailed ? <Building2 size={16} /> : <img src={event.organizerPicture || fallback} alt="" onError={(error) => {
+          {avatarFailed ? <Building2 size={16} /> : <img loading="lazy" decoding="async" src={event.organizerPicture || fallback} alt="" onError={(error) => {
             const image = error.currentTarget
             if (image.dataset.fallback) {
               setAvatarFailed(true)
@@ -250,7 +300,7 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
           {bannerFailed || !(event.banner || event.image) ? (
             <span className="preview-fallback"><Sparkles size={22} /></span>
           ) : (
-            <img src={event.banner || event.image} alt="" onError={() => setBannerFailed(true)} />
+            <img loading="lazy" decoding="async" src={event.banner || event.image} alt="" onError={() => setBannerFailed(true)} />
           )}
         </div>
         <div className="preview-info">
@@ -276,13 +326,14 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
 }
 
 function App() {
-  const [launchVisible, setLaunchVisible] = useState(() => !new URLSearchParams(window.location.search).has('event'))
+  const hasSharedEventLink = new URLSearchParams(window.location.search).has('event')
+  const [launchVisible, setLaunchVisible] = useState(() => !hasSharedEventLink)
+  const [hasSplashUnmounted, setHasSplashUnmounted] = useState(hasSharedEventLink)
   const [isLaunchAdActive, setIsLaunchAdActive] = useState(false)
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
   const [user, setUser] = useState(null)
   const [guestSignInRequested, setGuestSignInRequested] = useState(false)
-  const hasSharedEventLink = new URLSearchParams(window.location.search).has('event')
   const isGuestSharedView = hasSharedEventLink && (!session?.token || !user) && !guestSignInRequested
   const [profile, setProfile] = useState(null)
   const [profileOpen, setProfileOpen] = useState(false)
@@ -294,7 +345,7 @@ function App() {
   const [activeTab, setActiveTab] = useState(() => new URLSearchParams(window.location.search).has('event')
     ? 'home'
     : window.location.hash.replace('#', '') || 'home')
-  const [events, setEvents] = useState(readInitialEventCache)
+  const [events, setEvents] = useState([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [theme, setTheme] = useState(() => readStoredValue('futapulse-theme') || readStoredValue('futapulse-client-theme') || 'light')
@@ -319,7 +370,12 @@ function App() {
   })
   const [reminderIds, setReminderIds] = useState([])
   const [goingIds, setGoingIds] = useState([])
-  const [reminderTimes, setReminderTimes] = useState(() => readStored('futapulse-reminders', {}))
+  const [reminderTimes, setReminderTimes] = useState(() => {
+    const stored = readStored('futapulse-reminders', {})
+    return stored && typeof stored === 'object' && !Array.isArray(stored)
+      ? Object.fromEntries(Object.entries(stored).slice(-500))
+      : {}
+  })
   const [reminderClock, setReminderClock] = useState(() => Date.now())
   const [feedClock, setFeedClock] = useState(() => Date.now())
   const [clockNow, setClockNow] = useState(() => Date.now())
@@ -329,7 +385,7 @@ function App() {
     return Array.isArray(queued)
       ? queued.filter((action) => action && typeof action.actionId === 'string'
         && typeof action.eventId === 'string' && action.type === 'reminder'
-        && typeof action.accountId === 'string' && typeof action.enabled === 'boolean')
+        && typeof action.accountId === 'string' && typeof action.enabled === 'boolean').slice(-100)
       : []
   })
   const [networkOnline, setNetworkOnline] = useState(() => navigator.onLine)
@@ -353,6 +409,12 @@ function App() {
   const [eventDeleteTarget, setEventDeleteTarget] = useState(null)
   const [eventDeleting, setEventDeleting] = useState(false)
   const [eventEditor, setEventEditor] = useState(null)
+  const [visibleFullFeedCount, setVisibleFullFeedCount] = useState(EVENT_LIST_PAGE_SIZE)
+  const [visibleSearchCount, setVisibleSearchCount] = useState(EVENT_LIST_PAGE_SIZE)
+  const [visibleOrganizerCount, setVisibleOrganizerCount] = useState(EVENT_LIST_PAGE_SIZE)
+  const [visibleReportCount, setVisibleReportCount] = useState(8)
+  const [visibleAnticipatingCount, setVisibleAnticipatingCount] = useState(EVENT_LIST_PAGE_SIZE)
+  const [visibleReminderCount, setVisibleReminderCount] = useState(EVENT_LIST_PAGE_SIZE)
   const [eventDuplicateState, setEventDuplicateState] = useState({ code: '', matches: [] })
   const [eventSaving, setEventSaving] = useState(false)
   const [toast, setToast] = useState(null)
@@ -506,13 +568,6 @@ function App() {
 
   const syncOwnedEventsProfile = (owner, nextProfile) => {
     setEvents((current) => current.map((event) => syncEventOrganizerProfile(event, owner, nextProfile)))
-    const storedEvents = readStored('futapulse-organizer-events', [])
-    if (Array.isArray(storedEvents)) {
-      storeEventCache(
-        'futapulse-organizer-events',
-        storedEvents.map((event) => syncEventOrganizerProfile(event, owner, nextProfile)),
-      )
-    }
   }
 
   const persistSession = useCallback((auth, remember = false) => {
@@ -521,18 +576,11 @@ function App() {
     setUser(auth.user)
     const nextProfile = auth.user.profile || null
     setProfile(nextProfile)
-    if (nextProfile?.faculty && nextProfile?.department && nextProfile?.level && nextProfile?.name) {
-      safeSetStored('futapulse-profile', JSON.stringify(nextProfile))
-      safeSetStored(`futapulse-profile-${auth.user.username}`, JSON.stringify(nextProfile))
-    } else {
-      localStorage.removeItem('futapulse-profile')
-    }
-    safeSetStored('futapulse-auth-user', JSON.stringify(auth.user))
     localStorage.removeItem('futapulse-auth-session')
     sessionStorage.removeItem('futapulse-auth-session')
     const knownAccounts = readStored('futapulse-known-accounts', [])
     const accounts = Array.isArray(knownAccounts) ? knownAccounts : []
-    safeSetStored('futapulse-known-accounts', JSON.stringify([...new Set([...accounts, auth.user.username])]))
+    safeSetStored('futapulse-known-accounts', JSON.stringify([...new Set([...accounts, auth.user.username])].slice(-10)))
     setHasDeviceAccount(true)
     if (remember) {
       safeSetStored('futapulse-remembered-username', auth.user.username)
@@ -561,15 +609,30 @@ function App() {
   }, [notify, setProfileMenuOpen])
 
   useEffect(() => {
-    const timer = window.setTimeout(() => setLaunchVisible(false), 1500)
+    const timer = window.setTimeout(() => setLaunchVisible(false), 2500)
     return () => window.clearTimeout(timer)
   }, [])
 
   useEffect(() => {
-    if (hasSharedEventLink || launchVisible || sessionLoading) return undefined
-    const timer = window.setTimeout(() => setIsLaunchAdActive(true), 0)
+    if (hasSharedEventLink || launchVisible || sessionLoading || hasSplashUnmounted) return undefined
+    let nextFrame = 0
+    const frame = window.requestAnimationFrame(() => {
+      setHasSplashUnmounted(true)
+      nextFrame = window.requestAnimationFrame(() => setIsLaunchAdActive(true))
+    })
+    return () => {
+      window.cancelAnimationFrame(frame)
+      if (nextFrame) window.cancelAnimationFrame(nextFrame)
+    }
+  }, [hasSharedEventLink, launchVisible, sessionLoading, hasSplashUnmounted])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const cachedEvents = readInitialEventCache()
+      startTransition(() => setEvents((current) => current.length ? current : cachedEvents))
+    }, 0)
     return () => window.clearTimeout(timer)
-  }, [hasSharedEventLink, launchVisible, sessionLoading])
+  }, [])
 
   useEffect(() => {
     if (!facultyLogoOpen) return undefined
@@ -669,8 +732,6 @@ function App() {
         setUser(result.user)
         setProfile(result.user.profile || null)
         setHasDeviceAccount(true)
-        safeSetStored('futapulse-auth-user', JSON.stringify(result.user))
-        if (result.user.profile) safeSetStored('futapulse-profile', JSON.stringify(result.user.profile))
         setProfileOpen(!result.user.profile || !['name', 'faculty', 'department', 'level'].every((field) => result.user.profile[field]))
       } catch (error) {
         if (!controller.signal.aborted) {
@@ -746,22 +807,17 @@ function App() {
         const response = await fetch(`${API_BASE_URL}/api/events`, {
           signal: controller.signal,
           headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
+          cache: 'no-cache',
         })
         if (!response.ok) throw new Error(`Could not load events (${response.status}).`)
         const data = await response.json()
         if (!Array.isArray(data.events)) throw new Error('The events endpoint returned an invalid response.')
         const serverEvents = data.events
-        setEvents(serverEvents)
+        startTransition(() => setEvents(serverEvents))
         const serverGoingIds = serverEvents.filter((event) => event.isGoing).map((event) => String(getEventId(event)))
         setGoingIds((current) => current.join('|') === serverGoingIds.join('|') ? current : serverGoingIds)
         setReminderIds(serverEvents.filter((event) => event.isReminded).map((event) => String(getEventId(event))))
-        if (session?.user?.id) {
-          storeEventCache(
-            'futapulse-organizer-events',
-            serverEvents.filter((event) => String(event.createdByUserId || '') === String(session.user.id)),
-          )
-        }
-        storeEventCache('futapulse-events', serverEvents)
+        storeEventCache(serverEvents)
       } catch (error) {
         if (error.name !== 'AbortError') {
           console.error('Unable to load campus events.', error)
@@ -809,16 +865,17 @@ function App() {
       try {
         const response = await fetch(`${API_BASE_URL}/api/events`, {
           headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
+          cache: 'no-cache',
           signal: AbortSignal.timeout(8_000),
         })
         if (!response.ok) return
         const data = await response.json()
         if (cancelled || !Array.isArray(data.events)) return
-        setEvents(data.events)
+        startTransition(() => setEvents(data.events))
         const serverGoingIds = data.events.filter((event) => event.isGoing).map((event) => String(getEventId(event)))
         setGoingIds((current) => current.join('|') === serverGoingIds.join('|') ? current : serverGoingIds)
         setReminderIds(data.events.filter((event) => event.isReminded).map((event) => String(getEventId(event))))
-        storeEventCache('futapulse-events', data.events)
+
       } catch {
         // A failed refresh never overwrites the last confirmed server snapshot.
       } finally {
@@ -869,10 +926,6 @@ function App() {
     safeSetStored('futapulse-theme', theme)
     safeSetStored('futapulse-client-theme', theme)
   }, [theme])
-
-  useEffect(() => {
-    storeEventCache('futapulse-events', events)
-  }, [events])
 
   useEffect(() => {
     if (!detailEvent && !profileMenuOpen && !profileOpen && !eventEditor && !reminderTarget && !reportTarget) return undefined
@@ -1005,7 +1058,7 @@ function App() {
       enabled,
       attempts: 0,
       nextAttemptAt: 0,
-    }])
+    }].slice(-100))
   }, [session])
 
   const handleReminder = useCallback(async (id, explicitValue, { silent = false } = {}) => {
@@ -1050,7 +1103,6 @@ function App() {
       if (!result.event) throw new Error('The server did not confirm the attendance update.')
       const nextIds = isGoing ? goingIds.filter((item) => item !== eventId) : [...goingIds, eventId]
       setGoingIds(nextIds)
-      safeSetStored('futapulse-going-event-ids', JSON.stringify(nextIds))
       setEvents((current) => current.map((event) => String(getEventId(event)) === eventId
         ? { ...event, ...result.event, isGoing: !isGoing }
         : event))
@@ -1161,8 +1213,6 @@ function App() {
       const updatedUser = { ...user, profile: result.profile }
       setUser(updatedUser)
       setSession((current) => current ? { ...current, user: updatedUser } : current)
-      safeSetStored('futapulse-profile', JSON.stringify(result.profile))
-      safeSetStored('futapulse-auth-user', JSON.stringify(updatedUser))
       setGuidelinesOpen(false)
     } catch (error) {
       notify(error.message || 'Unable to save your acknowledgment. Please try again.', 'error')
@@ -1207,9 +1257,6 @@ function App() {
       setUser(updatedUser)
       setSession(updatedSession)
       syncOwnedEventsProfile(updatedUser, saved)
-      safeSetStored('futapulse-profile', JSON.stringify(saved))
-      safeSetStored(`futapulse-profile-${updatedUser.username}`, JSON.stringify(saved))
-      safeSetStored('futapulse-auth-user', JSON.stringify(updatedUser))
       setProfileOpen(false)
       notify('Profile saved successfully.', 'success')
     } finally {
@@ -1232,14 +1279,11 @@ function App() {
       setUser(updatedUser)
       setSession(updatedSession)
       syncOwnedEventsProfile(updatedUser, saved)
-      safeSetStored('futapulse-profile', JSON.stringify(saved))
-      safeSetStored(`futapulse-profile-${updatedUser.username}`, JSON.stringify(saved))
-      safeSetStored('futapulse-auth-user', JSON.stringify(updatedUser))
       const savedAccounts = readStored('futapulse-known-accounts', [])
       safeSetStored('futapulse-known-accounts', JSON.stringify([...new Set([
         ...(Array.isArray(savedAccounts) ? savedAccounts : []),
         updatedUser.username,
-      ])]))
+      ])].slice(-10)))
       if (rememberedUsername && user.username !== updatedUser.username) {
         safeSetStored('futapulse-remembered-username', updatedUser.username)
         setRememberedUsername(updatedUser.username)
@@ -1423,9 +1467,6 @@ function App() {
       setUser(updatedUser)
       setSession((current) => current ? { ...current, user: updatedUser } : current)
       syncOwnedEventsProfile(updatedUser, result.user.profile)
-      safeSetStored('futapulse-profile', JSON.stringify(result.user.profile))
-      safeSetStored(`futapulse-profile-${updatedUser.username}`, JSON.stringify(result.user.profile))
-      safeSetStored('futapulse-auth-user', JSON.stringify(updatedUser))
       setAvatarPhotoSource('')
       notify('Profile photo updated.', 'success')
     } catch (error) {
@@ -1437,8 +1478,9 @@ function App() {
     }
   }
 
+  const deferredSearch = useDeferredValue(search)
   const searchEvents = useMemo(() => {
-    const query = search.trim().toLowerCase()
+    const query = deferredSearch.trim().toLowerCase()
     if (!query) return []
     const keywords = query.split(/\s+/).filter(Boolean)
     const getFields = (event) => ({
@@ -1462,21 +1504,21 @@ function App() {
       .sort((first, second) => getMatchPriority(first) - getMatchPriority(second)
         || Number(Boolean(second.isHot)) - Number(Boolean(first.isHot))
         || getHotScore(second) - getHotScore(first))
-  }, [publishedEvents, search])
+  }, [publishedEvents, deferredSearch])
 
-  const remindedEvents = publishedEvents.filter((event) => {
+  const remindedEvents = useMemo(() => publishedEvents.filter((event) => {
     const id = String(getEventId(event))
     const scheduledReminder = reminderTimes[id]
     const notifyAt = Date.parse(scheduledReminder?.notifyAt || '')
     return !hasEventEnded(event, reminderClock) && Number.isFinite(notifyAt) && notifyAt > reminderClock
-  })
+  }), [publishedEvents, reminderTimes, reminderClock])
   const remindedEventIds = new Set(remindedEvents.map((event) => String(getEventId(event))))
-  const anticipatedEvents = publishedEvents.filter((event) => {
+  const anticipatedEvents = useMemo(() => publishedEvents.filter((event) => {
     const id = String(getEventId(event))
     return !hasEventEnded(event, reminderClock)
       && goingIds.includes(id)
       && !remindedEventIds.has(id)
-  })
+  }), [publishedEvents, reminderClock, goingIds, remindedEventIds])
 
   useEffect(() => {
     if (activeTab !== 'reminders' || !documentVisible) return undefined
@@ -1519,9 +1561,13 @@ function App() {
     && ['Published', 'Live'].includes(event.status)
     && (event.isHot === true || getHotScore(event) >= 10)
   )
-  const organizerEvents = events
+  const organizerEvents = useMemo(() => events
     .filter((event) => String(event.createdByUserId || '') === String(user?.id || ''))
-    .filter((event) => organizerTab === 'drafts' ? event.status === 'Draft' : ['Published', 'Live'].includes(event.status))
+    .filter((event) => organizerTab === 'drafts' ? event.status === 'Draft' : ['Published', 'Live'].includes(event.status)), [events, user?.id, organizerTab])
+
+  useEffect(() => { setVisibleSearchCount(EVENT_LIST_PAGE_SIZE) }, [search])
+  useEffect(() => { setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE) }, [expandedHomeCategory])
+  useEffect(() => { setVisibleOrganizerCount(EVENT_LIST_PAGE_SIZE) }, [organizerTab])
 
   const chooseCategory = (category) => {
     setHomeCategory(category)
@@ -1638,10 +1684,6 @@ function App() {
     setEvents((current) => current.some((item) => String(getEventId(item)) === savedId)
       ? current.map((item) => String(getEventId(item)) === savedId ? resultEvent : item)
       : [...current, resultEvent])
-    const existing = readStored('futapulse-organizer-events', [])
-    storeEventCache('futapulse-organizer-events', existing.some((item) => String(getEventId(item)) === savedId)
-      ? existing.map((item) => String(getEventId(item)) === savedId ? resultEvent : item)
-      : [...existing, resultEvent])
     return resultEvent
   }
 
@@ -1658,12 +1700,10 @@ function App() {
       setEvents((current) => current.filter((item) => String(getEventId(item)) !== eventId))
       setGoingIds((current) => {
         const next = current.filter((id) => String(id) !== eventId)
-        safeSetStored('futapulse-going-event-ids', JSON.stringify(next))
-        return next
+          return next
       })
       setReminderIds((current) => {
         const next = current.filter((id) => String(id) !== eventId)
-        safeSetStored('futapulse-reminder-event-ids', JSON.stringify(next))
         return next
       })
       setReminderTimes((current) => {
@@ -1677,10 +1717,6 @@ function App() {
         safeSetStored('futapulse-engagement-sync-queue', JSON.stringify(next))
         return next
       })
-      const storedEvents = readStored('futapulse-organizer-events', [])
-      storeEventCache('futapulse-organizer-events', Array.isArray(storedEvents)
-        ? storedEvents.filter((item) => String(getEventId(item)) !== eventId)
-        : [])
       const draftOwner = user?.username || 'guest'
       try {
         localStorage.removeItem(`futapulse-event-editor-draft:${draftOwner}:${eventId}`)
@@ -1739,11 +1775,6 @@ function App() {
       setEvents((current) => current.some((item) => String(getEventId(item)) === savedId)
         ? current.map((item) => String(getEventId(item)) === savedId ? resultEvent : item)
         : [...current, resultEvent])
-      const existing = readStored('futapulse-organizer-events', [])
-      const next = existing.some((item) => String(getEventId(item)) === savedId)
-        ? existing.map((item) => String(getEventId(item)) === savedId ? resultEvent : item)
-        : [...existing, resultEvent]
-      storeEventCache('futapulse-organizer-events', next)
       setEventDuplicateState({ code: '', matches: [] })
       setEventEditor(null)
       const hasAdvisoryMatches = Array.isArray(response.similarEvents) && response.similarEvents.length > 0
@@ -1811,6 +1842,10 @@ function App() {
         </div>
       </div>
     )
+  }
+
+  if (!hasSharedEventLink && !hasSplashUnmounted) {
+    return <div className="launch-screen" aria-hidden="true" />
   }
 
   if (isLaunchAdActive) {
@@ -1904,7 +1939,7 @@ function App() {
                     {(hotEvent || loading) && <section className="feed-section hot-section" ref={(node) => { homeSectionRefs.current.hot = node }}>
                       <h2 className="home-row-heading"><button type="button" className="home-row-button home-hot-button" aria-label={`Show all hot events, ${hotEventCount} ${hotEventCount === 1 ? 'event' : 'events'}`} onClick={() => openCategoryFeed('hot')}><span className="home-row-button-title"><span className="pulse-dot" />🔥 HOT EVENT ON CAMPUS</span><span className="home-row-count">{hotEventCount} {hotEventCount === 1 ? 'event' : 'events'}</span><span className="home-row-arrow-area"><ChevronRight size={22} /></span></button></h2>
                       {loading && !hotEvent ? <p className="feed-state">Loading live campus feed…</p>
-                        : hotEvent ? <div ref={hotCarouselRef} {...autoScrollInteractionProps('hot')} className={`home-event-track home-featured-track ${hotEvents.length ? 'has-many' : 'has-one'}`} aria-label="Hot events">{[hotEvent, ...hotEvents].map((event) => <EventPreview key={getEventId(event)} homeVariant="home-featured-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
+                        : hotEvent ? <div ref={hotCarouselRef} {...autoScrollInteractionProps('hot')} className={`home-event-track home-featured-track ${hotEvents.length ? 'has-many' : 'has-one'}`} aria-label="Hot events">{[hotEvent, ...hotEvents].slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-featured-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
                           : loadError ? <p className="feed-error" role="alert">{loadError}</p> : <p className="feed-state">No events are available yet.</p>}
                       {loadError && hotEvent && <p className="feed-error" role="status">Showing saved campus events while offline.</p>}
                     </section>}
@@ -1913,7 +1948,7 @@ function App() {
                       <section className="feed-section home-category-section" ref={(node) => { homeSectionRefs.current[category.id] = node }}>
                         <h2 className="home-row-heading"><button type="button" className={`home-row-button home-category-heading home-category-heading-${category.id}`} aria-label={`Show all ${category.label} events, ${category.events.length} ${category.events.length === 1 ? 'event' : 'events'}`} onClick={() => openCategoryFeed(category.id)}><span className="home-row-button-title">{category.label}</span><span className="home-row-count">{category.events.length} {category.events.length === 1 ? 'event' : 'events'}</span><span className="home-row-arrow-area"><ChevronRight size={22} /></span></button></h2>
                         {category.events.length
-                          ? <div className="home-event-track">{category.events.map((event) => <EventPreview key={getEventId(event)} homeVariant="home-category-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
+                          ? <div className="home-event-track">{category.events.slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-category-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
                           : <div className="home-category-empty-track"><div className="home-category-empty-card"><span className="home-category-empty-mark"><Sparkles size={18} aria-hidden="true" /></span><strong>No {category.label} events yet</strong><span>Check back as campus events are added.</span></div></div>}
                       </section>
                       {(categoryIndex + 1) % 2 === 0 && <AdSlot placement="home-category-pairs" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
@@ -1936,12 +1971,12 @@ function App() {
                       const fullEvents = expandedHomeCategory === 'hot'
                         ? [hotEvent, ...hotEvents].filter((event) => event && matchesProfileAudience(event, profile))
                         : publishedEvents.filter((event) => (expandedHomeCategory === 'all' || event.category === expandedHomeCategory) && matchesProfileAudience(event, profile))
-                      return fullEvents.length ? fullEvents.map((event, index) => <Fragment key={getEventId(event)}>
+                      return fullEvents.length ? <>{fullEvents.slice(0, visibleFullFeedCount).map((event, index) => <Fragment key={getEventId(event)}>
                         <div id={`home-full-event-${getEventId(event)}`} className={`home-full-event-anchor ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''}`}>
-                          <EventCard isHot={expandedHomeCategory === 'hot' || event.isHot === true || getHotScore(event) >= 10} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
+                          <LazyEventCard isHot={expandedHomeCategory === 'hot' || event.isHot === true || getHotScore(event) >= 10} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
                         </div>
                         {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <AdSlot placement="category-full-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
-                      </Fragment>) : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon">◌</span><strong>No events in this section yet</strong><span>Try another category to explore campus activity.</span></div><AdSlot placement="category-empty-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} /></>
+                      </Fragment>)}{visibleFullFeedCount < fullEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleFullFeedCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more events</button>}</> : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon">◌</span><strong>No events in this section yet</strong><span>Try another category to explore campus activity.</span></div><AdSlot placement="category-empty-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} /></>
                       })()}
                   </section>
                 )}
@@ -2004,8 +2039,9 @@ function App() {
                     <span className="explore-search-result-count" role="status" aria-live="polite" aria-atomic="true">{searchEvents.length} {searchEvents.length === 1 ? 'event' : 'events'}</span>
                   </div>
                   {loading && !searchEvents.length ? <p className="feed-state">Searching campus events…</p> : searchEvents.length ? (
+                    <>
                     <div className="explore-trending-track home-event-track">
-                      {searchEvents.map((event) => (
+                      {searchEvents.slice(0, visibleSearchCount).map((event) => (
                         <EventPreview
                           key={getEventId(event)}
                           homeVariant="home-category-preview"
@@ -2014,6 +2050,8 @@ function App() {
                         />
                       ))}
                     </div>
+                    {visibleSearchCount < searchEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleSearchCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more results</button>}
+                    </>
                   ) : <p className="explore-search-empty">{loadError || `No events or organizers match “${search.trim()}”. Try another keyword.`}</p>}
                   {loadError && searchEvents.length > 0 && <p className="feed-error" role="status">Showing saved events while offline.</p>}
                 </section>
@@ -2023,7 +2061,7 @@ function App() {
                   <button type="button" className="home-row-button home-hot-button" aria-label={`Show all hot events, ${hotEventCount} ${hotEventCount === 1 ? 'event' : 'events'}`} onClick={() => openCategoryFeed('hot')}><span className="home-row-button-title"><span className="pulse-dot" />🔥 HOT EVENT ON CAMPUS</span><span className="home-row-count">{hotEventCount} {hotEventCount === 1 ? 'event' : 'events'}</span><span className="home-row-arrow-area"><ChevronRight size={22} /></span></button>
                 </div>
                 {loading && !hotEvent ? <p className="feed-state">Loading trending events…</p>
-                  : hotEvent ? <div ref={hotCarouselRef} {...autoScrollInteractionProps('hot')} className={`home-event-track home-featured-track ${hotEvents.length ? 'has-many' : 'has-one'}`} aria-label="Hot events">{[hotEvent, ...hotEvents].map((event) => <EventPreview key={getEventId(event)} homeVariant="home-featured-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
+                  : hotEvent ? <div ref={hotCarouselRef} {...autoScrollInteractionProps('hot')} className={`home-event-track home-featured-track ${hotEvents.length ? 'has-many' : 'has-one'}`} aria-label="Hot events">{[hotEvent, ...hotEvents].slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-featured-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
                     : loadError ? <p className="feed-error" role="alert">{loadError}</p> : <p className="feed-state">No events are available yet.</p>}
                 {loadError && hotEvent && <p className="feed-error" role="status">Showing saved campus events while offline.</p>}
               </section>
@@ -2055,9 +2093,10 @@ function App() {
                     </div>
                     <p className="reminders-section-copy">Events you marked Coming without a separate reminder. We’ll alert you when they go live if notifications are enabled.</p>
                     {anticipatedEvents.length ? (
+                      <>
                       <div ref={(node) => { reminderCarouselRefs.current.anticipating = node }} {...autoScrollInteractionProps('anticipating')} className="reminders-event-list">
-                        {anticipatedEvents.map((event) => (
-                          <EventCard
+                        {anticipatedEvents.slice(0, visibleAnticipatingCount).map((event) => (
+                          <LazyEventCard
                             key={getEventId(event)}
                             event={{ ...event, startTime: getStartTime(event), isGoing: true, isReminded: false }}
                             viewerProfile={profile}
@@ -2067,6 +2106,8 @@ function App() {
                           />
                         ))}
                       </div>
+                      {visibleAnticipatingCount < anticipatedEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleAnticipatingCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more</button>}
+                      </>
                     ) : <p className="reminders-section-empty">Events you mark Coming without a separate reminder will appear here.</p>}
                   </section>
 
@@ -2077,9 +2118,10 @@ function App() {
                     </div>
                     <p className="reminders-section-copy">One scheduled reminder per event. After it fires, you can choose another time if the event hasn’t started.</p>
                     {remindedEvents.length ? (
+                      <>
                       <div ref={(node) => { reminderCarouselRefs.current.reminders = node }} {...autoScrollInteractionProps('reminders')} className="reminders-event-list">
-                        {remindedEvents.map((event) => (
-                          <EventCard
+                        {remindedEvents.slice(0, visibleReminderCount).map((event) => (
+                          <LazyEventCard
                             key={getEventId(event)}
                             event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: true }}
                             viewerProfile={profile}
@@ -2089,6 +2131,8 @@ function App() {
                           />
                         ))}
                       </div>
+                      {visibleReminderCount < remindedEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleReminderCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more</button>}
+                      </>
                     ) : <p className="reminders-section-empty">Events with a reminder you set will appear here.</p>}
                   </section>
                 </div>
@@ -2176,10 +2220,11 @@ function App() {
                   </div>
                   <p className="organizer-swipe-hint">Swipe left or right to switch between Events and Drafts.</p>
                   {organizerEvents.length ? <div className="profile-events-list">
-                    {organizerEvents.map((event) => <article key={getEventId(event)} className="profile-event-item">
+                    {organizerEvents.slice(0, visibleOrganizerCount).map((event) => <article key={getEventId(event)} className="profile-event-item">
                       <div className="profile-event-item-left"><span className={`profile-event-accent-bar ${event.category}`} /><div className="profile-event-info"><span className={`profile-item-badge ${event.status === 'Draft' ? 'draft' : 'published'}`}>{event.status}</span><strong>{event.title}</strong><span>{event.venue || 'Venue not set'} · {event.date ? new Date(event.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'Date not set'}</span></div></div>
                       {String(event.createdByUserId) === String(user.id) && <div className="profile-event-actions"><button type="button" className="btn-item-edit" onClick={() => { setEventDuplicateState({ code: '', matches: [] }); setEventEditor(event) }}>Edit</button><button type="button" className="btn-item-delete" onClick={() => setEventDeleteTarget(event)} aria-label={`Delete ${event.status === 'Draft' ? 'draft' : 'event'} ${event.title}`}><Trash2 size={17} /><span>Delete</span></button></div>}
                     </article>)}
+                    {visibleOrganizerCount < organizerEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleOrganizerCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more</button>}
                   </div> : <p className="profile-events-empty">{organizerTab === 'events' ? 'No uploaded events yet. Create your first campus event!' : 'No saved drafts. All your events have been published.'}</p>}
               </section>
             </div>
@@ -2235,22 +2280,22 @@ function App() {
       )}
 
       {profileOpen && (
-        <ProfileSetupModal
+        <Suspense fallback={null}><ProfileSetupModal
           profile={profile}
           username={profile?.name || user.profile?.name || user.username}
           editableFields={user.editableFields}
           saving={profileSaving}
           onClose={() => setProfileOpen(false)}
           onSave={profile ? saveEditedProfile : saveProfile}
-        />
+        /></Suspense>
       )}
 
-      {avatarPhotoSource && <ProfilePhotoCropper
+      {avatarPhotoSource && <Suspense fallback={null}><ProfilePhotoCropper
         source={avatarPhotoSource}
         saving={avatarUploading}
         onCancel={() => setAvatarPhotoSource('')}
         onSave={uploadProfilePhoto}
-      />}
+      /></Suspense>}
 
       {reminderTarget && (
         <div className="modal-backdrop reminder-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setReminderTarget(null) }}>
@@ -2282,7 +2327,7 @@ function App() {
                 <button type="button" onClick={() => { stopAlarmRingtone(); setActiveEventAlert(null) }}>Stop sound</button>
               </div>
             )}
-            <EventCard
+            <LazyEventCard
               event={{ ...detailEvent, startTime: getStartTime(detailEvent), isGoing: Boolean(detailEvent.isGoing ?? goingIds.includes(String(getEventId(detailEvent)))), isReminded: reminderIds.includes(String(getEventId(detailEvent))) }}
               viewerProfile={profile}
               onComing={(id) => handleRsvp(id)}
@@ -2397,7 +2442,7 @@ function App() {
                     <p className="options-detail-copy">These events reached five reports. No action is taken until you choose Ban or Ignore.</p>
                     {reportReviewCases.length === 0 ? <p className="options-detail-copy">There are no event reports awaiting review.</p> : (
                       <div className="event-report-review-list">
-                        {reportReviewCases.map((item) => (
+                        {reportReviewCases.slice(0, visibleReportCount).map((item) => (
                           <article key={item.eventId} className="event-report-review-card">
                             <strong>{item.event.title}</strong>
                             <span>{item.event.organizerName || 'Campus Organizer'} · {item.event.category} · {item.event.venue}</span>
@@ -2411,6 +2456,7 @@ function App() {
                             </div>
                           </article>
                         ))}
+                        {visibleReportCount < reportReviewCases.length && <button type="button" className="feed-load-more" onClick={() => setVisibleReportCount((count) => count + 8)}>Load more reports</button>}
                       </div>
                     )}
                   </>
@@ -2437,7 +2483,9 @@ function App() {
       )}
 
       {eventEditor && (
-        <EventEditor
+        <Suspense fallback={<div className="sheet-backdrop" aria-hidden="true" />}><EventEditor
+          categories={CATEGORY_DATA}
+          compressBanner={compressEventBanner}
           event={eventEditor}
           saving={eventSaving}
           bannerInput={eventBannerInput}
@@ -2448,7 +2496,7 @@ function App() {
           onClose={() => { setEventEditor(null); setEventDuplicateState({ code: '', matches: [] }) }}
           onAutoSave={autosaveEventDraft}
           onSave={saveEvent}
-        />
+        /></Suspense>
       )}
       {facultyLogoOpen && (
         <div
@@ -2511,384 +2559,6 @@ function AccountPasswordInput({ name, label, minLength = 6, autoComplete = 'curr
         </button>
       </span>
     </>
-  )
-}
-
-function toLocalDateAndTime(value) {
-  const date = new Date(value)
-  if (!Number.isFinite(date.getTime())) return { date: '', time: '' }
-  const pad = (number) => String(number).padStart(2, '0')
-  return {
-    date: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
-    time: `${pad(date.getHours())}:${pad(date.getMinutes())}`,
-  }
-}
-
-function TimeWheelPicker({ label, value, onChange }) {
-  const [open, setOpen] = useState(false)
-  const [hour, setHour] = useState('00')
-  const [minute, setMinute] = useState('00')
-  const hoursRef = useRef(null)
-  const minutesRef = useRef(null)
-  const previousFocusRef = useRef(null)
-  const initialSelectionRef = useRef({ hour: '00', minute: '00' })
-  const hours = useMemo(() => Array.from({ length: 24 }, (_, index) => String(index).padStart(2, '0')), [])
-  const minutes = useMemo(() => Array.from({ length: 60 }, (_, index) => String(index).padStart(2, '0')), [])
-  const openPicker = () => {
-    const valueMatch = /^((?:[01]\d|2[0-3])):([0-5]\d)$/.exec(value || '')
-    const selectedHour = valueMatch?.[1] || '00'
-    const selectedMinute = valueMatch?.[2] || '00'
-    initialSelectionRef.current = { hour: selectedHour, minute: selectedMinute }
-    previousFocusRef.current = document.activeElement
-    setHour(selectedHour)
-    setMinute(selectedMinute)
-    setOpen(true)
-  }
-
-  useEffect(() => {
-    if (!open) return undefined
-    const previousOverflow = document.body.style.overflow
-    let frameId = 0
-    const closeOnEscape = (event) => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    document.body.style.overflow = 'hidden'
-    window.addEventListener('keydown', closeOnEscape)
-    frameId = requestAnimationFrame(() => {
-      if (hoursRef.current) hoursRef.current.scrollTop = Number(initialSelectionRef.current.hour) * 44
-      if (minutesRef.current) minutesRef.current.scrollTop = Number(initialSelectionRef.current.minute) * 44
-      hoursRef.current?.focus({ preventScroll: true })
-    })
-    return () => {
-      cancelAnimationFrame(frameId)
-      window.removeEventListener('keydown', closeOnEscape)
-      document.body.style.overflow = previousOverflow
-      if (previousFocusRef.current instanceof HTMLElement && previousFocusRef.current.isConnected) {
-        previousFocusRef.current.focus({ preventScroll: true })
-      }
-    }
-  }, [open])
-
-  const updateFromScroll = (items, setSelected) => (event) => {
-    const index = Math.min(items.length - 1, Math.max(0, Math.round(event.currentTarget.scrollTop / 44)))
-    setSelected(items[index])
-  }
-  const onWheelKeyDown = (items, setSelected, selected) => (event) => {
-    const currentIndex = items.indexOf(selected)
-    const nextIndex = event.key === 'ArrowDown' ? Math.min(items.length - 1, currentIndex + 1)
-      : event.key === 'ArrowUp' ? Math.max(0, currentIndex - 1) : -1
-    if (nextIndex < 0) return
-    event.preventDefault()
-    setSelected(items[nextIndex])
-    event.currentTarget.scrollTo({ top: nextIndex * 44, behavior: 'smooth' })
-  }
-
-  return (
-    <>
-      <label className="event-time-label">{label}</label>
-      <button type="button" className="event-time-trigger" aria-haspopup="dialog" aria-label={`${label}: ${value || 'Select time'}`} onClick={openPicker}>
-        <Clock3 size={17} aria-hidden="true" />
-        <span>{value || 'Select time'}</span>
-        <small>24-hour time</small>
-      </button>
-      {open && (
-        <div className="time-picker-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setOpen(false) }}>
-          <section className="time-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="time-picker-title">
-            <span className="explore-eyebrow">SET EVENT TIME</span>
-            <h2 id="time-picker-title">{label}</h2>
-            <div className="time-wheel-group">
-              {[{ label: 'Hours', items: hours, selected: hour, setSelected: setHour, ref: hoursRef },
-                { label: 'Minutes', items: minutes, selected: minute, setSelected: setMinute, ref: minutesRef }].map((wheel) => (
-                <div key={wheel.label} className="time-wheel-column">
-                  <span className="time-wheel-caption">{wheel.label}</span>
-                  <div
-                    className="time-wheel-scroll"
-                    ref={wheel.ref}
-                    role="listbox"
-                    aria-label={`${wheel.label} selection`}
-                    aria-activedescendant={`${wheel.label}-${wheel.selected}`}
-                    tabIndex={0}
-                    onScroll={updateFromScroll(wheel.items, wheel.setSelected)}
-                    onKeyDown={onWheelKeyDown(wheel.items, wheel.setSelected, wheel.selected)}
-                  >
-                    {wheel.items.map((item, index) => (
-                      <div key={item} id={`${wheel.label}-${item}`} className={`time-wheel-option ${wheel.selected === item ? 'is-selected' : ''}`} role="option" aria-selected={wheel.selected === item} onClick={() => { wheel.setSelected(item); wheel.ref.current?.scrollTo({ top: index * 44, behavior: 'smooth' }) }}>
-                        {item}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="time-picker-actions">
-              <button type="button" className="profile-edit-pill" onClick={() => setOpen(false)}>Cancel</button>
-              <button type="button" className="setup-submit" onClick={() => { onChange(`${hour}:${minute}`); setOpen(false) }}>Done</button>
-            </div>
-          </section>
-        </div>
-      )}
-    </>
-  )
-}
-
-function EventEditor({
-  event,
-  saving,
-  bannerInput,
-  owner,
-  duplicateState,
-  onClearDuplicates,
-  onOpenDuplicate,
-  onClose,
-  onAutoSave,
-  onSave,
-}) {
-  const draftKey = `futapulse-event-editor-draft:${owner}:${event.id || 'new'}`
-  const publishedAtOpen = ['Published', 'Live'].includes(event.status)
-  const [form, setForm] = useState(() => {
-    const start = toLocalDateAndTime(event.startTime || event.date || '')
-    const end = toLocalDateAndTime(event.endTime || '')
-    const initial = {
-      ...emptyEvent(),
-      ...event,
-      audience: Array.isArray(event.audience) ? event.audience : String(event.audience || '').split(',').filter(Boolean),
-      date: start.date,
-      startClock: start.time,
-      endDateTime: end.date,
-      endClock: end.time,
-    }
-    if (publishedAtOpen) return initial
-    const savedDraft = readStored(draftKey, null)
-    return savedDraft && typeof savedDraft === 'object'
-      ? { ...initial, ...savedDraft, id: event.id || savedDraft.id || '' }
-      : initial
-  })
-  const [banner, setBanner] = useState('')
-  const formRef = useRef(form)
-  const bannerRef = useRef(banner)
-  useEffect(() => { formRef.current = form }, [form])
-  useEffect(() => { bannerRef.current = banner }, [banner])
-  const [error, setError] = useState('')
-  const [draftSaved, setDraftSaved] = useState(false)
-  const [draftSyncing, setDraftSyncing] = useState(false)
-  const [draftSyncError, setDraftSyncError] = useState('')
-  const hasEditedRef = useRef(Boolean(event.id || form.title || form.category || form.activity || form.date || form.venue || form.meetingUrl || form.banner))
-  const onAutoSaveRef = useRef(onAutoSave)
-  const draftAutoSaveTimerRef = useRef(null)
-  useEffect(() => { onAutoSaveRef.current = onAutoSave }, [onAutoSave])
-  const persistLocalDraft = useCallback((draftForm = formRef.current, draftBanner = bannerRef.current) => {
-    if (publishedAtOpen || !hasEditedRef.current) return false
-    const snapshot = { ...draftForm, status: 'Draft', banner: draftBanner || draftForm.banner || '' }
-    const saved = safeSetStored(draftKey, JSON.stringify(snapshot))
-    setDraftSaved(saved)
-    if (!saved) setError('This draft could not be autosaved on this device. Check available browser storage.')
-    return saved
-  }, [draftKey, publishedAtOpen])
-  const update = (field, value) => {
-    onClearDuplicates?.()
-    hasEditedRef.current = true
-    const next = { ...formRef.current, [field]: value }
-    formRef.current = next
-    setForm(next)
-    persistLocalDraft(next, bannerRef.current)
-  }
-  const updateBanner = (value) => {
-    hasEditedRef.current = true
-    bannerRef.current = value
-    setBanner(value)
-    persistLocalDraft(formRef.current, value)
-  }
-  const createSavePayload = (status, allowSimilar = false) => {
-    const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
-    const endDateTime = form.endDateTime && form.endClock ? `${form.endDateTime}T${form.endClock}` : ''
-    return { ...form, date: startDateTime, endDateTime, status, allowSimilar }
-  }
-
-  useEffect(() => {
-    if (publishedAtOpen || saving) return undefined
-    const snapshot = { ...form, status: 'Draft', banner: banner || form.banner || '' }
-    if (!hasEditedRef.current) return undefined
-    const localSaved = () => {
-      try {
-        const saved = safeSetStored(draftKey, JSON.stringify(snapshot))
-        setDraftSaved(saved)
-        if (!saved) setError('This draft could not be autosaved on this device. Check available browser storage.')
-      } catch (saveError) {
-        console.error('Unable to autosave this event draft locally.', saveError)
-        setDraftSaved(false)
-        setError('This draft could not be autosaved on this device. Check available browser storage.')
-      }
-    }
-    localSaved()
-    draftAutoSaveTimerRef.current = window.setTimeout(async () => {
-      setDraftSyncing(true)
-      try {
-        const startDateTime = snapshot.date && snapshot.startClock ? `${snapshot.date}T${snapshot.startClock}` : ''
-        const endDateTime = snapshot.endDateTime && snapshot.endClock ? `${snapshot.endDateTime}T${snapshot.endClock}` : ''
-        const saved = await onAutoSaveRef.current({ ...snapshot, date: startDateTime, endDateTime }, snapshot.banner)
-        if (saved?.id) {
-          const syncedSnapshot = { ...snapshot, id: saved.id }
-          safeSetStored(draftKey, JSON.stringify(syncedSnapshot))
-          setForm((current) => current.id ? current : { ...current, id: saved.id })
-        }
-        setDraftSyncError('')
-      } catch (saveError) {
-        setDraftSyncError(saveError.message || 'Draft sync failed. It is saved on this device.')
-      } finally {
-        setDraftSyncing(false)
-      }
-    }, 700)
-    return () => window.clearTimeout(draftAutoSaveTimerRef.current)
-  }, [draftKey, form, banner, publishedAtOpen, saving])
-
-  useEffect(() => {
-    const flushDraft = () => { persistLocalDraft(formRef.current, bannerRef.current) }
-    window.addEventListener('pagehide', flushDraft)
-    document.addEventListener('visibilitychange', flushDraft)
-    return () => {
-      window.removeEventListener('pagehide', flushDraft)
-      document.removeEventListener('visibilitychange', flushDraft)
-    }
-  }, [draftKey, publishedAtOpen, persistLocalDraft])
-
-  const closeEditor = async () => {
-    window.clearTimeout(draftAutoSaveTimerRef.current)
-    if (!publishedAtOpen && hasEditedRef.current) {
-      const currentForm = formRef.current
-      const currentBanner = bannerRef.current || currentForm.banner || ''
-      persistLocalDraft(currentForm, currentBanner)
-      const startDateTime = currentForm.date && currentForm.startClock ? `${currentForm.date}T${currentForm.startClock}` : ''
-      const endDateTime = currentForm.endDateTime && currentForm.endClock ? `${currentForm.endDateTime}T${currentForm.endClock}` : ''
-      try {
-        const saved = await onAutoSaveRef.current({ ...currentForm, date: startDateTime, endDateTime, status: 'Draft' }, currentBanner)
-        if (saved?.id) {
-          const syncedDraft = { ...currentForm, id: saved.id, status: 'Draft', banner: currentBanner }
-          formRef.current = syncedDraft
-          setForm((current) => current.id ? current : { ...current, id: saved.id })
-          safeSetStored(draftKey, JSON.stringify(syncedDraft))
-        }
-      } catch (saveError) {
-        setDraftSyncError(saveError.message || 'Draft sync failed. It is saved on this device.')
-      }
-    }
-    onClose()
-  }
-
-  const submit = async (eventSubmit) => {
-    eventSubmit.preventDefault()
-    setError('')
-    try {
-      const status = eventSubmit.nativeEvent.submitter?.dataset.status || 'Published'
-      const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
-      const endDateTime = form.endDateTime && form.endClock ? `${form.endDateTime}T${form.endClock}` : ''
-      if (status === 'Published' && (!startDateTime || !endDateTime)) throw new Error('Choose both the event start and end date and time.')
-      if (status === 'Published' && new Date(endDateTime).getTime() <= new Date(startDateTime).getTime()) {
-        throw new Error('The event end time must be later than the start time.')
-      }
-      const saved = await onSave({ ...form, date: startDateTime, endDateTime, status, allowSimilar: false }, banner)
-      if (saved) {
-        localStorage.removeItem(draftKey)
-        setDraftSaved(false)
-      }
-    } catch (saveError) {
-      setError(saveError.message || 'Unable to save event.')
-    }
-  }
-
-  const saveDraft = async () => {
-    const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
-    const endDateTime = form.endDateTime && form.endClock ? `${form.endDateTime}T${form.endClock}` : ''
-    try {
-      const saved = await onSave({ ...form, date: startDateTime, endDateTime, status: 'Draft' }, banner)
-      if (saved) {
-        localStorage.removeItem(draftKey)
-        setDraftSaved(false)
-      }
-    } catch (saveError) {
-      setError(saveError.message || 'Unable to save event draft.')
-    }
-  }
-
-  return (
-    <div className="sheet-backdrop" role="presentation" onMouseDown={(eventClick) => { if (eventClick.target === eventClick.currentTarget) void closeEditor() }}>
-      <section className="event-creation-panel glass-panel" role="dialog" aria-modal="true" aria-labelledby="event-editor-title">
-        <button type="button" className="sheet-close" aria-label="Close event creation" onClick={() => { void closeEditor() }}><X size={18} /></button>
-        <span className="eyebrow-label">EVENT STUDIO</span>
-        <h2 id="event-editor-title">{form.id ? 'Edit campus event' : 'Create a campus event'}</h2>
-        <form className="profile-form" onSubmit={submit}>
-          <label htmlFor="event-title">Event title</label><input id="event-title" value={form.title} onChange={(eventChange) => update('title', eventChange.target.value)} placeholder="Name your event" required />
-          <label htmlFor="event-category">Category</label><select id="event-category" value={form.category} onChange={(eventChange) => update('category', eventChange.target.value)} required><option value="">Select category</option>{CATEGORY_DATA.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select>
-          <label htmlFor="event-activity">Event activity</label><textarea id="event-activity" rows={3} value={form.activity} onChange={(eventChange) => update('activity', eventChange.target.value)} placeholder="What should students expect?" required />
-          <label htmlFor="event-date">Start date</label><input id="event-date" type="date" value={form.date} onChange={(eventChange) => update('date', eventChange.target.value)} required={form.status !== 'Draft'} />
-          <TimeWheelPicker label="Start time" value={form.startClock} onChange={(value) => update('startClock', value)} />
-          <label htmlFor="event-end-date">End date</label><input id="event-end-date" type="date" value={form.endDateTime} onChange={(eventChange) => update('endDateTime', eventChange.target.value)} required={form.status !== 'Draft'} />
-          <TimeWheelPicker label="End time" value={form.endClock} onChange={(value) => update('endClock', value)} />
-          <label htmlFor="event-venue">Venue</label><input id="event-venue" value={form.venue} onChange={(eventChange) => update('venue', eventChange.target.value)} maxLength={120} placeholder="e.g. LT1 / SEET Complex" required />
-          <label htmlFor="event-landmark">Landmark &amp; directions <span className="optional-field-label">Optional</span></label><textarea id="event-landmark" rows={2} value={form.venueLandmark} onChange={(eventChange) => update('venueLandmark', eventChange.target.value)} maxLength={240} placeholder="Add a nearby landmark or directions students can follow" />
-          {form.category === 'seminars' && <><label htmlFor="event-meeting-url">Online seminar link (optional)</label><input id="event-meeting-url" type="url" inputMode="url" autoComplete="url" maxLength={2048} value={form.meetingUrl || ''} onChange={(eventChange) => update('meetingUrl', eventChange.target.value)} placeholder="https://meet.google.com/..." /><small className="profile-edit-limit">Students can open this link from the full event card.</small></>}
-          <label htmlFor="event-banner">Event banner (optional)</label>
-          <input ref={bannerInput} id="event-banner" type="file" accept="image/*" hidden onChange={async (eventChange) => {
-            const file = eventChange.target.files?.[0]
-            eventChange.target.value = ''
-            if (!file) return
-            if (file.size > 3 * 1024 * 1024) { setError('Choose an event banner smaller than 3 MB.'); eventChange.target.value = ''; return }
-            try {
-              const dataUrl = await new Promise((resolve, reject) => {
-                const reader = new FileReader()
-                reader.onload = () => resolve(reader.result)
-                reader.onerror = () => reject(new Error('Unable to read the event banner.'))
-                reader.readAsDataURL(file)
-              })
-              hasEditedRef.current = true
-              updateBanner(dataUrl)
-            } catch (readError) { setError(readError.message) }
-          }} />
-          <button
-            type="button"
-            className={`event-banner-upload ${(banner || form.banner) ? 'has-banner' : ''}`}
-            aria-label={(banner || form.banner) ? 'Change event banner' : 'Upload image'}
-            onClick={() => bannerInput.current?.click()}
-          >
-            {banner || form.banner
-              ? <><img src={banner || form.banner} alt="Selected event banner preview" /><span className="event-banner-action-label">Change event banner</span></>
-              : <><Sparkles size={24} /><strong>Event banner</strong><span>Optional · choose a JPG or PNG up to 3 MB</span><b>Upload image</b></>}
-          </button>
-          {(banner || form.banner) && <button type="button" className="event-banner-clear" onClick={() => { updateBanner(''); update('banner', '') }}>Clear banner</button>}
-          <fieldset className="audience-levels"><legend>Target audience levels</legend>{[['all', 'All levels'], ['100', '100'], ['200', '200'], ['300', '300'], ['400', '400'], ['500', '500']].map(([value, label]) => <label key={value}><input type="checkbox" checked={form.audience.includes(value)} onChange={(eventChange) => update('audience', eventChange.target.checked ? [...form.audience.filter((level) => level !== 'all' && value !== 'all'), value] : form.audience.filter((level) => level !== value))} /> {label}</label>)}</fieldset>
-          {draftSaved && !publishedAtOpen && <p className="event-draft-status" role="status">{draftSyncing ? 'Saving draft…' : draftSyncError ? 'Draft saved on this device; server sync will retry.' : 'Draft saved automatically.'}</p>}
-          {draftSyncError && <p className="form-error" role="status">{draftSyncError}</p>}
-          {duplicateState?.matches?.length > 0 && (
-            <section className={`event-duplicate-notice ${duplicateState.code === 'DUPLICATE_EVENT' ? 'is-blocked' : 'is-advisory'}`} role="alert">
-              <strong>{duplicateState.code === 'DUPLICATE_EVENT' ? 'This event is already posted.' : 'A similar event was found.'}</strong>
-              <p>{duplicateState.code === 'DUPLICATE_EVENT'
-                ? 'The title, category, venue, start and end times, and event description match an existing post. Review it below before continuing.'
-                : 'Review these close matches before confirming that your event is different.'}</p>
-              <div className="event-duplicate-matches">
-                {duplicateState.matches.map(({ event: match, score }) => (
-                  <button key={getEventId(match)} type="button" className="event-duplicate-match" onClick={() => onOpenDuplicate?.(match)}>
-                    <span><strong>{match.title}</strong><small>{match.category} · {match.venue}</small><small>{new Date(match.date || match.startTime).toLocaleString()} – {new Date(match.endTime).toLocaleString()}</small><small>{match.activity}</small></span>
-                    <b>{score}%</b>
-                  </button>
-                ))}
-              </div>
-              {duplicateState.code === 'POSSIBLE_DUPLICATE' && (
-                <button type="button" className="setup-submit event-duplicate-confirm" disabled={saving} onClick={async () => {
-                  const saved = await onSave(createSavePayload('Published', true), banner)
-                  if (saved) {
-                    localStorage.removeItem(draftKey)
-                    setDraftSaved(false)
-                  }
-                }}>
-                  This is a different event — continue publishing
-                </button>
-              )}
-            </section>
-          )}
-          {error && <p className="form-error" role="alert">{error}</p>}
-          <div className="event-form-actions">{!publishedAtOpen && <button type="button" className="event-draft-btn" disabled={saving} onClick={saveDraft}>Save draft</button>}<button className="setup-submit" type="submit" data-status="Published" disabled={saving}>Publish event <span>→</span></button></div>
-        </form>
-      </section>
-    </div>
   )
 }
 
