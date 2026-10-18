@@ -2107,11 +2107,10 @@ app.get("/", (request, response) => {
 });
 app.use((error, request, response, next) => {
   if (error instanceof SyntaxError && "body" in error) return response.status(400).json({ error: "Request body must be valid JSON." });
+
   console.error("Unhandled API error.", error);
   return response.status(500).json({ error: "Internal server error." });
 });
-
-
 
   const listen = () => app.listen(PORT, "0.0.0.0", () => {
     console.log(`FUTApulse API listening on port ${PORT}`);
@@ -2133,7 +2132,6 @@ app.use((error, request, response, next) => {
     .catch((error) => {
       throw new Error(`MongoDB is configured but unavailable; API startup stopped to prevent writes going to a separate local database: ${error.message}`);
     });
-}
 
 if (require.main === module) startServer();
 
