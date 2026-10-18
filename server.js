@@ -2111,15 +2111,7 @@ app.use((error, request, response, next) => {
   return response.status(500).json({ error: "Internal server error." });
 });
 
-function startServer() {
-  if (!JWT_SECRET) throw new Error("JWT_SECRET must be set when NODE_ENV=production.");
-  const production = process.env.NODE_ENV === "production";
-  if (production && !process.env.MONGO_URI) {
-    throw new Error("MONGO_URI must be set in production; local JSON fallback is disabled.");
-  }
-  if (production && !OPERATIONAL_MONGO_CUTOVER_COMPLETE) {
-    throw new Error("Production startup is blocked until event, report, and engagement data are switched to MongoDB in Phase 2.");
-  }
+
 
   const listen = () => app.listen(PORT, "0.0.0.0", () => {
     console.log(`FUTApulse API listening on port ${PORT}`);
