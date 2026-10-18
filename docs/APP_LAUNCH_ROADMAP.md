@@ -97,21 +97,34 @@ These are accepted product requirements or queued design tasks. They are not all
 - `node scripts/migrate-local-to-mongo.js` is a read-only dry run by default. It selects only the two approved account emails and their owned events/reports; `--apply` requires `MONGO_URI`, is idempotent, remaps local owner IDs, and does not alter the local source file.
 - The dry run selected 2 approved accounts, 2 owned event records, and 0 report cases, with no excluded accounts or events. A current pre-migration backup is retained at `data/backups/futapulse-phase2-pre-migration-2026-10-16T15-04-19-430Z.json`.
 - `/api/health` reports database connectivity; `/api/ready` reports production readiness. Production startup is intentionally blocked until event, report, and engagement API routes have switched to MongoDB. This prevents a production API from silently persisting event state to local JSON.
-- The current environment has no `MONGO_URI`, so no cloud database was contacted and no migration was applied. Development continues on local JSON while the repository cutover is implemented.
+- Phase 2 has since been completed on `phase-2-mongo`: Atlas connection, event/account migration path, Mongo-backed event/report/engagement operations, fallback guards, build, and API verification have been completed. This supersedes the earlier checkpoint above; do not treat the Phase 2 kickoff snapshot as current state.
 
-**Phase 2 remains in progress.** The schemas, allowlisted migration path, and production guard are in place. The next implementation step is to move event CRUD, reports, and engagement reads/writes onto these MongoDB models, then run the migration only after a staging database is configured.
+**Phase 2 review outcome: Complete.** Atlas is the shared database for deployed use. The local JSON path remains available only for deliberate local development without `MONGO_URI`; when MongoDB is configured but unavailable, the API stops instead of silently splitting writes.
 
-**Exit condition:** Two separate clients can create/read/update shared events and see the same server-confirmed attendance state, including after an API restart.
+**Exit condition:** Met and verified on `phase-2-mongo`: two clients share server-confirmed event and attendance state through MongoDB, and production startup is guarded by the Mongo cutover flag.
 
 ## Phase 3 - Deploy the API and phone-accessible client
 
 **Purpose:** Make the app reachable from student phones over the internet.
 
-- Choose an API host (for example Render or Railway) and a frontend host (for example Netlify or Vercel) based on current pricing, availability, and project needs.
-- Configure production secrets only in the host's secret manager: database URI, session/JWT secret, Google OAuth server secret, SMTP credentials, admin email, frontend origin, and allowed origins.
-- Set the client API base URL to the deployed HTTPS API; configure CORS, OAuth origins, email links, and deep links for the real app origin.
+- **Selected hosts:** Render for the Express API and Vercel for the Vite + React client. Keep this phase as deployment preparation until the Render service URL and Vercel project URL are known.
+- Deploy the Express API on Render from the repository root with `npm start`, the platform-provided `PORT`, and health check `/api/ready`. The server binds to `0.0.0.0`; keep `/api/ready` dependent on MongoDB readiness and the cutover flag.
+- Deploy the Vite client on Vercel with the project Root Directory set to `client`, build command `npm run build`, and output directory `dist`. Put Vercel routing configuration in `client/vercel.json` because `client/` is the Vercel project root.
+- **Use a same-origin API proxy for production cookies.** Configure `client/vercel.json` with an external rewrite from `/api/:path*` to `https://<your-render-service>.onrender.com/api/:path*`. This keeps the browser request URL on the Vercel origin while Vercel forwards it to Render. The exact Render hostname must be filled in after the Render service is created; do not use a guessed hostname.
+- In Vercel Production (and Preview only when preview deployments are intentionally supported), leave `VITE_API_BASE_URL` unset or set it to an empty value. The client then sends `/api/...` requests to its own origin, through the rewrite. Do **not** set this variable to the unrelated `*.onrender.com` host for the browser client: that makes auth cross-site and prevents the current `SameSite=Lax` refresh cookie from being sent reliably. Keep `http://localhost:3001` only in local development. Vite variables are embedded at build time, so changes require a new deployment.
+- The API uses a host-only, `HttpOnly`, `Secure` production refresh cookie with `SameSite=Lax` and path `/api/auth`. With the Vercel proxy, the browser receives it from and sends it to the Vercel origin; no cross-site cookie relaxation or cookie `Domain` override should be needed. Keep `credentials: 'include'` on client requests.
+- Set Render `CORS_ORIGIN` to the exact Vercel production origin (for example, `https://<project>.vercel.app`) and, only if needed, explicitly listed Vercel preview/custom origins. Never use `*` with credentialed requests. The Vercel proxy makes normal API calls same-origin from the browser; the allowlist remains a defense-in-depth configuration for direct requests and future clients.
+- For Google Identity Services popup code flow, set Render `GOOGLE_REDIRECT_URI` to the exact Vercel app origin, with no path or trailing slash, and add the same origin to the Google OAuth client's Authorized JavaScript origins. Add a custom domain origin too if students will use it. Keep `GOOGLE_CLIENT_SECRET` only in Render; the client ID may be served publicly by the API. Set Render `FRONTEND_URL` to the canonical Vercel/custom app origin so report links open the app. The OAuth popup's redirect URI must match the origin that initiated sign-in.
+- Configure Render secrets only in its Environment settings: `MONGO_URI`, a unique strong `JWT_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `FUTAPULSE_MONGO_CUTOVER_COMPLETE=true`. Set non-secret server settings there too: `NODE_ENV=production`, `CORS_ORIGIN`, `FRONTEND_URL`, `GOOGLE_REDIRECT_URI`, `FUTAPULSE_ADMIN_EMAIL`, and any mail sender settings. Never put server secrets in Vercel variables, `VITE_*` variables, or committed `.env` files.
+- Restrict the Atlas IP access list to the API host's outbound IP ranges or a private network path. Do not use `0.0.0.0/0` for production unless there is no alternative and the exposure is explicitly accepted.
 - Add a domain when ready; verify HTTPS, account recovery, signup email, Google sign-in, event share links, and server health on real phones.
 - Add basic operational visibility: error logs, database backups, uptime checks, and a simple recovery procedure.
+
+### Phase 3 deployment values still needed
+
+- Render public API origin, used as the target in `client/vercel.json` (for example, `https://<service>.onrender.com`).
+- Vercel production origin, used in Render `CORS_ORIGIN`, `FRONTEND_URL`, `GOOGLE_REDIRECT_URI`, and Google Authorized JavaScript origins.
+- Optional custom app domain and any preview origins that should be allowed to sign in.
 
 **Exit condition:** A phone on mobile data can sign in, browse, publish, and interact with events through the deployed service, with records shared across accounts/devices.
 

@@ -6,7 +6,8 @@ import {
 import AuthScreen from './components/AuthScreen'
 import CountdownPill from './components/CountdownPill'
 import EventCard from './components/EventCard'
-import NativeAdCard from './components/NativeAdCard'
+import AdSlot from './components/AdSlot'
+import LaunchAdGate from './components/LaunchAdGate'
 import BrandHeart from './components/BrandHeart'
 import ProfileSetupModal from './components/ProfileSetupModal'
 import ProfilePhotoCropper from './components/ProfilePhotoCropper'
@@ -560,21 +561,14 @@ function App() {
   }, [notify, setProfileMenuOpen])
 
   useEffect(() => {
-    const timer = window.setTimeout(() => setLaunchVisible(false), 3900)
+    const timer = window.setTimeout(() => setLaunchVisible(false), 1500)
     return () => window.clearTimeout(timer)
   }, [])
 
   useEffect(() => {
     if (hasSharedEventLink || launchVisible || sessionLoading) return undefined
-    let hideTimer
-    const showTimer = window.setTimeout(() => {
-      setIsLaunchAdActive(true)
-      hideTimer = window.setTimeout(() => setIsLaunchAdActive(false), 2000)
-    }, 0)
-    return () => {
-      window.clearTimeout(showTimer)
-      window.clearTimeout(hideTimer)
-    }
+    const timer = window.setTimeout(() => setIsLaunchAdActive(true), 0)
+    return () => window.clearTimeout(timer)
   }, [hasSharedEventLink, launchVisible, sessionLoading])
 
   useEffect(() => {
@@ -1813,7 +1807,7 @@ function App() {
         <div className="launch-brand" aria-hidden="true">
           <span className="launch-word launch-futa">FUTA</span>
           <span className="launch-word launch-pulse">pulse</span>
-          <BrandHeart className="launch-heart" size={40} variant="on-red" />
+          <BrandHeart className="launch-heart" size={40} />
         </div>
       </div>
     )
@@ -1821,18 +1815,10 @@ function App() {
 
   if (isLaunchAdActive) {
     return (
-      <div className={`app-root theme-${theme}`}>
-        <div className="launch-ad-overlay">
-          <section className="launch-ad-panel" role="dialog" aria-modal="true" aria-labelledby="launch-ad-title">
-            <span className="launch-ad-eyebrow">FUTApulse partner preview</span>
-            <div className="launch-ad-art" aria-hidden="true"><Sparkles size={32} /><span>YOUR CAMPUS<br />STARTS HERE</span></div>
-            <span className="launch-ad-sponsored">Sponsored</span>
-            <h1 id="launch-ad-title">A little something for campus life.</h1>
-            <p>Partner offers and campus promotions will appear here.</p>
-            <button type="button" className="launch-ad-skip" onClick={() => setIsLaunchAdActive(false)}>Skip Ad <ChevronRight size={16} /></button>
-          </section>
-        </div>
-      </div>
+      <LaunchAdGate
+        onComplete={() => setIsLaunchAdActive(false)}
+        onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')}
+      />
     )
   }
 
@@ -1930,7 +1916,7 @@ function App() {
                           ? <div className="home-event-track">{category.events.map((event) => <EventPreview key={getEventId(event)} homeVariant="home-category-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
                           : <div className="home-category-empty-track"><div className="home-category-empty-card"><span className="home-category-empty-mark"><Sparkles size={18} aria-hidden="true" /></span><strong>No {category.label} events yet</strong><span>Check back as campus events are added.</span></div></div>}
                       </section>
-                      {(categoryIndex + 1) % 2 === 0 && <NativeAdCard onAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
+                      {(categoryIndex + 1) % 2 === 0 && <AdSlot placement="home-category-pairs" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
                       </Fragment>
                     ))}
                   </div>
@@ -1954,9 +1940,9 @@ function App() {
                         <div id={`home-full-event-${getEventId(event)}`} className={`home-full-event-anchor ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''}`}>
                           <EventCard isHot={expandedHomeCategory === 'hot' || event.isHot === true || getHotScore(event) >= 10} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
                         </div>
-                        {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <NativeAdCard onAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
-                      </Fragment>) : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon">◌</span><strong>No events in this section yet</strong><span>Try another category to explore campus activity.</span></div><NativeAdCard onAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} /></>
-                    })()}
+                        {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <AdSlot placement="category-full-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
+                      </Fragment>) : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon">◌</span><strong>No events in this section yet</strong><span>Try another category to explore campus activity.</span></div><AdSlot placement="category-empty-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} /></>
+                      })()}
                   </section>
                 )}
               </div>

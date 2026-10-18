@@ -183,11 +183,14 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
   const [confirmPassword, setConfirmPassword] = useState('')
   const [googleEmail, setGoogleEmail] = useState('')
   const [googleUsername, setGoogleUsername] = useState('')
+  const [googlePassword, setGooglePassword] = useState('')
+  const [googleConfirmPassword, setGoogleConfirmPassword] = useState('')
   const [resetToken, setResetToken] = useState('')
   const [resetCodeVerification, setResetCodeVerification] = useState({ key: '', status: 'idle' })
   const [resetPassword, setResetPassword] = useState('')
   const [confirmResetPassword, setConfirmResetPassword] = useState('')
   const [googleSignupToken, setGoogleSignupToken] = useState('')
+  const [googlePasswordSetupToken, setGooglePasswordSetupToken] = useState('')
   const [resetMessage, setResetMessage] = useState('')
   const googleTimeoutRef = useRef(null)
 
@@ -279,7 +282,8 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
       mode === 'login' ? 'Contacting the FUTApulse server to verify your username and password…'
         : mode === 'signup' ? 'Requesting an email verification code…'
           : mode === 'verify-email' ? 'Verifying your email address and creating your account…'
-        : mode === 'google-username' ? 'Asking the FUTApulse server to reserve this username…'
+        : mode === 'google-username' ? 'Creating your FUTApulse account…'
+          : mode === 'google-password' ? 'Saving your FUTApulse password…'
             : mode === 'forgot' ? 'Sending your recovery request to the FUTApulse server…'
               : 'Asking the FUTApulse server to reset your password…',
     )
@@ -320,12 +324,23 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
         if (!isValidUsername(enteredUsername)) {
           throw new Error('Use 3–24 characters with at least one letter. Accents and letters from any language are supported.')
         }
+        if (!isValidNewPassword(googlePassword)) throw new Error('Use more than 6 characters, at least one uppercase letter, and at least one number.')
+        if (googlePassword !== googleConfirmPassword) throw new Error('Your passwords do not match.')
         const result = await request('/api/auth/google', {
           method: 'POST',
-          body: JSON.stringify({ onboardingToken: googleSignupToken, username: enteredUsername, remember }),
+          body: JSON.stringify({ onboardingToken: googleSignupToken, username: enteredUsername, password: googlePassword, remember }),
         })
         if (result.usernameRequired) throw new Error('Choose a unique username to continue.')
-        onAuthenticated(requireSessionResponse(result), remember, 'Server confirmed your Google account and username.')
+        onAuthenticated(requireSessionResponse(result), remember, 'Your Google account and FUTApulse password are ready.')
+      } else if (mode === 'google-password') {
+        if (!googlePasswordSetupToken) throw new Error('Restart Google sign-in to continue.')
+        if (!isValidNewPassword(googlePassword)) throw new Error('Use more than 6 characters, at least one uppercase letter, and at least one number.')
+        if (googlePassword !== googleConfirmPassword) throw new Error('Your passwords do not match.')
+        const result = await request('/api/auth/google/password', {
+          method: 'POST',
+          body: JSON.stringify({ passwordSetupToken: googlePasswordSetupToken, password: googlePassword, remember }),
+        })
+        onAuthenticated(requireSessionResponse(result), remember, 'Your FUTApulse password is ready.')
       } else if (mode === 'forgot') {
         const result = await request('/api/auth/forgot-password', {
           method: 'POST',
@@ -404,8 +419,20 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
               setGoogleSignupToken(result.signupToken)
               setGoogleEmail(result.email)
               setGoogleUsername(suggestedUsername(result.name, result.email))
+              setGooglePassword('')
+              setGoogleConfirmPassword('')
               setMode('google-username')
-              setServerStatus('Google verified your email. Choose a unique FUTApulse username to finish account setup.')
+              setServerStatus('Google verified your email. Choose a username and FUTApulse password to finish account setup.')
+              return
+            }
+            if (result.passwordRequired) {
+              if (!result.passwordSetupToken || !result.email) throw new Error('Google sign-in returned incomplete password setup details. Please retry.')
+              setGooglePasswordSetupToken(result.passwordSetupToken)
+              setGoogleEmail(result.email)
+              setGooglePassword('')
+              setGoogleConfirmPassword('')
+              setMode('google-password')
+              setServerStatus('Google verified your account. Create a FUTApulse password to use username and password sign-in next time.')
               return
             }
             onAuthenticated(requireSessionResponse(result), remember, 'Google sign-in was confirmed by FUTApulse.')
@@ -459,7 +486,7 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
       <section className="auth-panel" aria-labelledby="auth-title">
         <div className="auth-brand-mark">
           <h1 id="auth-title">FUTApulse</h1>
-          <BrandHeart className="auth-heart" size={23} variant="on-red" />
+          <BrandHeart className="auth-heart" size={23} />
         </div>
         <p className="auth-tagline">The heartbeat of FUTA.</p>
         <p className="auth-welcome">
@@ -516,15 +543,13 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
               </button>
               {mode === 'signup' && <label className="remember-me auth-remember-signup"><input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} /> <span>Remember me on this device</span></label>}
             </form>
-            {mode === 'signup' && (
-              <>
-                <div className="auth-divider"><span>Or</span></div>
-                <button className="google-login" type="button" onClick={startGoogle} disabled={loading}>
-                  <strong className="google-mark">G</strong>
-                  {loading ? 'Connecting…' : 'Continue with Google'}
-                </button>
-              </>
-            )}
+            <>
+              <div className="auth-divider"><span>Or</span></div>
+              <button className="google-login" type="button" onClick={startGoogle} disabled={loading}>
+                <strong className="google-mark">G</strong>
+                {loading ? 'Connecting…' : 'Continue with Google'}
+              </button>
+            </>
             <p className="auth-provider-note">
               {mode === 'signup' ? 'Accents and letters from any language are supported. Use an email you can access for account recovery.' : 'Sign in with your FUTApulse username and password.'}
             </p>
@@ -541,7 +566,24 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
           <form className="auth-subform" onSubmit={submitAuth}>
             <p className="google-account-email">{googleEmail}</p>
             <label className="auth-field"><span>Choose your username / profile name</span><input minLength={3} maxLength={24} autoComplete="username" value={googleUsername} onChange={(event) => setGoogleUsername(event.target.value)} required />{activeUsernameAvailability.message && <small className={`username-availability is-${activeUsernameAvailability.status}`} role="status" aria-live="polite">{activeUsernameAvailability.message}</small>}</label>
-            <button className="auth-submit" type="submit" disabled={loading}>{loading ? 'Please wait…' : 'Continue'}</button>
+            <PasswordField label="Create FUTApulse password" autoComplete="new-password" minLength={7} value={googlePassword} onChange={(event) => setGooglePassword(event.target.value)} ariaInvalid={Boolean(googlePassword && !isValidNewPassword(googlePassword))} ariaDescribedBy={googlePassword ? 'google-signup-password-strength' : undefined} />
+            <PasswordStrengthMeter password={googlePassword} minLength={7} idPrefix="google-signup-password" show={Boolean(googlePassword)} />
+            <PasswordField label="Confirm password" autoComplete="new-password" value={googleConfirmPassword} onChange={(event) => setGoogleConfirmPassword(event.target.value)} ariaInvalid={Boolean(googleConfirmPassword && googlePassword !== googleConfirmPassword)} />
+            {googleConfirmPassword && googlePassword !== googleConfirmPassword && <p className="mt-1 text-xs text-rose-300" role="alert">Passwords do not match.</p>}
+            <button className="auth-submit" type="submit" disabled={loading}>{loading ? 'Please wait…' : 'Create account'}</button>
+            <button className="google-back-btn" type="button" disabled={loading} onClick={() => changeMode('login')}>Back to sign in</button>
+          </form>
+        )}
+
+        {mode === 'google-password' && (
+          <form className="auth-subform" onSubmit={submitAuth}>
+            <p className="google-account-email">{googleEmail}</p>
+            <p>Create a FUTApulse password for this verified Google account. You’ll use it with your username when signing in.</p>
+            <PasswordField label="Create FUTApulse password" autoComplete="new-password" minLength={7} value={googlePassword} onChange={(event) => setGooglePassword(event.target.value)} ariaInvalid={Boolean(googlePassword && !isValidNewPassword(googlePassword))} ariaDescribedBy={googlePassword ? 'google-password-strength' : undefined} />
+            <PasswordStrengthMeter password={googlePassword} minLength={7} idPrefix="google-password" show={Boolean(googlePassword)} />
+            <PasswordField label="Confirm password" autoComplete="new-password" value={googleConfirmPassword} onChange={(event) => setGoogleConfirmPassword(event.target.value)} ariaInvalid={Boolean(googleConfirmPassword && googlePassword !== googleConfirmPassword)} />
+            {googleConfirmPassword && googlePassword !== googleConfirmPassword && <p className="mt-1 text-xs text-rose-300" role="alert">Passwords do not match.</p>}
+            <button className="auth-submit" type="submit" disabled={loading}>{loading ? 'Saving…' : 'Save password'}</button>
             <button className="google-back-btn" type="button" disabled={loading} onClick={() => changeMode('login')}>Back to sign in</button>
           </form>
         )}

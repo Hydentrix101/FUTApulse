@@ -55,7 +55,7 @@ Event posting is open to every signed-in student with a completed profile. Event
 
 Each signed-in account can report an event once per review cycle. Five unique reports send a review email to `FUTAPULSE_ADMIN_EMAIL`; reaching the threshold does not automatically remove the event or penalize its owner. Only that verified developer account can open Reported event review and choose to pause the event owner's posting access for seven days or ignore the reports. Email alerts use the same SMTP configuration as account verification and password recovery. Set `FRONTEND_URL` to the hosted app origin so review emails link to the correct event after deployment.
 
-MongoDB is optional in development. When `MONGO_URI` is missing or the database cannot connect, users (including their account-scoped profiles) and events use the local `data/futapulse.json` fallback. Demo events are tagged with `isDemo`; new user profiles are stored on their authenticated account, not in shared demo/test profile state. Google sign-in requires valid OAuth client ID and secret configuration in all environments; without these values the endpoint fails closed. Set `FUTAPULSE_DATA_FILE` to isolate local data, for example when running tests. Production requires a strong `JWT_SECRET`.
+MongoDB is optional in development only when `MONGO_URI` is not set; in that case users (including their account-scoped profiles) and events use the local `data/futapulse.json` fallback. If `MONGO_URI` is configured but MongoDB cannot connect, the API now stops instead of silently writing to a separate local database. Demo events are tagged with `isDemo`; new user profiles are stored on their authenticated account, not in shared demo/test profile state. Google sign-in requires valid OAuth client ID and secret configuration in all environments; without these values the endpoint fails closed. Set `FUTAPULSE_DATA_FILE` to isolate local data, for example when running tests. Production requires a strong `JWT_SECRET`.
 
 Email signup requires a real inbox that can receive the verification code. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, and `SMTP_PASS` (and optionally `SMTP_SECURE` and `MAIL_FROM`) before testing signup or password recovery; an email-shaped string alone is not proof that the address exists. Remember Me stores the signed token in local storage; without it, the token stays in session storage. In non-production mode, the recovery endpoint returns its token directly so the full reset flow can be tested. Production never returns the token, and email delivery must be configured before production password recovery can be used.
 
@@ -68,7 +68,7 @@ Email signup requires a real inbox that can receive the verification code. Confi
 - `POST /api/profiles`
 - `GET /api/profiles/:id`
 
-With MongoDB disconnected, API data is stored locally in `data/futapulse.json`.
+Without `MONGO_URI`, development API data is stored locally in `data/futapulse.json`. If a configured MongoDB connection is unavailable, the API exits rather than splitting data across Atlas and local storage.
 
 Signed-in students with a completed profile may publish campus events without a banner. Exact duplicates (title, venue, category, start time, end time, and event activity) are blocked; close matches are shown so the author can inspect them before confirming that the event is distinct. An edited event is excluded from its own comparison. Event edits are restricted to the account that created the event; legacy events without verified ownership remain read-only.
 

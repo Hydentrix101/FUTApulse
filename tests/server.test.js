@@ -7,9 +7,14 @@ const path = require("node:path");
 const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "futapulse-test-"));
 const dataFile = path.join(dataDirectory, "futapulse.json");
 process.env.FUTAPULSE_DATA_FILE = dataFile;
+process.env.MONGO_URI = "";
+process.env.JWT_SECRET = "futapulse-tests-only-signing-secret";
+process.env.GOOGLE_CLIENT_ID = "google-client-id-for-tests";
+process.env.GOOGLE_CLIENT_SECRET = "google-client-secret-for-tests";
 
-const { app, models } = require("../server");
+const { app, models, buildFacultyTurnoutBreakdown } = require("../server");
 const { buildApprovedMigrationPlan } = require("../server/dataMigration");
+const jwt = require("jsonwebtoken");
 const deliveredEmails = [];
 app.locals.emailSender = async ({ text }) => deliveredEmails.push(text);
 
@@ -106,6 +111,23 @@ test("Phase 2 Mongo models define event lookup and per-account action uniqueness
   assert.ok(reportIndexes.some(([fields]) => fields.eventId === 1));
 });
 
+test("faculty turnout groups attendance and recovers faculty from the attendee account when an action has no snapshot", () => {
+  const turnout = buildFacultyTurnoutBreakdown([
+    { userId: "attendee-one", faculty: "" },
+    { userId: "attendee-two", faculty: "SEET" },
+    { userId: "attendee-three", faculty: "" },
+    { userId: "unknown-attendee", faculty: "" }
+  ], new Map([
+    ["attendee-one", "SEET"],
+    ["attendee-three", "SPS"]
+  ]));
+
+  assert.deepEqual(turnout, [
+    { faculty: "SEET", count: 2 },
+    { faculty: "SPS", count: 1 }
+  ]);
+});
+
 test("health and readiness clearly report the local development storage mode", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const healthResponse = await fetch(`${baseUrl}/api/health`);
@@ -142,6 +164,88 @@ test("GET /api/events/hot returns only qualifying events, ranked by engagement s
   assert.deepEqual(body.events.map((event) => event.id), ["event-high", "event-ended-29m"]);
   assert.equal(body.events[0].hotScore, 15);
   assert.equal(body.events[0].isHot, true);
+});
+
+test("Google onboarding saves a FUTApulse password that works for username sign-in", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const onboardingToken = jwt.sign({
+    email: "google-new@example.com",
+    name: "Google New",
+    picture: "",
+    googleSubject: "google-sub-new",
+    tokenUse: "google-onboarding"
+  }, process.env.JWT_SECRET, { expiresIn: "10m" });
+
+  const invalid = await fetch(`${baseUrl}/api/auth/google`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ onboardingToken, username: "google_new", password: "weak", remember: false })
+  });
+  assert.equal(invalid.status, 400);
+
+  const created = await fetch(`${baseUrl}/api/auth/google`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ onboardingToken, username: "google_new", password: "StrongPassword1", remember: false })
+  });
+  assert.equal(created.status, 200);
+  assert.ok((await created.json()).token);
+
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "google_new", password: "StrongPassword1", remember: false })
+  });
+  assert.equal(login.status, 200);
+  assert.ok((await login.json()).token);
+});
+
+test("legacy Google-only accounts can set their first FUTApulse password using a short-lived setup token", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const legacyId = "legacy-google-account";
+  const database = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  database.users.push({
+    id: legacyId,
+    email: "google-legacy@example.com",
+    username: "google_legacy",
+    passwordHash: "",
+    emailVerified: true,
+    googleSubject: "google-sub-legacy",
+    sessionVersion: 0,
+    profile: { name: "Google Legacy", picture: "", faculty: "", department: "", level: "", role: "explorer" }
+  });
+  fs.writeFileSync(dataFile, JSON.stringify(database, null, 2));
+
+  const onboardingToken = jwt.sign({
+    email: "google-legacy@example.com",
+    name: "Google Legacy",
+    picture: "",
+    googleSubject: "google-sub-legacy",
+    tokenUse: "google-onboarding"
+  }, process.env.JWT_SECRET, { expiresIn: "10m" });
+  const googleSignIn = await fetch(`${baseUrl}/api/auth/google`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ onboardingToken, remember: false })
+  });
+  assert.equal(googleSignIn.status, 200);
+  const googleSignInResult = await googleSignIn.json();
+  assert.equal(googleSignInResult.passwordRequired, true);
+  assert.equal(googleSignInResult.email, "google-legacy@example.com");
+  const setup = await fetch(`${baseUrl}/api/auth/google/password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ passwordSetupToken: googleSignInResult.passwordSetupToken, password: "LegacyPassword1", remember: false })
+  });
+  assert.equal(setup.status, 200);
+
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "google_legacy", password: "LegacyPassword1", remember: false })
+  });
+  assert.equal(login.status, 200);
+  assert.ok((await login.json()).token);
 });
 
 test("GET /api/events/hot keeps ended events only through the 30-minute grace period", async () => {

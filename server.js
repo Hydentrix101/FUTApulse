@@ -338,6 +338,15 @@ function isMongoConnected() {
   return mongoose.connection.readyState === 1;
 }
 
+function buildFacultyTurnoutBreakdown(attendees, facultyByUserId = new Map()) {
+  const turnoutBreakdown = new Map();
+  for (const action of attendees) {
+    const faculty = String(action.faculty || facultyByUserId.get(String(action.userId)) || "").trim();
+    if (faculty) turnoutBreakdown.set(faculty, (turnoutBreakdown.get(faculty) || 0) + 1);
+  }
+  return [...turnoutBreakdown].map(([faculty, count]) => ({ faculty, count }));
+}
+
 function eventDocumentFromRecord(event) {
   const startsAt = new Date(event.date || event.startTime || "");
   const endsAt = new Date(event.endTime || "");
@@ -364,24 +373,34 @@ async function listStoredEvents(viewerId = "") {
     if (!actionsByEvent.has(action.eventId)) actionsByEvent.set(action.eventId, []);
     actionsByEvent.get(action.eventId).push(action);
   }
+  const attendeesMissingFaculty = actions
+    .filter((action) => action.type === "rsvp" && !String(action.faculty || "").trim())
+    .map((action) => String(action.userId || ""));
+  const missingFacultyUserIds = [...new Set(attendeesMissingFaculty)].filter((id) => mongoose.isValidObjectId(id));
+  const facultyByUserId = new Map();
+  if (missingFacultyUserIds.length) {
+    const attendeeUsers = await User.find({ _id: { $in: missingFacultyUserIds } })
+      .select("_id profile.faculty")
+      .lean()
+      .exec();
+    for (const attendee of attendeeUsers) {
+      const faculty = String(attendee.profile?.faculty || "").trim();
+      if (faculty) facultyByUserId.set(String(attendee._id), faculty);
+    }
+  }
   return events.map((event) => {
     const eventActions = actionsByEvent.get(String(event.id)) || [];
     const matching = (type) => eventActions.filter((action) => action.type === type);
     const attendees = matching("rsvp");
     const hyped = matching("flame");
     const reminders = matching("reminder");
-    const turnoutBreakdown = new Map();
-    for (const action of attendees) {
-      const faculty = String(action.faculty || "").trim();
-      if (faculty) turnoutBreakdown.set(faculty, (turnoutBreakdown.get(faculty) || 0) + 1);
-    }
     return {
       ...event,
       rsvpCount: attendees.length,
       turnoutCount: attendees.length,
       flameCount: hyped.length,
       reminderCount: reminders.length,
-      turnoutBreakdown: [...turnoutBreakdown].map(([faculty, count]) => ({ faculty, count })),
+      turnoutBreakdown: buildFacultyTurnoutBreakdown(attendees, facultyByUserId),
       attendeeUserIds: viewerId && attendees.some((action) => String(action.userId) === String(viewerId)) ? [String(viewerId)] : [],
       hypedUserIds: viewerId && hyped.some((action) => String(action.userId) === String(viewerId)) ? [String(viewerId)] : [],
       reminderUserIds: viewerId && reminders.some((action) => String(action.userId) === String(viewerId)) ? [String(viewerId)] : []
@@ -424,8 +443,7 @@ async function listStoredReports() {
 
 async function storeReport(reportCase) {
   if (!isMongoConnected()) {
-    const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
-    const storedEvents = await listStoredEvents();
+    const database = readDatabase();
     const reports = database.eventReports || [];
     const index = reports.findIndex((item) => String(item.eventId) === String(reportCase.eventId));
     if (index < 0) reports.push(reportCase);
@@ -728,6 +746,15 @@ async function findUserByResetTokenHash(tokenHash) {
   ) || null;
 }
 
+async function findMongoUserById(id) {
+  // Local development accounts historically used UUIDs, while MongoDB's User
+  // model uses ObjectIds. Old local access/refresh tokens can still contain a
+  // UUID after the API is switched to Atlas; treat those tokens as expired
+  // instead of letting Mongoose throw a CastError and return a 500.
+  if (!mongoose.isValidObjectId(id)) return null;
+  return User.findById(id).exec();
+}
+
 async function getAuthenticatedUser(request) {
   const authorization = request.get("authorization") || "";
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
@@ -735,7 +762,7 @@ async function getAuthenticatedUser(request) {
   const claims = jwt.verify(token, JWT_SECRET);
   if (claims.tokenUse !== "access") return null;
   const user = isMongoConnected()
-    ? await User.findById(claims.sub).exec()
+    ? await findMongoUserById(claims.sub)
     : readDatabase().users.find((item) => item.id === claims.sub) || null;
   if (!user || (claims.sessionVersion || 0) !== (user.sessionVersion || 0)) return null;
   return user;
@@ -782,19 +809,28 @@ app.get("/api/health", (request, response) => {
     ok: true,
     service: "futapulse-api",
     database: databaseBackend === "mongodb" ? "mongodb" : "local-fallback",
-    databaseConnected: databaseBackend === "mongodb" ? isMongoConnected() : true,
+    databaseConnected: isMongoConnected(),
     timestamp: new Date().toISOString()
   });
 });
 
 app.get("/api/ready", (request, response) => {
-  const productionReady = process.env.NODE_ENV !== "production"
-    || (isMongoConnected() && OPERATIONAL_MONGO_CUTOVER_COMPLETE);
-  return response.status(productionReady ? 200 : 503).json({
-    ready: productionReady,
+  const storageReady = databaseBackend === "mongodb"
+    ? isMongoConnected()
+    : !process.env.MONGO_URI;
+  const ready = storageReady && (process.env.NODE_ENV !== "production" || OPERATIONAL_MONGO_CUTOVER_COMPLETE);
+  return response.status(ready ? 200 : 503).json({
+    ready,
     database: isMongoConnected() ? "mongodb" : "local-fallback",
     operationalMongoCutover: OPERATIONAL_MONGO_CUTOVER_COMPLETE
   });
+});
+
+app.use("/api", (request, response, next) => {
+  if (databaseBackend === "mongodb" && !isMongoConnected()) {
+    return response.status(503).json({ error: "FUTApulse is temporarily disconnected from its cloud database. Please retry shortly." });
+  }
+  return next();
 });
 
 app.get("/api/config/google", (request, response) => {
@@ -840,7 +876,7 @@ app.post("/api/auth/refresh", async (request, response) => {
     const claims = jwt.verify(refreshToken, JWT_SECRET);
     if (claims.tokenUse !== "refresh") return response.status(401).json({ error: "Session is no longer valid." });
     const user = isMongoConnected()
-      ? await User.findById(claims.sub).exec()
+      ? await findMongoUserById(claims.sub)
       : readDatabase().users.find((item) => item.id === claims.sub) || null;
     if (!user || (claims.sessionVersion || 0) !== (user.sessionVersion || 0)) {
       clearRefreshCookie(response);
@@ -1462,14 +1498,26 @@ app.post("/api/auth/google", async (request, response) => {
         return response.status(400).json({ error: "Use 3â€“24 characters with at least one letter. Accents and letters from any language are supported." });
       }
       if (await findUserByUsername(username)) return response.status(409).json({ error: "That username is already taken." });
+      const password = typeof body.password === "string" ? body.password : "";
+      if (!isValidNewPassword(password)) return response.status(400).json({ error: "Use more than 6 characters, at least one uppercase letter, and at least one number." });
+      const passwordHash = await bcrypt.hash(password, 12);
       user = await createUser({
         email,
         username,
-        passwordHash: "",
+        passwordHash,
         emailVerified: true,
         googleSubject: identity.sub,
         profile: { name: displayName, picture: identity.picture, faculty: "", department: "", level: "", role: "explorer" }
       });
+    }
+    if (!user.passwordHash) {
+      const passwordSetupToken = jwt.sign({
+        sub: String(user._id || user.id),
+        email,
+        googleSubject: identity.sub,
+        tokenUse: "google-password-setup"
+      }, JWT_SECRET, { expiresIn: "10m" });
+      return response.status(200).json({ passwordRequired: true, passwordSetupToken, email });
     }
     return response.json(sendSession(response, user, body.remember === true));
   } catch (error) {
@@ -1483,6 +1531,52 @@ app.post("/api/auth/google", async (request, response) => {
     }
     console.error("Google sign-in failed.", error);
     return response.status(500).json({ error: "Unable to complete Google sign-in right now." });
+  }
+});
+
+app.post("/api/auth/google/password", async (request, response) => {
+  const body = request.body || {};
+  const token = typeof body.passwordSetupToken === "string" ? body.passwordSetupToken : "";
+  const password = typeof body.password === "string" ? body.password : "";
+  if (!token) return response.status(400).json({ error: "Google password setup has expired. Start Google sign-in again." });
+  if (!isValidNewPassword(password)) return response.status(400).json({ error: "Use more than 6 characters, at least one uppercase letter, and at least one number." });
+
+  try {
+    const claims = jwt.verify(token, JWT_SECRET);
+    if (claims.tokenUse !== "google-password-setup" || !claims.sub || !claims.email || !claims.googleSubject) {
+      return response.status(401).json({ error: "Google password setup is no longer valid. Start Google sign-in again." });
+    }
+    const user = isMongoConnected()
+      ? await findMongoUserById(claims.sub)
+      : readDatabase().users.find((item) => item.id === claims.sub) || null;
+    if (!user || user.email !== claims.email || (user.googleSubject && user.googleSubject !== claims.googleSubject)) {
+      return response.status(401).json({ error: "Google password setup is no longer valid. Start Google sign-in again." });
+    }
+    if (user.passwordHash) return response.status(409).json({ error: "This account already has a password. Sign in with it or use password recovery." });
+
+    user.passwordHash = await bcrypt.hash(password, 12);
+    user.googleSubject = claims.googleSubject;
+    user.emailVerified = true;
+    user.sessionVersion = (user.sessionVersion || 0) + 1;
+    if (isMongoConnected()) {
+      await user.save();
+    } else {
+      const database = readDatabase();
+      const storedUser = database.users.find((item) => item.id === claims.sub);
+      if (!storedUser) return response.status(401).json({ error: "Google password setup is no longer valid. Start Google sign-in again." });
+      storedUser.passwordHash = user.passwordHash;
+      storedUser.googleSubject = claims.googleSubject;
+      storedUser.emailVerified = true;
+      storedUser.sessionVersion = user.sessionVersion;
+      writeDatabase(database);
+    }
+    return response.json(sendSession(response, user, body.remember === true));
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Google password setup expired. Start Google sign-in again." });
+    }
+    console.error("Google password setup failed.", error);
+    return response.status(500).json({ error: "Unable to save the password right now." });
   }
 });
 
@@ -2027,8 +2121,8 @@ function startServer() {
     throw new Error("Production startup is blocked until event, report, and engagement data are switched to MongoDB in Phase 2.");
   }
 
-  const listen = () => app.listen(PORT, () => {
-    console.log(`FUTApulse API running at http://localhost:${PORT}`);
+  const listen = () => app.listen(PORT, "0.0.0.0", () => {
+    console.log(`FUTApulse API listening on port ${PORT}`);
   });
 
   if (!process.env.MONGO_URI) {
@@ -2045,10 +2139,7 @@ function startServer() {
       return listen();
     })
     .catch((error) => {
-      if (production) throw new Error(`MongoDB is unavailable; production API did not start: ${error.message}`);
-      ensureDatabase();
-      console.warn(`MongoDB unavailable; using local fallback storage in development: ${error.message}`);
-      return listen();
+      throw new Error(`MongoDB is configured but unavailable; API startup stopped to prevent writes going to a separate local database: ${error.message}`);
     });
 }
 
@@ -2057,5 +2148,6 @@ if (require.main === module) startServer();
 module.exports = {
   app,
   startServer,
-  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport }
+  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport },
+  buildFacultyTurnoutBreakdown
 };

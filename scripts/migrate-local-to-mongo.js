@@ -52,6 +52,10 @@ async function main() {
   }
 
   const accountIds = mapAccountIds(plan.users, migratedUsers)
+  const facultyByAccountId = new Map(migratedUsers.map((user) => [
+    String(user._id),
+    String(user.profile?.faculty || '').trim(),
+  ]))
   let insertedEvents = 0
   for (const sourceEvent of plan.events) {
     const ownerUserId = accountIds.get(String(sourceEvent.createdByUserId))
@@ -63,7 +67,10 @@ async function main() {
         await models.EngagementAction.bulkWrite(record[field].map((userId) => ({
           updateOne: {
             filter: { eventId: String(sourceEvent.id), userId, type: actionType },
-            update: { $setOnInsert: { eventId: String(sourceEvent.id), userId, type: actionType } },
+            update: {
+              $set: { faculty: facultyByAccountId.get(userId) || '' },
+              $setOnInsert: { eventId: String(sourceEvent.id), userId, type: actionType },
+            },
             upsert: true,
           },
         })), { ordered: false })
