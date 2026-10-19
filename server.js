@@ -6,11 +6,13 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 const { OAuth2Client } = require("google-auth-library");
 
 if (fs.existsSync(path.join(__dirname, ".env"))) process.loadEnvFile(path.join(__dirname, ".env"));
 
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const EMAIL_SEND_TIMEOUT_MS = 15_000;
 const PORT = Number(process.env.PORT || 3001);
 const ROOT = __dirname;
 const CLIENT_DIST = path.join(ROOT, "client", "dist");
@@ -602,33 +604,17 @@ function refreshSessionIsPersistent(request) {
   }
 }
 
-let smtpTransporter = null;
-let smtpTransporterKey = "";
+function isEmailDeliveryConfigured() {
+  return typeof app.locals.emailSender === "function" || Boolean(resend);
+}
 
-function createSmtpTransport() {
-  const host = process.env.SMTP_HOST;
-  const port = Number(process.env.SMTP_PORT);
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-  if (!host || !Number.isInteger(port) || !user || !pass) return null;
-  const transporterKey = `${host}:${port}:${user}:${pass}:${process.env.SMTP_SECURE === "true"}`;
-  if (smtpTransporter && smtpTransporterKey === transporterKey) return smtpTransporter;
-  smtpTransporter?.close();
-  smtpTransporterKey = transporterKey;
-  smtpTransporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: process.env.SMTP_SECURE === "true",
-    auth: { user, pass },
-    pool: true,
-    maxConnections: 2,
-    maxMessages: 100,
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
-    socketTimeout: 20000,
-    dnsTimeout: 5000
-  });
-  return smtpTransporter;
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 async function deliverEmail({ to, subject, text, replyTo }) {
@@ -636,19 +622,40 @@ async function deliverEmail({ to, subject, text, replyTo }) {
     await app.locals.emailSender({ to, subject, text });
     return;
   }
-  const transporter = createSmtpTransport();
-  if (!transporter) {
-    const error = new Error("Email delivery is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, and SMTP_PASS in .env.");
+  if (!resend) {
+    const error = new Error("Email delivery is not configured. Set RESEND_API_KEY in the server environment.");
     error.code = "EMAIL_NOT_CONFIGURED";
     throw error;
   }
-  await transporter.sendMail({
-    from: process.env.MAIL_FROM || process.env.SMTP_USER,
-    to,
-    subject,
-    text,
-    ...(replyTo ? { replyTo } : {})
-  });
+  const toEmail = String(to || "").trim();
+  if (!toEmail || !subject || !text) {
+    throw new Error("Email delivery requires a recipient, subject, and message.");
+  }
+  try {
+    const result = await resend.emails.send({
+      from: "FUTApulse <onboarding@resend.dev>",
+      to: [toEmail],
+      subject,
+      html: `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#172033"><p>${escapeHtml(text).replace(/\r?\n/g, "<br>")}</p></div>`,
+      ...(replyTo ? { replyTo } : {})
+    }, { signal: AbortSignal.timeout(EMAIL_SEND_TIMEOUT_MS) });
+    if (result.error) {
+      const error = new Error(`Resend could not deliver the email: ${result.error.message || "Unknown provider error."}`);
+      error.code = "EMAIL_DELIVERY_FAILED";
+      error.statusCode = result.error.statusCode || null;
+      throw error;
+    }
+    if (!result.data?.id) {
+      const error = new Error("Resend did not confirm that the email was accepted.");
+      error.code = "EMAIL_DELIVERY_FAILED";
+      throw error;
+    }
+  } catch (cause) {
+    if (cause && cause.code === "EMAIL_DELIVERY_FAILED") throw cause;
+    const error = new Error("Resend email delivery failed or timed out. Please retry.", { cause });
+    error.code = "EMAIL_DELIVERY_FAILED";
+    throw error;
+  }
 }
 
 async function saveEmailChallenge({ email, purpose, codeHash, expiresAt, payload = {} }) {
@@ -1133,6 +1140,7 @@ app.post("/api/auth/change-email", async (request, response) => {
   } catch (error) {
     if (error.code === 11000) return response.status(409).json({ error: "An account with that email already exists." });
     if (error.code === "EMAIL_NOT_CONFIGURED") return response.status(503).json({ error: error.message });
+    if (error.code === "EMAIL_DELIVERY_FAILED") return response.status(502).json({ error: error.message });
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
       return response.status(401).json({ error: "Session is no longer valid." });
     }
@@ -1326,6 +1334,7 @@ app.post("/api/auth/signup", async (request, response) => {
   } catch (error) {
     if (error.code === 11000) return response.status(409).json({ error: "That email or username is already registered." });
     if (error.code === "EMAIL_NOT_CONFIGURED") return response.status(503).json({ error: error.message });
+    if (error.code === "EMAIL_DELIVERY_FAILED") return response.status(502).json({ error: error.message });
     console.error("Signup verification request failed.", error);
     return response.status(500).json({ error: "Unable to send the account verification code right now." });
   }
@@ -1406,8 +1415,8 @@ app.post("/api/auth/forgot-password", async (request, response) => {
   }
 
   try {
-    if (!app.locals.emailSender && !createSmtpTransport()) {
-      return response.status(503).json({ error: "Password recovery email is not configured yet. Please contact support." });
+    if (!isEmailDeliveryConfigured()) {
+      return response.status(503).json({ error: "Password recovery email is not configured yet. Set RESEND_API_KEY on the server." });
     }
     const user = await findUserByEmail(email);
     if (user) {
@@ -1415,6 +1424,7 @@ app.post("/api/auth/forgot-password", async (request, response) => {
     }
     return response.json({ message: "If an account exists for that email, a password reset code has been sent to its registered email address." });
   } catch (error) {
+    if (error.code === "EMAIL_DELIVERY_FAILED") return response.status(502).json({ error: error.message });
     console.error("Password recovery request failed.", error);
     return response.status(500).json({ error: "Unable to request password recovery right now." });
   }
