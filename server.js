@@ -6,13 +6,14 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const { Resend } = require("resend");
+const nodemailer = require("nodemailer");
 const { OAuth2Client } = require("google-auth-library");
 
 if (fs.existsSync(path.join(__dirname, ".env"))) process.loadEnvFile(path.join(__dirname, ".env"));
 
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-const EMAIL_SEND_TIMEOUT_MS = 15_000;
+const EMAIL_CONNECTION_TIMEOUT_MS = 10_000;
+const EMAIL_GREETING_TIMEOUT_MS = 10_000;
+const EMAIL_SOCKET_TIMEOUT_MS = 30_000;
 const PORT = Number(process.env.PORT || 3001);
 const ROOT = __dirname;
 const CLIENT_DIST = path.join(ROOT, "client", "dist");
@@ -604,9 +605,8 @@ function refreshSessionIsPersistent(request) {
   }
 }
 
-function isEmailDeliveryConfigured() {
-  return typeof app.locals.emailSender === "function" || Boolean(resend);
-}
+let smtpTransporter = null;
+let smtpTransporterKey = "";
 
 function escapeHtml(value) {
   return String(value)
@@ -617,13 +617,46 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+function createSmtpTransport() {
+  const host = process.env.SMTP_HOST || "smtp.gmail.com";
+  const port = Number(process.env.SMTP_PORT || 465);
+  const user = String(process.env.SMTP_USER || "").trim();
+  const pass = process.env.SMTP_PASS || "";
+  if (!user || !pass || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+
+  const secure = process.env.SMTP_SECURE === undefined
+    ? port === 465
+    : process.env.SMTP_SECURE === "true";
+  const transporterKey = `${host}:${port}:${user}:${pass}:${secure}`;
+  if (smtpTransporter && smtpTransporterKey === transporterKey) return smtpTransporter;
+
+  smtpTransporter?.close();
+  smtpTransporterKey = transporterKey;
+  smtpTransporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: { user, pass },
+    connectionTimeout: EMAIL_CONNECTION_TIMEOUT_MS,
+    greetingTimeout: EMAIL_GREETING_TIMEOUT_MS,
+    socketTimeout: EMAIL_SOCKET_TIMEOUT_MS,
+    tls: { minVersion: "TLSv1.2" }
+  });
+  return smtpTransporter;
+}
+
+function isEmailDeliveryConfigured() {
+  return typeof app.locals.emailSender === "function" || Boolean(createSmtpTransport());
+}
+
 async function deliverEmail({ to, subject, text, replyTo }) {
   if (typeof app.locals.emailSender === "function") {
     await app.locals.emailSender({ to, subject, text });
     return;
   }
-  if (!resend) {
-    const error = new Error("Email delivery is not configured. Set RESEND_API_KEY in the server environment.");
+  const transporter = createSmtpTransport();
+  if (!transporter) {
+    const error = new Error("Email delivery is not configured. Set SMTP_USER and SMTP_PASS (a Gmail App Password) in the server environment.");
     error.code = "EMAIL_NOT_CONFIGURED";
     throw error;
   }
@@ -632,27 +665,22 @@ async function deliverEmail({ to, subject, text, replyTo }) {
     throw new Error("Email delivery requires a recipient, subject, and message.");
   }
   try {
-    const result = await resend.emails.send({
-      from: "FUTApulse <onboarding@resend.dev>",
-      to: [toEmail],
+    const result = await transporter.sendMail({
+      from: process.env.MAIL_FROM || `FUTApulse <${String(process.env.SMTP_USER).trim()}>`,
+      to: toEmail,
       subject,
+      text,
       html: `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#172033"><p>${escapeHtml(text).replace(/\r?\n/g, "<br>")}</p></div>`,
       ...(replyTo ? { replyTo } : {})
-    }, { signal: AbortSignal.timeout(EMAIL_SEND_TIMEOUT_MS) });
-    if (result.error) {
-      const error = new Error(`Resend could not deliver the email: ${result.error.message || "Unknown provider error."}`);
-      error.code = "EMAIL_DELIVERY_FAILED";
-      error.statusCode = result.error.statusCode || null;
-      throw error;
-    }
-    if (!result.data?.id) {
-      const error = new Error("Resend did not confirm that the email was accepted.");
+    });
+    if (!Array.isArray(result.accepted) || !result.accepted.some((recipient) => String(recipient).toLowerCase() === toEmail.toLowerCase())) {
+      const error = new Error("Gmail SMTP did not confirm acceptance of the recipient.");
       error.code = "EMAIL_DELIVERY_FAILED";
       throw error;
     }
   } catch (cause) {
     if (cause && cause.code === "EMAIL_DELIVERY_FAILED") throw cause;
-    const error = new Error("Resend email delivery failed or timed out. Please retry.", { cause });
+    const error = new Error("Gmail SMTP email delivery failed. Check the mail server configuration and retry.", { cause });
     error.code = "EMAIL_DELIVERY_FAILED";
     throw error;
   }
@@ -1416,7 +1444,7 @@ app.post("/api/auth/forgot-password", async (request, response) => {
 
   try {
     if (!isEmailDeliveryConfigured()) {
-      return response.status(503).json({ error: "Password recovery email is not configured yet. Set RESEND_API_KEY on the server." });
+      return response.status(503).json({ error: "Password recovery email is not configured yet. Set SMTP_USER and SMTP_PASS on the server." });
     }
     const user = await findUserByEmail(email);
     if (user) {
