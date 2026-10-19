@@ -602,18 +602,33 @@ function refreshSessionIsPersistent(request) {
   }
 }
 
+let smtpTransporter = null;
+let smtpTransporterKey = "";
+
 function createSmtpTransport() {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT);
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
   if (!host || !Number.isInteger(port) || !user || !pass) return null;
-  return nodemailer.createTransport({
+  const transporterKey = `${host}:${port}:${user}:${pass}:${process.env.SMTP_SECURE === "true"}`;
+  if (smtpTransporter && smtpTransporterKey === transporterKey) return smtpTransporter;
+  smtpTransporter?.close();
+  smtpTransporterKey = transporterKey;
+  smtpTransporter = nodemailer.createTransport({
     host,
     port,
     secure: process.env.SMTP_SECURE === "true",
-    auth: { user, pass }
+    auth: { user, pass },
+    pool: true,
+    maxConnections: 2,
+    maxMessages: 100,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 20000,
+    dnsTimeout: 5000
   });
+  return smtpTransporter;
 }
 
 async function deliverEmail({ to, subject, text, replyTo }) {
@@ -1641,6 +1656,47 @@ app.get("/api/events", async (request, response) => {
   }
 });
 
+// Lightweight polling contract for mobile clients. Feed cards and banners are
+// fetched separately; frequent count refreshes should not resend those assets.
+app.get("/api/events/engagement", async (request, response) => {
+  try {
+    const authorization = request.get("authorization") || "";
+    const user = authorization.startsWith("Bearer ") ? await getAuthenticatedUser(request) : null;
+    if (authorization.startsWith("Bearer ") && !user) return response.status(401).json({ error: "Session is no longer valid." });
+    const viewerId = user ? String(user._id || user.id) : "";
+    const events = await listStoredEvents(viewerId);
+    const updates = events
+      .filter((event) => ["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event))
+      .map((event) => {
+        const hasAction = (field) => viewerId && Array.isArray(event[field]) && event[field].includes(viewerId);
+        const flameCount = Number(event.flameCount ?? event.hypeCount) || 0;
+        const rsvpCount = Number(event.rsvpCount ?? event.turnoutCount) || 0;
+        const reminderCount = Number(event.reminderCount) || 0;
+        return {
+          id: String(event.id),
+          status: event.status,
+          flameCount,
+          hypeCount: flameCount,
+          rsvpCount,
+          turnoutCount: rsvpCount,
+          reminderCount,
+          turnoutBreakdown: Array.isArray(event.turnoutBreakdown) ? event.turnoutBreakdown : [],
+          isGoing: Boolean(hasAction("attendeeUserIds")),
+          isHyped: Boolean(hasAction("hypedUserIds")),
+          isReminded: Boolean(hasAction("reminderUserIds")),
+          isHot: (rsvpCount * 2) + (reminderCount * 3) + flameCount >= HOT_EVENT_THRESHOLD
+        };
+      });
+    return response.json({ updates });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Session is no longer valid." });
+    }
+    console.error("Event engagement refresh failed.", error);
+    return response.status(500).json({ error: "Unable to refresh event counts." });
+  }
+});
+
 const HOT_EVENT_THRESHOLD = 10;
 const ENGAGEMENT_COUNTERS = {
   flame: "flameCount",
@@ -2145,6 +2201,7 @@ app.use((error, request, response, next) => {
   return response.status(500).json({ error: "Internal server error." });
 });
 
+async function startServer() {
   const listen = () => app.listen(PORT, "0.0.0.0", () => {
     console.log(`FUTApulse API listening on port ${PORT}`);
   });
@@ -2165,8 +2222,14 @@ app.use((error, request, response, next) => {
     .catch((error) => {
       throw new Error(`MongoDB is configured but unavailable; API startup stopped to prevent writes going to a separate local database: ${error.message}`);
     });
+}
 
-if (require.main === module) startServer();
+if (require.main === module) {
+  startServer().catch((error) => {
+    console.error("FUTApulse API startup failed.", error);
+    process.exitCode = 1;
+  });
+}
 
 module.exports = {
   app,

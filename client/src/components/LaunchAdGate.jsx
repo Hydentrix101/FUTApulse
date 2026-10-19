@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
+import { Check, SkipForward } from 'lucide-react'
 import HouseSponsorCard from './HouseSponsorCard'
 import { dismissLaunchAd, preloadLaunchAd, showLaunchAd } from '../ads/adProviderAdapter'
 
-const LOAD_TIMEOUT_MS = 2000
-const HOUSE_FALLBACK_MS = 1800
-const MAX_VIDEO_DISPLAY_MS = 30000
+const LOAD_TIMEOUT_MS = 2500
+const MAX_NATIVE_AD_MS = 120000
+const SKIP_AFTER_MS = 5000
+const launchVideoUrl = String(import.meta.env.VITE_LAUNCH_AD_VIDEO_URL || '').trim()
 
 function withTimeout(promise, timeoutMs) {
   let timer
@@ -18,6 +20,8 @@ function withTimeout(promise, timeoutMs) {
 
 function LaunchAdGate({ onComplete, onHouseAction }) {
   const [mode, setMode] = useState('loading')
+  const [skipAvailable, setSkipAvailable] = useState(false)
+  const [skipCountdown, setSkipCountdown] = useState(5)
   const completedRef = useRef(false)
   const onCompleteRef = useRef(onComplete)
 
@@ -27,21 +31,22 @@ function LaunchAdGate({ onComplete, onHouseAction }) {
 
   useEffect(() => {
     let cancelled = false
-    let fallbackTimer
     const finish = () => {
       if (completedRef.current) return
       completedRef.current = true
       onCompleteRef.current()
     }
-
+    const skipTimer = window.setTimeout(() => setSkipAvailable(true), SKIP_AFTER_MS)
+    const countdownTimer = window.setInterval(() => {
+      setSkipCountdown((seconds) => Math.max(0, seconds - 1))
+    }, 1000)
     const start = async () => {
       try {
         const prepared = await withTimeout(preloadLaunchAd(), LOAD_TIMEOUT_MS)
         if (cancelled) return
-
         if (prepared) {
-          setMode('video')
-          const shown = await withTimeout(showLaunchAd(), MAX_VIDEO_DISPLAY_MS)
+          setMode('native')
+          const shown = await withTimeout(showLaunchAd(), MAX_NATIVE_AD_MS)
           if (cancelled) return
           if (shown) {
             finish()
@@ -50,28 +55,26 @@ function LaunchAdGate({ onComplete, onHouseAction }) {
           await dismissLaunchAd().catch(() => {})
         }
       } catch {
-        // Missing SDK, no fill, provider errors, and load errors all use the
-        // same non-blocking house-card path.
+        // A missing ad bridge or a no-fill falls through to the configured
+        // launch video, then to the local sponsor card.
       }
-
-      if (cancelled) return
-      setMode('fallback')
-      fallbackTimer = window.setTimeout(finish, HOUSE_FALLBACK_MS)
+      if (!cancelled) setMode(launchVideoUrl ? 'video' : 'sponsor')
     }
-
     start()
     return () => {
       cancelled = true
-      window.clearTimeout(fallbackTimer)
+      window.clearTimeout(skipTimer)
+      window.clearInterval(countdownTimer)
     }
   }, [])
 
   const handleContinue = async () => {
-    if (mode === 'video') {
+    if (!skipAvailable || completedRef.current) return
+    if (mode === 'native') {
       try {
         await dismissLaunchAd()
       } catch {
-        // Completing the web gate must not depend on a native dismissal hook.
+        // A native dismissal failure must not trap the user at launch.
       }
     }
     if (completedRef.current) return
@@ -83,9 +86,37 @@ function LaunchAdGate({ onComplete, onHouseAction }) {
     <div className="app-root launch-ad-root">
       <div className="launch-ad-overlay">
         <section className="launch-ad-panel" aria-label="FUTApulse launch sponsor">
-          <HouseSponsorCard launch onAction={onHouseAction} />
-          {mode === 'video' && <p className="launch-ad-status" role="status">Sponsored video is playing. Use the ad provider's skip or close control to continue.</p>}
-          {mode !== 'video' && <button type="button" className="launch-ad-skip" onClick={handleContinue}>Continue to FUTApulse</button>}
+          <span className="launch-ad-sponsored">SPONSORED</span>
+          {mode === 'video' && (
+            <video
+              className="launch-ad-video"
+              src={launchVideoUrl}
+              autoPlay
+              muted
+              playsInline
+              controls
+              preload="auto"
+              onEnded={() => {
+                if (!completedRef.current) {
+                  completedRef.current = true
+                  onCompleteRef.current()
+                }
+              }}
+              onError={() => setMode('sponsor')}
+              aria-label="FUTApulse sponsor video"
+            />
+          )}
+          {mode !== 'video' && <HouseSponsorCard launch onAction={onHouseAction} />}
+          {mode === 'native' && <p className="launch-ad-status" role="status">Your sponsor message is playing.</p>}
+          {mode === 'loading' && <p className="launch-ad-status" role="status">Preparing today’s campus sponsor…</p>}
+          {mode === 'sponsor' && <p className="launch-ad-status" role="status">Watch the sponsor message or skip when the button becomes available.</p>}
+          {skipAvailable ? (
+            <button type="button" className="launch-ad-skip" onClick={handleContinue}>
+              <SkipForward size={16} aria-hidden="true" /> Skip ad
+            </button>
+          ) : (
+            <p className="launch-ad-skip-countdown" role="status"><Check size={14} aria-hidden="true" /> Skip available in {skipCountdown}s</p>
+          )}
         </section>
       </div>
     </div>

@@ -217,16 +217,25 @@ function matchesProfileAudience(event, profile) {
 }
 
 async function apiRequest(endpoint, options = {}, token = '') {
-  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-    ...options,
-    credentials: 'include',
-    headers: {
-      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers || {}),
-    },
-    signal: options.signal || AbortSignal.timeout(8000),
-  })
+  const { timeoutMs = 45000, ...requestOptions } = options
+  let response
+  try {
+    response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      ...requestOptions,
+      credentials: 'include',
+      headers: {
+        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(options.headers || {}),
+      },
+      signal: requestOptions.signal || AbortSignal.timeout(timeoutMs),
+    })
+  } catch (error) {
+    if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+      throw new Error('FUTApulse did not confirm this request in time. Check the feed before retrying.', { cause: error })
+    }
+    throw error
+  }
   const result = await response.json().catch(() => ({}))
   if (!response.ok) {
     const error = new Error(result.error || `Request failed (${response.status}).`)
@@ -327,8 +336,8 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
 
 function App() {
   const hasSharedEventLink = new URLSearchParams(window.location.search).has('event')
-  const [launchVisible, setLaunchVisible] = useState(() => !hasSharedEventLink)
-  const [hasSplashUnmounted, setHasSplashUnmounted] = useState(hasSharedEventLink)
+  const [launchVisible, setLaunchVisible] = useState(true)
+  const [launchSequenceReady, setLaunchSequenceReady] = useState(false)
   const [isLaunchAdActive, setIsLaunchAdActive] = useState(false)
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
@@ -609,22 +618,21 @@ function App() {
   }, [notify, setProfileMenuOpen])
 
   useEffect(() => {
-    const timer = window.setTimeout(() => setLaunchVisible(false), 2500)
-    return () => window.clearTimeout(timer)
-  }, [])
-
-  useEffect(() => {
-    if (hasSharedEventLink || launchVisible || sessionLoading || hasSplashUnmounted) return undefined
-    let nextFrame = 0
-    const frame = window.requestAnimationFrame(() => {
-      setHasSplashUnmounted(true)
-      nextFrame = window.requestAnimationFrame(() => setIsLaunchAdActive(true))
-    })
+    let splashFrame = 0
+    let adFrame = 0
+    const timer = window.setTimeout(() => {
+      setLaunchVisible(false)
+      splashFrame = window.requestAnimationFrame(() => {
+        setLaunchSequenceReady(true)
+        adFrame = window.requestAnimationFrame(() => setIsLaunchAdActive(true))
+      })
+    }, 2500)
     return () => {
-      window.cancelAnimationFrame(frame)
-      if (nextFrame) window.cancelAnimationFrame(nextFrame)
+      window.clearTimeout(timer)
+      if (splashFrame) window.cancelAnimationFrame(splashFrame)
+      if (adFrame) window.cancelAnimationFrame(adFrame)
     }
-  }, [hasSharedEventLink, launchVisible, sessionLoading, hasSplashUnmounted])
+  }, [])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -731,6 +739,8 @@ function App() {
         setSession({ token: result.token, user: result.user })
         setUser(result.user)
         setProfile(result.user.profile || null)
+        setRememberedUsername(result.user.username || '')
+        safeSetStored('futapulse-remembered-username', result.user.username || '')
         setHasDeviceAccount(true)
         setProfileOpen(!result.user.profile || !['name', 'faculty', 'department', 'level'].every((field) => result.user.profile[field]))
       } catch (error) {
@@ -863,18 +873,21 @@ function App() {
       if (refreshing) return
       refreshing = true
       try {
-        const response = await fetch(`${API_BASE_URL}/api/events`, {
+        const response = await fetch(`${API_BASE_URL}/api/events/engagement`, {
           headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
-          cache: 'no-cache',
           signal: AbortSignal.timeout(8_000),
         })
         if (!response.ok) return
         const data = await response.json()
-        if (cancelled || !Array.isArray(data.events)) return
-        startTransition(() => setEvents(data.events))
-        const serverGoingIds = data.events.filter((event) => event.isGoing).map((event) => String(getEventId(event)))
+        if (cancelled || !Array.isArray(data.updates)) return
+        const updatesById = new Map(data.updates.map((event) => [String(getEventId(event)), event]))
+        const activeIds = new Set(updatesById.keys())
+        startTransition(() => setEvents((current) => current
+          .filter((event) => event.status === 'Draft' || activeIds.has(String(getEventId(event))))
+          .map((event) => ({ ...event, ...(updatesById.get(String(getEventId(event))) || {}) }))))
+        const serverGoingIds = data.updates.filter((event) => event.isGoing).map((event) => String(getEventId(event)))
         setGoingIds((current) => current.join('|') === serverGoingIds.join('|') ? current : serverGoingIds)
-        setReminderIds(data.events.filter((event) => event.isReminded).map((event) => String(getEventId(event))))
+        setReminderIds(data.updates.filter((event) => event.isReminded).map((event) => String(getEventId(event))))
 
       } catch {
         // A failed refresh never overwrites the last confirmed server snapshot.
@@ -882,7 +895,34 @@ function App() {
         refreshing = false
       }
     }
-    const timer = window.setInterval(refreshLiveEvents, 5_000)
+    const timer = window.setInterval(refreshLiveEvents, 10_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [networkOnline, documentVisible, session?.token])
+
+  useEffect(() => {
+    if (!networkOnline || !documentVisible) return undefined
+    let cancelled = false
+    const refreshFeed = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/events`, {
+          headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
+          signal: AbortSignal.timeout(20000),
+        })
+        if (!response.ok) return
+        const data = await response.json()
+        if (cancelled || !Array.isArray(data.events)) return
+        startTransition(() => setEvents(data.events))
+        setGoingIds(data.events.filter((event) => event.isGoing).map((event) => String(getEventId(event))))
+        setReminderIds(data.events.filter((event) => event.isReminded).map((event) => String(getEventId(event))))
+        storeEventCache(data.events)
+      } catch {
+        // Keep the last confirmed feed snapshot if the periodic refresh fails.
+      }
+    }
+    const timer = window.setInterval(refreshFeed, 60_000)
     return () => {
       cancelled = true
       window.clearInterval(timer)
@@ -906,6 +946,7 @@ function App() {
       if (activeTab !== 'home') skipFilterAutoCenterRef.current = true
       setActiveTab('home')
       setExpandedHomeCategory(selectedCategory)
+      setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
       setPendingFullEventId(requestedEventId)
     })
     return () => window.cancelAnimationFrame(frame)
@@ -1512,13 +1553,15 @@ function App() {
     const notifyAt = Date.parse(scheduledReminder?.notifyAt || '')
     return !hasEventEnded(event, reminderClock) && Number.isFinite(notifyAt) && notifyAt > reminderClock
   }), [publishedEvents, reminderTimes, reminderClock])
-  const remindedEventIds = new Set(remindedEvents.map((event) => String(getEventId(event))))
-  const anticipatedEvents = useMemo(() => publishedEvents.filter((event) => {
-    const id = String(getEventId(event))
-    return !hasEventEnded(event, reminderClock)
-      && goingIds.includes(id)
-      && !remindedEventIds.has(id)
-  }), [publishedEvents, reminderClock, goingIds, remindedEventIds])
+  const anticipatedEvents = useMemo(() => {
+    const remindedEventIds = new Set(remindedEvents.map((event) => String(getEventId(event))))
+    return publishedEvents.filter((event) => {
+      const id = String(getEventId(event))
+      return !hasEventEnded(event, reminderClock)
+        && goingIds.includes(id)
+        && !remindedEventIds.has(id)
+    })
+  }, [publishedEvents, reminderClock, goingIds, remindedEvents])
 
   useEffect(() => {
     if (activeTab !== 'reminders' || !documentVisible) return undefined
@@ -1565,13 +1608,20 @@ function App() {
     .filter((event) => String(event.createdByUserId || '') === String(user?.id || ''))
     .filter((event) => organizerTab === 'drafts' ? event.status === 'Draft' : ['Published', 'Live'].includes(event.status)), [events, user?.id, organizerTab])
 
-  useEffect(() => { setVisibleSearchCount(EVENT_LIST_PAGE_SIZE) }, [search])
-  useEffect(() => { setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE) }, [expandedHomeCategory])
-  useEffect(() => { setVisibleOrganizerCount(EVENT_LIST_PAGE_SIZE) }, [organizerTab])
+  const changeSearch = (value) => {
+    setSearch(value)
+    setVisibleSearchCount(EVENT_LIST_PAGE_SIZE)
+  }
+
+  const changeOrganizerTab = (tab) => {
+    setOrganizerTab(tab)
+    setVisibleOrganizerCount(EVENT_LIST_PAGE_SIZE)
+  }
 
   const chooseCategory = (category) => {
     setHomeCategory(category)
     setExpandedHomeCategory('')
+    setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
     switchTab('home')
     window.setTimeout(() => {
       if (category === 'all') {
@@ -1594,6 +1644,7 @@ function App() {
       if (activeTab !== 'home') skipFilterAutoCenterRef.current = true
     }
     setExpandedHomeCategory(category)
+    setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
     setPendingFullEventId(eventId ? String(eventId) : '')
     switchTab('home')
     if (!eventId) window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 0)
@@ -1832,7 +1883,7 @@ function App() {
     </button>
   )
 
-  if (launchVisible || (sessionLoading && !hasSharedEventLink)) {
+  if (launchVisible) {
     return (
       <div className="launch-screen" aria-label="Launching FUTApulse">
         <div className="launch-brand" aria-hidden="true">
@@ -1844,9 +1895,7 @@ function App() {
     )
   }
 
-  if (!hasSharedEventLink && !hasSplashUnmounted) {
-    return <div className="launch-screen" aria-hidden="true" />
-  }
+  if (!launchSequenceReady) return <div className="launch-screen" aria-hidden="true" />
 
   if (isLaunchAdActive) {
     return (
@@ -1855,6 +1904,10 @@ function App() {
         onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')}
       />
     )
+  }
+
+  if (sessionLoading) {
+    return <div className={`app-root theme-${theme} session-restore-screen`} role="status" aria-live="polite"><BrandHeart size={36} /><span>Connecting to FUTApulse…</span></div>
   }
 
   if ((!session?.token || !user) && !isGuestSharedView) {
@@ -1959,6 +2012,7 @@ function App() {
                   <section className="home-full-feed-view">
                     <button className={`home-back-button ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''}`} type="button" onClick={() => {
                       setExpandedHomeCategory('')
+                      setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
                       setPendingFullEventId('')
                       window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 0)
                     }}><ChevronLeft size={18} /> Back to home</button>
@@ -1998,13 +2052,13 @@ function App() {
                     type="search"
                     value={search}
                     onFocus={() => setSearchFocused(true)}
-                    onChange={(event) => setSearch(event.target.value)}
+                    onChange={(event) => changeSearch(event.target.value)}
                     onKeyDown={(event) => { if (event.key === 'Enter') rememberSearch(search) }}
                     placeholder="Search event titles or organisers' names"
                     autoComplete="off"
                     aria-label="Search events by event title or organizer"
                   />
-                  {search && <button type="button" className="explore-search-clear" aria-label="Clear search" onClick={() => setSearch('')}><X size={18} /></button>}
+                  {search && <button type="button" className="explore-search-clear" aria-label="Clear search" onClick={() => changeSearch('')}><X size={18} /></button>}
                 </div>
                 {searchFocused && !search.trim() && (
                   <div className="explore-search-discovery">
@@ -2015,7 +2069,7 @@ function App() {
                           safeSetStored('futapulse-recent-searches', JSON.stringify([]))
                         }}>Clear</button></div>
                         <div className="explore-recent-search-list">
-                          {recentSearches.map((term) => <button key={term} type="button" className="explore-recent-search" onClick={() => setSearch(term)}><Clock3 size={14} />{term}</button>)}
+                          {recentSearches.map((term) => <button key={term} type="button" className="explore-recent-search" onClick={() => changeSearch(term)}><Clock3 size={14} />{term}</button>)}
                         </div>
                       </section>
                     )}
@@ -2207,14 +2261,14 @@ function App() {
                   const deltaX = touch.clientX - start.x
                   const deltaY = touch.clientY - start.y
                   if (Math.abs(deltaX) < 55 || Math.abs(deltaX) < Math.abs(deltaY) * 1.25) return
-                  setOrganizerTab(deltaX < 0 ? 'drafts' : 'events')
+                  changeOrganizerTab(deltaX < 0 ? 'drafts' : 'events')
                 }}
                 onTouchCancel={() => { organizerTouchStart.current = null }}
               >
                   {eventPostingPaused && <p className="event-posting-ban-note" role="status">Event posting is paused for this account until {new Date(user.postingBanUntil).toLocaleString()}.</p>}
                   <div className="organizer-tabs-row">
                     <div className="organizer-tabs-group">
-                      {['events', 'drafts'].map((tab) => <button key={tab} type="button" className={`organizer-tab-btn ${organizerTab === tab ? 'active' : ''}`} onClick={() => setOrganizerTab(tab)}>{tab[0].toUpperCase() + tab.slice(1)}</button>)}
+                      {['events', 'drafts'].map((tab) => <button key={tab} type="button" className={`organizer-tab-btn ${organizerTab === tab ? 'active' : ''}`} onClick={() => changeOrganizerTab(tab)}>{tab[0].toUpperCase() + tab.slice(1)}</button>)}
                     </div>
                     <button type="button" className="organizer-create-btn" disabled={eventPostingPaused} onClick={() => { setEventDuplicateState({ code: '', matches: [] }); setEventEditor(emptyEvent()) }}>{eventPostingPaused ? 'Posting paused' : '＋ Create Event'}</button>
                   </div>

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Clock3, Sparkles, X } from 'lucide-react'
+import { CalendarDays, Clock3, Sparkles, X } from 'lucide-react'
 
 const MAX_LOCAL_DRAFT_CHARACTERS = 650_000
 
@@ -37,6 +37,78 @@ function toLocalDateAndTime(value) {
     date: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
     time: `${pad(date.getHours())}:${pad(date.getMinutes())}`,
   }
+}
+
+function formatDateForEntry(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || '')
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : ''
+}
+
+function EventDateField({ id, label, value, onChange, required = false }) {
+  const [dateText, setDateText] = useState(() => formatDateForEntry(value))
+  const entryRef = useRef(null)
+  const pickerRef = useRef(null)
+
+  const updateDateText = (rawValue) => {
+    const digits = rawValue.replace(/\D/g, '').slice(0, 8)
+    const formatted = digits.length > 4
+      ? `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4)}`
+      : digits.length > 2 ? `${digits.slice(0, 2)}/${digits.slice(2)}` : digits
+    setDateText(formatted)
+    if (digits.length !== 8) {
+      onChange('')
+      return
+    }
+    const day = Number(digits.slice(0, 2))
+    const month = Number(digits.slice(2, 4))
+    const year = Number(digits.slice(4, 8))
+    const parsed = new Date(year, month - 1, day)
+    if (parsed.getFullYear() === year && parsed.getMonth() === month - 1 && parsed.getDate() === day) {
+      onChange(`${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`)
+    } else {
+      onChange('')
+    }
+  }
+
+  return (
+    <div className="event-date-control">
+      <input
+        id={id}
+        ref={entryRef}
+        type="text"
+        inputMode="numeric"
+        autoComplete="off"
+        value={dateText}
+        onChange={(event) => updateDateText(event.target.value)}
+        placeholder="DD/MM/YYYY"
+        aria-label={label}
+        aria-describedby={`${id}-hint`}
+        required={required}
+      />
+      <button type="button" aria-label={`Choose ${label.toLowerCase()} from calendar`} onClick={() => {
+        const focusEntry = () => entryRef.current?.focus({ preventScroll: false })
+        try {
+          if (typeof pickerRef.current?.showPicker === 'function') pickerRef.current.showPicker()
+          else focusEntry()
+        } catch {
+          focusEntry()
+        }
+      }}><CalendarDays size={17} aria-hidden="true" /></button>
+      <input
+        ref={pickerRef}
+        className="event-date-native-picker"
+        type="date"
+        tabIndex={-1}
+        aria-hidden="true"
+        value={value || ''}
+        onChange={(event) => {
+          setDateText(formatDateForEntry(event.target.value))
+          onChange(event.target.value)
+        }}
+      />
+      <span id={`${id}-hint`} className="event-date-hint">Enter day, month, year or choose from calendar</span>
+    </div>
+  )
 }
 
 function TimeWheelPicker({ label, value, onChange }) {
@@ -350,9 +422,9 @@ function EventEditor({
           <label htmlFor="event-title">Event title</label><input id="event-title" value={form.title} onChange={(eventChange) => update('title', eventChange.target.value)} placeholder="Name your event" required />
           <label htmlFor="event-category">Category</label><select id="event-category" value={form.category} onChange={(eventChange) => update('category', eventChange.target.value)} required><option value="">Select category</option>{categories.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select>
           <label htmlFor="event-activity">Event activity</label><textarea id="event-activity" rows={3} value={form.activity} onChange={(eventChange) => update('activity', eventChange.target.value)} placeholder="What should students expect?" required />
-          <label htmlFor="event-date">Start date</label><input id="event-date" type="date" value={form.date} onChange={(eventChange) => update('date', eventChange.target.value)} required={form.status !== 'Draft'} />
+          <label htmlFor="event-date">Start date</label><EventDateField id="event-date" label="Start date" value={form.date} onChange={(value) => update('date', value)} required={form.status !== 'Draft'} />
           <TimeWheelPicker label="Start time" value={form.startClock} onChange={(value) => update('startClock', value)} />
-          <label htmlFor="event-end-date">End date</label><input id="event-end-date" type="date" value={form.endDateTime} onChange={(eventChange) => update('endDateTime', eventChange.target.value)} required={form.status !== 'Draft'} />
+          <label htmlFor="event-end-date">End date</label><EventDateField id="event-end-date" label="End date" value={form.endDateTime} onChange={(value) => update('endDateTime', value)} required={form.status !== 'Draft'} />
           <TimeWheelPicker label="End time" value={form.endClock} onChange={(value) => update('endClock', value)} />
           <label htmlFor="event-venue">Venue</label><input id="event-venue" value={form.venue} onChange={(eventChange) => update('venue', eventChange.target.value)} maxLength={120} placeholder="e.g. LT1 / SEET Complex" required />
           <label htmlFor="event-landmark">Landmark &amp; directions <span className="optional-field-label">Optional</span></label><textarea id="event-landmark" rows={2} value={form.venueLandmark} onChange={(eventChange) => update('venueLandmark', eventChange.target.value)} maxLength={240} placeholder="Add a nearby landmark or directions students can follow" />
