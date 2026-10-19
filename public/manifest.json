@@ -1,0 +1,20 @@
+{
+  "short_name": "FUTApulse",
+  "name": "FUTApulse — Campus Events",
+  "icons": [
+    {
+      "src": "FUTApulse Icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "FUTApulse Icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "background_color": "#050508",
+  "theme_color": "#9333ea",
+  "display": "standalone"
+}
