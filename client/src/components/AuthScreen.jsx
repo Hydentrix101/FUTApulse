@@ -7,16 +7,17 @@ import { isValidUsername } from '../utils/usernames'
 let googleIdentityServicesPromise
 
 async function request(endpoint, options = {}) {
+  const { timeoutMs = 30000, ...requestOptions } = options
   let response
   try {
     response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      ...options,
+      ...requestOptions,
       credentials: 'include',
       headers: {
         ...(options.body ? { 'Content-Type': 'application/json' } : {}),
         ...options.headers,
       },
-      signal: options.signal || AbortSignal.timeout(8000),
+      signal: requestOptions.signal || AbortSignal.timeout(timeoutMs),
     })
   } catch (error) {
     if (error.name === 'AbortError' || error.name === 'TimeoutError') {
@@ -302,6 +303,7 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
         }
         const result = await request(mode === 'signup' ? '/api/auth/signup' : '/api/auth/login', {
           method: 'POST',
+          timeoutMs: mode === 'signup' ? 60000 : 30000,
           body: JSON.stringify(mode === 'signup'
             ? { email: email.trim().toLowerCase(), username: enteredUsername, password, remember }
             : { username: enteredUsername, password, remember }),
@@ -410,7 +412,8 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
           try {
             const result = await request('/api/auth/google', {
               method: 'POST',
-              body: JSON.stringify({ code: googleResponse.code, remember }),
+              headers: { 'X-FUTApulse-OAuth-Request': '1' },
+              body: JSON.stringify({ code: googleResponse.code, remember, origin: window.location.origin }),
             })
             if (result.usernameRequired) {
               if (!result.signupToken || !result.email) {
