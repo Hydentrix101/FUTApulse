@@ -11,6 +11,7 @@ process.env.MONGO_URI = "";
 process.env.JWT_SECRET = "futapulse-tests-only-signing-secret";
 process.env.GOOGLE_CLIENT_ID = "google-client-id-for-tests";
 process.env.GOOGLE_CLIENT_SECRET = "google-client-secret-for-tests";
+process.env.RESEND_API_KEY = "re_test_key_for_mock_fetch";
 
 const { app, models, buildFacultyTurnoutBreakdown } = require("../server");
 const { buildApprovedMigrationPlan } = require("../server/dataMigration");
@@ -141,6 +142,64 @@ test("health and readiness clearly report the local development storage mode", a
   assert.equal(readinessResponse.status, 200);
   assert.equal(readiness.ready, true);
   assert.equal(readiness.operationalMongoCutover, false);
+});
+
+test("signup sends verification through Resend and surfaces provider failures", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const originalEmailSender = app.locals.emailSender;
+  const originalFetch = global.fetch;
+  const resendRequests = [];
+  let shouldFail = false;
+
+  app.locals.emailSender = undefined;
+  global.fetch = async (input, options) => {
+    if (String(input).startsWith("https://api.resend.com/")) {
+      resendRequests.push(JSON.parse(options.body));
+      return shouldFail
+        ? new Response(JSON.stringify({ message: "Provider unavailable", name: "application_error" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" }
+        })
+        : new Response(JSON.stringify({ id: "email_test_123" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+    }
+    return originalFetch(input, options);
+  };
+
+  try {
+    const success = await originalFetch(`${baseUrl}/api/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "resend-success@futa.edu.ng", username: "resend_success", password: "CorrectPassword1" })
+    });
+    assert.equal(success.status, 202);
+    assert.deepEqual({
+      from: resendRequests[0].from,
+      to: resendRequests[0].to,
+      subject: resendRequests[0].subject
+    }, {
+      from: "FUTApulse <onboarding@resend.dev>",
+      to: ["resend-success@futa.edu.ng"],
+      subject: "Verify your FUTApulse email"
+    });
+    assert.match(resendRequests[0].html, /Your FUTApulse verification code is \d{6}/);
+
+    shouldFail = true;
+    const failure = await originalFetch(`${baseUrl}/api/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "resend-failure@futa.edu.ng", username: "resend_failure", password: "CorrectPassword1" })
+    });
+    assert.equal(failure.status, 502);
+    assert.match((await failure.json()).error, /Resend could not deliver/);
+    const savedDatabase = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+    assert.equal(savedDatabase.emailChallenges.some((challenge) => challenge.email === "resend-failure@futa.edu.ng"), false);
+  } finally {
+    global.fetch = originalFetch;
+    app.locals.emailSender = originalEmailSender;
+  }
 });
 
 let server;
