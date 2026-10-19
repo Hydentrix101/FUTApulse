@@ -94,6 +94,17 @@ function safeSetStored(key, value) {
   }
 }
 
+function hasRememberedSession() {
+  const rememberMe = readStoredValue('futapulse-remember-me')
+  if (rememberMe === 'true') return true
+  if (rememberMe === 'false') return false
+
+  // Older releases used the remembered username as the persistence marker.
+  if (!readStoredValue('futapulse-remembered-username')) return false
+  safeSetStored('futapulse-remember-me', 'true')
+  return true
+}
+
 function withoutInlineImages(value) {
   if (typeof value === 'string') return value.startsWith('data:image/') ? '' : value
   if (Array.isArray(value)) return value.map(withoutInlineImages)
@@ -592,9 +603,11 @@ function App() {
     safeSetStored('futapulse-known-accounts', JSON.stringify([...new Set([...accounts, auth.user.username])].slice(-10)))
     setHasDeviceAccount(true)
     if (remember) {
+      safeSetStored('futapulse-remember-me', 'true')
       safeSetStored('futapulse-remembered-username', auth.user.username)
       setRememberedUsername(auth.user.username)
     } else {
+      safeSetStored('futapulse-remember-me', 'false')
       localStorage.removeItem('futapulse-remembered-username')
       setRememberedUsername('')
     }
@@ -606,6 +619,7 @@ function App() {
       .catch((error) => console.error('Unable to clear the server session cookie.', error))
     localStorage.removeItem('futapulse-auth-session')
     localStorage.removeItem('futapulse-auth-user')
+    localStorage.removeItem('futapulse-remember-me')
     localStorage.removeItem('futapulse-remembered-username')
     localStorage.removeItem('futapulse-profile')
     sessionStorage.removeItem('futapulse-auth-session')
@@ -718,7 +732,7 @@ function App() {
   useEffect(() => {
     const controller = new AbortController()
     const restoreSession = async () => {
-      if (!readStoredValue('futapulse-remembered-username')) {
+      if (!hasRememberedSession()) {
         setSessionLoading(false)
         return
       }
@@ -729,6 +743,7 @@ function App() {
           signal: controller.signal,
         })
         if (response.status === 401) {
+          safeSetStored('futapulse-remember-me', 'false')
           localStorage.removeItem('futapulse-remembered-username')
           setRememberedUsername('')
           return
@@ -740,6 +755,7 @@ function App() {
         setUser(result.user)
         setProfile(result.user.profile || null)
         setRememberedUsername(result.user.username || '')
+        safeSetStored('futapulse-remember-me', 'true')
         safeSetStored('futapulse-remembered-username', result.user.username || '')
         setHasDeviceAccount(true)
         setProfileOpen(!result.user.profile || !['name', 'faculty', 'department', 'level'].every((field) => result.user.profile[field]))
