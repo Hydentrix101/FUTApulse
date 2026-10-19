@@ -6,14 +6,11 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const nodemailer = require("nodemailer");
 const { OAuth2Client } = require("google-auth-library");
 
 if (fs.existsSync(path.join(__dirname, ".env"))) process.loadEnvFile(path.join(__dirname, ".env"));
 
-const EMAIL_CONNECTION_TIMEOUT_MS = 10_000;
-const EMAIL_GREETING_TIMEOUT_MS = 10_000;
-const EMAIL_SOCKET_TIMEOUT_MS = 30_000;
+const EMAIL_SEND_TIMEOUT_MS = 15_000;
 const PORT = Number(process.env.PORT || 3001);
 const ROOT = __dirname;
 const CLIENT_DIST = path.join(ROOT, "client", "dist");
@@ -605,9 +602,6 @@ function refreshSessionIsPersistent(request) {
   }
 }
 
-let smtpTransporter = null;
-let smtpTransporterKey = "";
-
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -617,36 +611,93 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function createSmtpTransport() {
-  const host = process.env.SMTP_HOST || "smtp.gmail.com";
-  const port = Number(process.env.SMTP_PORT || 587);
-  const user = String(process.env.SMTP_USER || "").trim();
-  const pass = process.env.SMTP_PASS || "";
-  if (!user || !pass || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+function createGmailOAuthClient(signal) {
+  const clientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env.GOOGLE_CLIENT_SECRET || "").trim();
+  const refreshToken = String(process.env.GMAIL_REFRESH_TOKEN || "").trim();
+  if (!clientId || !clientSecret || !refreshToken) return null;
+  const clientOptions = {
+    clientId,
+    clientSecret,
+    transporterOptions: { timeout: EMAIL_SEND_TIMEOUT_MS, signal }
+  };
+  const client = typeof app.locals.gmailOAuthClientFactory === "function"
+    ? app.locals.gmailOAuthClientFactory(clientOptions)
+    : new OAuth2Client(clientOptions);
+  client.setCredentials({ refresh_token: refreshToken });
+  return client;
+}
 
-  const secure = process.env.SMTP_SECURE === undefined
-    ? port === 465
-    : process.env.SMTP_SECURE === "true";
-  const transporterKey = `${host}:${port}:${user}:${pass}:${secure}`;
-  if (smtpTransporter && smtpTransporterKey === transporterKey) return smtpTransporter;
+function encodeMimeBody(value) {
+  const encoded = Buffer.from(String(value), "utf8").toString("base64");
+  return encoded.match(/.{1,76}/g)?.join("\r\n") || "";
+}
 
-  smtpTransporter?.close();
-  smtpTransporterKey = transporterKey;
-  smtpTransporter = nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth: { user, pass },
-    connectionTimeout: EMAIL_CONNECTION_TIMEOUT_MS,
-    greetingTimeout: EMAIL_GREETING_TIMEOUT_MS,
-    socketTimeout: EMAIL_SOCKET_TIMEOUT_MS,
-    tls: { minVersion: "TLSv1.2" }
-  });
-  return smtpTransporter;
+function encodeMimeHeader(value) {
+  return `=?UTF-8?B?${Buffer.from(String(value), "utf8").toString("base64")}?=`;
+}
+
+function isSafeEmailAddress(value) {
+  return typeof value === "string"
+    && !/[\s<>\r\n]/.test(value)
+    && /^[^@]+@[^@]+\.[^@]+$/.test(value);
+}
+
+function buildRawEmail({ to, from, subject, text, html, replyTo }) {
+  const boundary = `futapulse_${crypto.randomBytes(12).toString("hex")}`;
+  const headers = [
+    `To: ${to}`,
+    `From: FUTApulse <${from}>`,
+    `Subject: ${encodeMimeHeader(subject)}`,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/alternative; boundary="${boundary}"`
+  ];
+  if (replyTo) headers.splice(2, 0, `Reply-To: ${replyTo}`);
+  const mime = [
+    ...headers,
+    "",
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    encodeMimeBody(text),
+    `--${boundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    encodeMimeBody(html),
+    `--${boundary}--`,
+    ""
+  ].join("\r\n");
+  return Buffer.from(mime, "utf8").toString("base64url");
+}
+
+function safeProviderError(error) {
+  let message = String(error?.message || "No provider message.")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]")
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
+  for (const secret of [process.env.GOOGLE_CLIENT_SECRET, process.env.GMAIL_REFRESH_TOKEN]) {
+    if (secret && secret.length > 4) message = message.replaceAll(secret, "[redacted]");
+  }
+  return {
+    name: String(error?.name || "Error").slice(0, 80),
+    code: String(error?.code || "").slice(0, 80),
+    statusCode: Number.isInteger(error?.statusCode)
+      ? error.statusCode
+      : Number.isInteger(error?.response?.status) ? error.response.status : null,
+    message: message.slice(0, 300)
+  };
 }
 
 function isEmailDeliveryConfigured() {
-  return typeof app.locals.emailSender === "function" || Boolean(createSmtpTransport());
+  const sender = String(process.env.GMAIL_SENDER_EMAIL || "").trim();
+  return typeof app.locals.emailSender === "function"
+    || Boolean(
+      String(process.env.GOOGLE_CLIENT_ID || "").trim()
+      && String(process.env.GOOGLE_CLIENT_SECRET || "").trim()
+      && String(process.env.GMAIL_REFRESH_TOKEN || "").trim()
+      && isSafeEmailAddress(sender)
+    );
 }
 
 async function deliverEmail({ to, subject, text, replyTo }) {
@@ -654,33 +705,63 @@ async function deliverEmail({ to, subject, text, replyTo }) {
     await app.locals.emailSender({ to, subject, text });
     return;
   }
-  const transporter = createSmtpTransport();
-  if (!transporter) {
-    const error = new Error("Email delivery is not configured. Set SMTP_USER and SMTP_PASS (a Gmail App Password) in the server environment.");
+
+  const toEmail = String(to || "").trim();
+  const replyToEmail = replyTo ? String(replyTo).trim() : "";
+  if (!isSafeEmailAddress(toEmail) || !subject || !text || (replyTo && !isSafeEmailAddress(replyToEmail))) {
+    throw new Error("Email delivery requires a recipient, subject, and message.");
+  }
+
+  const from = String(process.env.GMAIL_SENDER_EMAIL || "").trim();
+  if (!isEmailDeliveryConfigured()) {
+    const error = new Error("Email delivery is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, and a valid GMAIL_SENDER_EMAIL on the server.");
     error.code = "EMAIL_NOT_CONFIGURED";
     throw error;
   }
-  const toEmail = String(to || "").trim();
-  if (!toEmail || !subject || !text) {
-    throw new Error("Email delivery requires a recipient, subject, and message.");
-  }
   try {
-    const result = await transporter.sendMail({
-      from: process.env.MAIL_FROM || `FUTApulse <${String(process.env.SMTP_USER).trim()}>`,
-      to: toEmail,
-      subject,
-      text,
-      html: `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#172033"><p>${escapeHtml(text).replace(/\r?\n/g, "<br>")}</p></div>`,
-      ...(replyTo ? { replyTo } : {})
+    const timeoutSignal = AbortSignal.timeout(EMAIL_SEND_TIMEOUT_MS);
+    const oauthClient = createGmailOAuthClient(timeoutSignal);
+    const tokenResult = await oauthClient.getAccessToken();
+    const accessToken = typeof tokenResult === "string" ? tokenResult : tokenResult?.token;
+    if (!accessToken) {
+      const error = new Error("Google OAuth did not return a Gmail API access token.");
+      error.code = "EMAIL_DELIVERY_FAILED";
+      throw error;
+    }
+    const html = `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#172033"><p>${escapeHtml(text).replace(/\r?\n/g, "<br>")}</p></div>`;
+    const fetcher = app.locals.gmailApiFetch || fetch;
+    const response = await fetcher("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ raw: buildRawEmail({ to: toEmail, from, subject, text, html, replyTo: replyToEmail }) }),
+      signal: timeoutSignal
     });
-    if (!Array.isArray(result.accepted) || !result.accepted.some((recipient) => String(recipient).toLowerCase() === toEmail.toLowerCase())) {
-      const error = new Error("Gmail SMTP did not confirm acceptance of the recipient.");
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(`Gmail API rejected the message (${response.status}).`);
+      error.code = "EMAIL_DELIVERY_FAILED";
+      error.statusCode = response.status;
+      throw error;
+    }
+    if (!result.id) {
+      const error = new Error("Gmail API did not confirm that the message was accepted.");
       error.code = "EMAIL_DELIVERY_FAILED";
       throw error;
     }
   } catch (cause) {
-    if (cause && cause.code === "EMAIL_DELIVERY_FAILED") throw cause;
-    const error = new Error("Gmail SMTP email delivery failed. Check the mail server configuration and retry.", { cause });
+    console.error("Gmail API email delivery failed.", safeProviderError(cause?.cause || cause));
+    if (cause && cause.code === "EMAIL_DELIVERY_FAILED") {
+      const error = new Error(cause.statusCode
+        ? `Gmail API rejected the message (${cause.statusCode}).`
+        : "Gmail API did not confirm that the message was accepted.");
+      error.code = "EMAIL_DELIVERY_FAILED";
+      error.statusCode = cause.statusCode;
+      throw error;
+    }
+    const error = new Error("Gmail API email delivery failed or timed out. Check the OAuth refresh token, Gmail API access, and sender-account configuration.", { cause });
     error.code = "EMAIL_DELIVERY_FAILED";
     throw error;
   }
@@ -1444,7 +1525,7 @@ app.post("/api/auth/forgot-password", async (request, response) => {
 
   try {
     if (!isEmailDeliveryConfigured()) {
-      return response.status(503).json({ error: "Password recovery email is not configured yet. Set SMTP_USER and SMTP_PASS on the server." });
+      return response.status(503).json({ error: "Password recovery email is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, and GMAIL_SENDER_EMAIL on the server." });
     }
     const user = await findUserByEmail(email);
     if (user) {
