@@ -619,7 +619,7 @@ function escapeHtml(value) {
 
 function createSmtpTransport() {
   const host = process.env.SMTP_HOST || "smtp.gmail.com";
-  const port = Number(process.env.SMTP_PORT || 465);
+  const port = Number(process.env.SMTP_PORT || 587);
   const user = String(process.env.SMTP_USER || "").trim();
   const pass = process.env.SMTP_PASS || "";
   if (!user || !pass || !Number.isInteger(port) || port < 1 || port > 65535) return null;
