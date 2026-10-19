@@ -11,7 +11,8 @@ process.env.MONGO_URI = "";
 process.env.JWT_SECRET = "futapulse-tests-only-signing-secret";
 process.env.GOOGLE_CLIENT_ID = "google-client-id-for-tests";
 process.env.GOOGLE_CLIENT_SECRET = "google-client-secret-for-tests";
-process.env.RESEND_API_KEY = "re_test_key_for_mock_fetch";
+process.env.GMAIL_REFRESH_TOKEN = "gmail-refresh-token-for-tests";
+process.env.GMAIL_SENDER_EMAIL = "sender@example.test";
 
 const { app, models, buildFacultyTurnoutBreakdown } = require("../server");
 const { buildApprovedMigrationPlan } = require("../server/dataMigration");
@@ -144,61 +145,98 @@ test("health and readiness clearly report the local development storage mode", a
   assert.equal(readiness.operationalMongoCutover, false);
 });
 
-test("signup sends verification through Resend and surfaces provider failures", async () => {
+test("signup sends verification through Gmail API and sanitizes provider failures", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const originalEmailSender = app.locals.emailSender;
-  const originalFetch = global.fetch;
-  const resendRequests = [];
+  const originalGmailOAuthClientFactory = app.locals.gmailOAuthClientFactory;
+  const originalGmailApiFetch = app.locals.gmailApiFetch;
+  const originalRefreshToken = process.env.GMAIL_REFRESH_TOKEN;
+  const apiRequests = [];
+  const providerLogs = [];
+  let oauthSignal;
   let shouldFail = false;
 
   app.locals.emailSender = undefined;
-  global.fetch = async (input, options) => {
-    if (String(input).startsWith("https://api.resend.com/")) {
-      resendRequests.push(JSON.parse(options.body));
-      return shouldFail
-        ? new Response(JSON.stringify({ message: "Provider unavailable", name: "application_error" }), {
-          status: 503,
-          headers: { "Content-Type": "application/json" }
-        })
-        : new Response(JSON.stringify({ id: "email_test_123" }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" }
-        });
-    }
-    return originalFetch(input, options);
+  app.locals.gmailOAuthClientFactory = ({ clientId, clientSecret, transporterOptions }) => {
+    assert.equal(clientId, "google-client-id-for-tests");
+    assert.equal(clientSecret, "google-client-secret-for-tests");
+    assert.equal(transporterOptions.timeout, 15_000);
+    assert.equal(transporterOptions.signal instanceof AbortSignal, true);
+    oauthSignal = transporterOptions.signal;
+    return {
+      setCredentials: (credentials) => assert.deepEqual(credentials, { refresh_token: "gmail-refresh-token-for-tests" }),
+      getAccessToken: async () => ({ token: "gmail-api-access-token-for-tests" })
+    };
   };
+  app.locals.gmailApiFetch = async (url, options) => {
+    apiRequests.push({ url, options });
+    if (shouldFail) {
+      const error = new Error("Gmail delivery failed for gmail-failure@futa.edu.ng.");
+      error.response = { status: 403 };
+      throw error;
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "gmail_message_123" })
+    };
+  };
+  const originalConsoleError = console.error;
+  console.error = (...args) => providerLogs.push(args);
 
   try {
-    const success = await originalFetch(`${baseUrl}/api/auth/signup`, {
+    const success = await fetch(`${baseUrl}/api/auth/signup`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "resend-success@futa.edu.ng", username: "resend_success", password: "CorrectPassword1" })
+      body: JSON.stringify({ email: "gmail-success@futa.edu.ng", username: "gmail_success", password: "CorrectPassword1" })
     });
     assert.equal(success.status, 202);
-    assert.deepEqual({
-      from: resendRequests[0].from,
-      to: resendRequests[0].to,
-      subject: resendRequests[0].subject
-    }, {
-      from: "FUTApulse <onboarding@resend.dev>",
-      to: ["resend-success@futa.edu.ng"],
-      subject: "Verify your FUTApulse email"
-    });
-    assert.match(resendRequests[0].html, /Your FUTApulse verification code is \d{6}/);
+    assert.equal(apiRequests[0].url, "https://gmail.googleapis.com/gmail/v1/users/me/messages/send");
+    assert.equal(apiRequests[0].options.method, "POST");
+    assert.equal(apiRequests[0].options.headers.Authorization, "Bearer gmail-api-access-token-for-tests");
+    assert.equal(apiRequests[0].options.signal, oauthSignal);
+    const requestBody = JSON.parse(apiRequests[0].options.body);
+    const mimeMessage = Buffer.from(requestBody.raw, "base64url").toString("utf8");
+    assert.match(mimeMessage, /To: gmail-success@futa\.edu\.ng/);
+    assert.match(mimeMessage, /From: FUTApulse <sender@example\.test>/);
+    const encodedSubject = mimeMessage.match(/^Subject: =\?UTF-8\?B\?([A-Za-z0-9+/=]+)\?=$/m)?.[1];
+    assert.equal(Buffer.from(encodedSubject, "base64").toString("utf8"), "Verify your FUTApulse email");
+    const encodedTextBody = mimeMessage.match(/Content-Type: text\/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n([\s\S]*?)\r\n--futapulse_/)?.[1];
+    const textBody = Buffer.from(encodedTextBody.replace(/\s/g, ""), "base64").toString("utf8");
+    assert.match(textBody, /Your FUTApulse verification code is \d{6}/);
 
     shouldFail = true;
-    const failure = await originalFetch(`${baseUrl}/api/auth/signup`, {
+    const failure = await fetch(`${baseUrl}/api/auth/signup`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "resend-failure@futa.edu.ng", username: "resend_failure", password: "CorrectPassword1" })
+      body: JSON.stringify({ email: "gmail-failure@futa.edu.ng", username: "gmail_failure", password: "CorrectPassword1" })
     });
     assert.equal(failure.status, 502);
-    assert.match((await failure.json()).error, /Resend could not deliver/);
+    assert.match((await failure.json()).error, /Gmail API email delivery failed or timed out/);
+    assert.equal(providerLogs.length, 1);
+    assert.equal(providerLogs[0][0], "Gmail API email delivery failed.");
+    assert.equal(providerLogs[0][1].statusCode, 403);
+    assert.doesNotMatch(JSON.stringify(providerLogs[0]), /gmail-failure@futa\.edu\.ng/);
     const savedDatabase = JSON.parse(fs.readFileSync(dataFile, "utf8"));
-    assert.equal(savedDatabase.emailChallenges.some((challenge) => challenge.email === "resend-failure@futa.edu.ng"), false);
+    assert.equal(savedDatabase.emailChallenges.some((challenge) => challenge.email === "gmail-failure@futa.edu.ng"), false);
+
+    shouldFail = false;
+    const configuredRefreshToken = process.env.GMAIL_REFRESH_TOKEN;
+    delete process.env.GMAIL_REFRESH_TOKEN;
+    const unconfigured = await fetch(`${baseUrl}/api/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "unconfigured@futa.edu.ng", username: "unconfigured_user", password: "CorrectPassword1" })
+    });
+    assert.equal(unconfigured.status, 503);
+    assert.match((await unconfigured.json()).error, /GMAIL_REFRESH_TOKEN/);
+    process.env.GMAIL_REFRESH_TOKEN = configuredRefreshToken;
   } finally {
-    global.fetch = originalFetch;
+    console.error = originalConsoleError;
+    app.locals.gmailOAuthClientFactory = originalGmailOAuthClientFactory;
+    app.locals.gmailApiFetch = originalGmailApiFetch;
     app.locals.emailSender = originalEmailSender;
+    process.env.GMAIL_REFRESH_TOKEN = originalRefreshToken;
   }
 });
 
