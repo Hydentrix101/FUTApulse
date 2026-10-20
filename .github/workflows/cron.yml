@@ -1,0 +1,15 @@
+name: FUTApulse Cloud Cron
+
+on:
+  schedule:
+    # Runs every 5 minutes, 24/7, completely free on GitHub
+    - cron: '*/5 * * * *'
+    
+jobs:
+  run-cron:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit Backend Notification Worker
+        run: |
+          curl -X POST https://https://futapulse.onrender.com/api/notifications/process-due \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET_KEY }}"
