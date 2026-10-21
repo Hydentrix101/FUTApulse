@@ -1,10 +1,16 @@
 # FUTApulse Ad Provider Bridge
 
-The React ad slots are provider-neutral. Until a supported mobile ad SDK is
-installed in the Capacitor Android/iOS project, the app uses the local house
-sponsor card. The client only activates the native bridge when `VITE_ADS_MODE`
-is `admob`, the platform app/ad-unit IDs are configured, and the native runtime
-exposes `window.FUTApulseAds`.
+The React placements are provider-neutral. They use the local house sponsor
+card unless `VITE_IS_ADS_LIVE=true`, `VITE_ADS_MODE=admob`, platform app/ad-unit
+IDs are configured, and the native runtime exposes `window.FUTApulseAds`.
+`VITE_IS_ADS_LIVE` is opt-in and defaults to false; unset or invalid values
+keep the app in mock mode, including the launch gate and feed placements.
+
+The current integration is a native AdMob bridge contract, not a web AdSense
+integration. A Google AdSense publisher ID by itself does not configure web ad
+inventory; approved ad slots, consent/disclosure behavior, and a reviewed web
+adapter would also be required. Do not enable live ads by setting the flag
+until the matching provider is configured and approved.
 
 ## Expected native bridge
 
@@ -33,4 +39,6 @@ screens do not mount ad slots.
 
 Ad provider requests and SDK credentials are not proxied through Express. A
 future house-campaign API may provide first-party creative metadata, but the
-static fallback must remain available when the network is absent.
+static fallback must remain available when the network is absent. The existing
+mock component is `HouseSponsorCard` (with the `native-ad-card` visual shell);
+there is no separate `NativeAdCard` component in the current client.

@@ -10,6 +10,14 @@ This roadmap is the working launch path for FUTApulse. It gives us a safe sequen
 - Live advertising is deferred. Keep sponsored placements in mock mode until the mobile platform, provider setup, legal disclosures, and privacy review are ready.
 - Feature changes remain welcome. Before a phase that depends on a feature, confirm whether that feature is still in scope and update this roadmap.
 
+## Current roadmap position
+
+- **Phases 0–2: Complete.** Product baseline and API/data contracts are recorded; Atlas is the deployed shared database with production readiness guards.
+- **Phase 3: Complete.** The owner reports that the live Vercel/Render signup and Gmail verification flow has been tested successfully in production.
+- **Phase 4: Implementation prepared; beta device verification in progress.** The PWA and Android packaging scaffold are present. Install, offline, update, sign-in persistence, and shared-link checks on supported phones are assigned to the seven-member beta team.
+- **Phase 5: Notification implementation complete; beta verification in progress.** Notification persistence, server scheduling, delivery hooks, and regression coverage are implemented. The beta team owns the manual background/closed-app, permission, token renewal, opt-out, duplicate, and notification-tap deep-link checks. Phase 6 preparation can proceed in parallel; the device checks remain a release gate.
+- **Phase 6: In progress — legal, trust and safety, and pilot preparation.** Public privacy/terms/about routes and navigation are implemented, existing reporting and posting controls are retained, and beta feedback will be triaged while Google reviews the public site. Backup/restore and incident runbooks, Google Console branding, legal-content and retention confirmation, and pilot sign-off remain before broad rollout.
+
 ## Phase 0 - Product decisions and current-state baseline
 
 **Purpose:** Agree on what the first campus release must do, without blocking further design changes.
@@ -107,7 +115,7 @@ These are accepted product requirements or queued design tasks. They are not all
 
 **Purpose:** Make the app reachable from student phones over the internet.
 
-- **Selected hosts:** Render for the Express API at `https://futapulse.onrender.com` and Vercel for the Vite + React client. Deployment preparation is recorded; the Vercel production origin is still needed for the final OAuth/CORS allowlist.
+- **Selected hosts:** Render for the Express API at `https://futapulse.onrender.com` and Vercel for the Vite + React client at `https://fut-apulse.vercel.app`.
 - Deploy the Express API on Render from the repository root with `npm start`, the platform-provided `PORT`, and health check `/api/ready`. The server binds to `0.0.0.0`; keep `/api/ready` dependent on MongoDB readiness and the cutover flag.
 - Deploy the Vite client on Vercel with the project Root Directory set to `client`, build command `npm run build`, and output directory `dist`. Put Vercel routing configuration in `client/vercel.json` because `client/` is the Vercel project root.
 - **Use a same-origin API proxy for production cookies.** `client/vercel.json` rewrites `/api/:path*` to `https://futapulse.onrender.com/api/:path*`. This keeps the browser request URL on the Vercel origin while Vercel forwards it to Render.
@@ -122,23 +130,38 @@ These are accepted product requirements or queued design tasks. They are not all
 - Add a domain when ready; verify HTTPS, account recovery, signup email, Google sign-in, event share links, and server health on real phones.
 - Add basic operational visibility: error logs, database backups, uptime checks, and a simple recovery procedure.
 
-### Phase 3 deployment values still needed
+### Phase 3 production configuration and verification record
 
-- Vercel production origin, used in Render `CORS_ORIGIN`, `FRONTEND_URL`, `GOOGLE_REDIRECT_URI`, and Google Authorized JavaScript origins.
-- Optional custom app domain and any preview origins that should be allowed to sign in.
+- The canonical Vercel production origin is `https://fut-apulse.vercel.app`; keep it consistent in Render `CORS_ORIGIN`, `FRONTEND_URL`, `GOOGLE_REDIRECT_URI`, and Google Authorized JavaScript origins.
+- Optional custom app domain and preview origins only if/when FUTApulse intentionally adds them.
+- The staging-only Playwright workflow in [PHASE3_STAGING_E2E.md](./PHASE3_STAGING_E2E.md) is optional test tooling; it is not a production test and must never be pointed at production.
+- The owner reports successful live production signup, receipt and use of the Gmail verification code, and completion of Phase 3 testing across the deployed Vercel frontend and Render API.
 
-**Exit condition:** A phone on mobile data can sign in, browse, publish, and interact with events through the deployed service, with records shared across accounts/devices.
+- Render `/api/health` and `/api/ready` returned HTTP 200 with MongoDB connected and production cutover ready during the latest live check.
+- Vercel same-origin `/api/health` and `/api/ready` also returned HTTP 200, confirming the rewrite reaches the Render API.
+- Signup verification email was confirmed in a real inbox, and the code was successfully used in the live app.
+
+**Exit condition:** Met, based on the owner's live production verification.
 
 ## Phase 4 - Mobile install and app packaging
 
-**Purpose:** Choose and deliver the phone installation experience.
+**Purpose:** Deliver a reliable installable PWA first, then package the same hosted client as an Android APK.
 
-- If PWA is the first route, add the manifest, icons, install experience, and a service worker with a conservative cache policy. Do not cache private API responses as public app-shell data.
-- If distributing an APK, add Capacitor after confirming the hosted client works; configure app identity, icons, permissions, deep links, and secure API origins.
+- Add the PWA service worker, install prompt, update prompt, and an offline shell. Cache only versioned static app assets; never cache private API responses or authenticated data.
+- Verify the PWA manifest, icons, install flow, update flow, offline shell, and shared-event deep links on supported Android phones and iOS Safari.
+- After the hosted PWA is verified, add Capacitor for Android; configure app identity, icons, permissions, deep links, and secure API origins without duplicating backend logic.
 - Keep the app usable on narrow screens, touch input, mobile keyboards, interrupted connections, and lower-bandwidth networks.
-- Test install, update, sign-in persistence, event sharing/deep links, and back navigation on supported Android phones. Add iOS packaging only if it becomes a launch target.
+- Test install, update, sign-in persistence, event sharing/deep links, and back navigation on supported Android phones. Add native iOS packaging only if it becomes a launch target.
 
-**Exit condition:** Students can install/open the chosen mobile form, update it safely, and reach the correct event from a shared link.
+### Phase 4 implementation status
+
+- **Core PWA setup: Complete.** The existing `client/public/manifest.json` and `icon-192.png` / `icon-512.png` remain the install identity and assets. Vite generates the service worker. Precache is limited to build-time static assets; `/api` navigations are explicitly excluded from the app-shell fallback, and no private API runtime cache is configured.
+- The client offers browser-native install where available, iOS Safari Home Screen instructions, an offline-shell-ready message, and a user-controlled update/reload prompt.
+- **Final PWA verification remains:** install and launch from the Home Screen, sign in, open a shared event link, verify offline shell behavior without treating API data as available offline, then deploy an update and confirm the refresh prompt safely applies it on supported phones.
+- **Capacitor scaffold: Prepared.** The permanent Android ID is `ng.edu.futa.futapulse`; Capacitor core/Android/CLI dependencies, native project, branded launcher/splash assets, and Android build configuration are present. `npm run cap:sync:android --prefix client` rebuilds with the HTTPS Render API origin and syncs the native project.
+- **Before native authentication/device testing:** add `https://localhost` to Render's `CORS_ORIGIN` allowlist for the Android WebView; design a native refresh strategy because server refresh cookies are `SameSite=Lax`; and implement a supported native Google OAuth flow instead of assuming the browser popup works. Add verified Android App Links after the signing certificate fingerprint is available. Build/sign and physical-device validation require Android Studio, Android SDK/JDK, and a protected signing-key setup; do not commit signing credentials.
+
+**Exit condition:** Students can install/open the chosen mobile form, update it safely, and reach the correct event from a shared link. The beta team’s device results must be recorded before marking this phase fully verified.
 
 ## Phase 5 - Notifications and event updates
 
@@ -150,7 +173,9 @@ These are accepted product requirements or queued design tasks. They are not all
 - Send important event-change notices only when meaningful fields change; include the event deep link and changed details.
 - Respect OS permission, quiet/sound settings, battery restrictions, and user preferences. A push can alert and deep-link to the full event; the OS controls whether it can play a sound or open the app automatically.
 
-**Exit condition:** Push delivery, opt-out, token renewal, duplicate prevention, and deep-link behavior are confirmed on supported devices with the app backgrounded and closed.
+**Implementation status:** Server persistence, scheduling/delivery hooks, preference controls, deduplication keys, and automated regression tests are implemented. Per the owner’s rollout plan, manual checks for closed-app push banners, PWA background alerts, permission behavior, token renewal, opt-out, and notification deep links are assigned to the seven-member beta team and will run against the deployed app in parallel with Phase 6 and Google site review.
+
+**Exit condition:** Beta results confirm push delivery, opt-out, token renewal, duplicate prevention, and deep-link behavior on supported devices with the app backgrounded and closed. Until those results are recorded, Phase 5 implementation is complete but device verification remains open.
 
 ## Phase 6 - Privacy, moderation, and launch readiness
 
@@ -161,8 +186,10 @@ These are accepted product requirements or queued design tasks. They are not all
 - Define backup retention, restore steps, incident contact, and a way to pause event publishing if moderation or infrastructure fails.
 - Run an invite-only FUTA pilot, collect feedback, fix high-impact mobile issues, and then expand distribution with a QR/deep-link campaign.
 - Keep ads in mock mode at launch unless and until the selected native ad SDK, disclosures, consent needs, and provider review are complete. Keep ticket payments deferred.
+- Verify Google OAuth branding, support email, authorized domain, homepage, and policy links in Google Cloud Console; these settings cannot be completed by a repository code change.
+- For AdSense review, keep the public legal pages accessible without sign-in and ensure the published content and contact details are accurate. Do not set `VITE_IS_ADS_LIVE=true` until the advertising provider, approved account, ad placements, and required consent/disclosures are ready. The current React placements are house/mock cards and a provider-neutral native bridge; a publisher ID alone does not implement web AdSense inventory.
 
-**Exit condition:** Immanuel approves the pilot checklist, essential flows work on phones, support and rollback steps are known, and no launch-critical data/security issue remains.
+**Exit condition:** Immanuel approves the pilot checklist, legal and retention details match deployed provider settings, essential flows work on phones, support and rollback steps are known, and no launch-critical data/security issue remains. Beta testing and Google site review may proceed concurrently with this preparation.
 
 ## Working order
 

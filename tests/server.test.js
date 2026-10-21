@@ -106,11 +106,38 @@ test("Phase 2 Mongo models define event lookup and per-account action uniqueness
   const eventIndexes = models.EventRecord.schema.indexes();
   const actionIndexes = models.EngagementAction.schema.indexes();
   const reportIndexes = models.EventReport.schema.indexes();
+  const notificationIndexes = models.NotificationJob.schema.indexes();
 
   assert.ok(eventIndexes.some(([fields]) => fields.eventId === 1));
   assert.ok(eventIndexes.some(([fields]) => fields.status === 1 && fields.endsAt === 1));
   assert.ok(actionIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && fields.type === 1 && options.unique));
   assert.ok(reportIndexes.some(([fields]) => fields.eventId === 1));
+  assert.ok(notificationIndexes.some(([fields, options]) => fields.idempotencyKey === 1 && options.unique));
+});
+
+test("notification category preferences default enabled and persist as user-profile metadata", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const account = await createVerifiedAccount(baseUrl, "notification-preferences@futa.edu.ng", "notify_prefs");
+  const categories = ["academic", "tech", "social", "religious", "sports", "seminars"];
+  assert.deepEqual(account.user.profile.notificationPreferences, Object.fromEntries(categories.map((category) => [category, true])));
+  assert.equal(account.user.profile.notificationPreferencesOnboardingComplete, false);
+
+  const saved = await fetch(`${baseUrl}/api/notifications/preferences`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${account.token}` },
+    body: JSON.stringify({ notificationPreferences: { social: false, seminars: false } })
+  });
+  assert.equal(saved.status, 200);
+  const savedBody = await saved.json();
+  assert.deepEqual(savedBody.notificationPreferences, {
+    academic: true, tech: true, social: false, religious: true, sports: true, seminars: false
+  });
+  assert.equal(savedBody.notificationPreferencesOnboardingComplete, true);
+
+  const session = await fetch(`${baseUrl}/api/auth/session`, { headers: { Authorization: `Bearer ${account.token}` } });
+  const sessionBody = await session.json();
+  assert.deepEqual(sessionBody.user.profile.notificationPreferences, savedBody.notificationPreferences);
+  assert.equal(sessionBody.user.profile.notificationPreferencesOnboardingComplete, true);
 });
 
 test("faculty turnout groups attendance and recovers faculty from the attendee account when an action has no snapshot", () => {
@@ -154,7 +181,7 @@ test("signup sends verification through Gmail API and sanitizes provider failure
   const apiRequests = [];
   const providerLogs = [];
   let oauthSignal;
-  let shouldFail = false;
+  let failureType = "";
 
   app.locals.emailSender = undefined;
   app.locals.gmailOAuthClientFactory = ({ clientId, clientSecret, transporterOptions }) => {
@@ -165,15 +192,30 @@ test("signup sends verification through Gmail API and sanitizes provider failure
     oauthSignal = transporterOptions.signal;
     return {
       setCredentials: (credentials) => assert.deepEqual(credentials, { refresh_token: "gmail-refresh-token-for-tests" }),
-      getAccessToken: async () => ({ token: "gmail-api-access-token-for-tests" })
+      getAccessToken: async () => {
+        if (failureType === "invalid_grant") {
+          const error = new Error("invalid_grant: sender authorization was revoked.");
+          error.response = { data: { error: "invalid_grant", error_description: "Refresh token expired or revoked." } };
+          throw error;
+        }
+        return { token: "gmail-api-access-token-for-tests" };
+      }
     };
   };
   app.locals.gmailApiFetch = async (url, options) => {
     apiRequests.push({ url, options });
-    if (shouldFail) {
-      const error = new Error("Gmail delivery failed for gmail-failure@futa.edu.ng.");
-      error.response = { status: 403 };
-      throw error;
+    if (failureType === "permission") {
+      return {
+        ok: false,
+        status: 403,
+        json: async () => ({
+          error: {
+            code: 403,
+            message: "Insufficient Permission",
+            errors: [{ reason: "insufficientPermissions" }]
+          }
+        })
+      };
     }
     return {
       ok: true,
@@ -205,22 +247,35 @@ test("signup sends verification through Gmail API and sanitizes provider failure
     const textBody = Buffer.from(encodedTextBody.replace(/\s/g, ""), "base64").toString("utf8");
     assert.match(textBody, /Your FUTApulse verification code is \d{6}/);
 
-    shouldFail = true;
+    failureType = "permission";
     const failure = await fetch(`${baseUrl}/api/auth/signup`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: "gmail-failure@futa.edu.ng", username: "gmail_failure", password: "CorrectPassword1" })
     });
     assert.equal(failure.status, 502);
-    assert.match((await failure.json()).error, /Gmail API email delivery failed or timed out/);
+    assert.match((await failure.json()).error, /lacks the gmail.send permission/);
     assert.equal(providerLogs.length, 1);
     assert.equal(providerLogs[0][0], "Gmail API email delivery failed.");
     assert.equal(providerLogs[0][1].statusCode, 403);
+    assert.equal(providerLogs[0][1].reason, "insufficientPermissions");
     assert.doesNotMatch(JSON.stringify(providerLogs[0]), /gmail-failure@futa\.edu\.ng/);
     const savedDatabase = JSON.parse(fs.readFileSync(dataFile, "utf8"));
     assert.equal(savedDatabase.emailChallenges.some((challenge) => challenge.email === "gmail-failure@futa.edu.ng"), false);
 
-    shouldFail = false;
+    failureType = "invalid_grant";
+    const tokenFailure = await fetch(`${baseUrl}/api/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "gmail-token-failure@futa.edu.ng", username: "gmail_token_failure", password: "CorrectPassword1" })
+    });
+    assert.equal(tokenFailure.status, 502);
+    assert.match((await tokenFailure.json()).error, /GMAIL_REFRESH_TOKEN \(invalid_grant\)/);
+    assert.equal(providerLogs.length, 2);
+    assert.equal(providerLogs[1][1].code, "invalid_grant");
+    assert.doesNotMatch(JSON.stringify(providerLogs[1]), /gmail-token-failure@futa\.edu\.ng/);
+
+    failureType = "";
     const configuredRefreshToken = process.env.GMAIL_REFRESH_TOKEN;
     delete process.env.GMAIL_REFRESH_TOKEN;
     const unconfigured = await fetch(`${baseUrl}/api/auth/signup`, {
@@ -692,6 +747,14 @@ test("account deletion removes events owned by that account", async () => {
   });
   assert.equal(createdResponse.status, 201);
   const eventId = (await createdResponse.json()).event.id;
+  const localDatabase = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  localDatabase.pushDevices = [{ userId: owner.user.id, deviceKey: "delete-owner-device" }];
+  localDatabase.notificationJobs = [
+    { recipientUserId: owner.user.id, eventId: "another-event" },
+    { recipientUserId: "another-user", eventId }
+  ];
+  localDatabase.engagementActions = [{ userId: owner.user.id, eventId: "another-event" }];
+  fs.writeFileSync(dataFile, JSON.stringify(localDatabase));
 
   const deletion = await fetch(`${baseUrl}/api/auth/account`, {
     method: "DELETE",
@@ -701,6 +764,10 @@ test("account deletion removes events owned by that account", async () => {
   assert.equal(deletion.status, 200);
   const eventsAfterDeletion = await fetch(`${baseUrl}/api/events`);
   assert.ok(!(await eventsAfterDeletion.json()).events.some((event) => event.id === eventId));
+  const afterDeletion = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  assert.deepEqual(afterDeletion.pushDevices, []);
+  assert.deepEqual(afterDeletion.engagementActions, []);
+  assert.deepEqual(afterDeletion.notificationJobs, []);
 });
 
 test("account security supports email/password changes and confirmed deletion", async () => {
