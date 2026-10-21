@@ -1,0 +1,23 @@
+{
+  "short_name": "FUTApulse",
+  "name": "FUTApulse — Campus Events",
+  "description": "Discover, save, and share campus events at FUTA.",
+  "icons": [
+    {
+      "src": "/android-chrome-192x192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "/android-chrome-512x512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "background_color": "#050508",
+  "theme_color": "#9333ea",
+  "display": "standalone"
+}

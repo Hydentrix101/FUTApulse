@@ -1,0 +1,8 @@
+{
+	"appId": "ng.edu.futa.futapulse",
+	"appName": "FUTApulse",
+	"webDir": "dist",
+	"android": {
+		"allowMixedContent": false
+	}
+}
