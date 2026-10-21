@@ -2,11 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import { Check, SkipForward } from 'lucide-react'
 import HouseSponsorCard from './HouseSponsorCard'
 import { dismissLaunchAd, preloadLaunchAd, showLaunchAd } from '../ads/adProviderAdapter'
+import { mobileAdsConfig } from '../config/mobileAds'
 
 const LOAD_TIMEOUT_MS = 2500
 const MAX_NATIVE_AD_MS = 120000
 const SKIP_AFTER_MS = 5000
-const launchVideoUrl = String(import.meta.env.VITE_LAUNCH_AD_VIDEO_URL || '').trim()
+const launchVideoUrl = mobileAdsConfig.isAdsLive
+  ? String(import.meta.env.VITE_LAUNCH_AD_VIDEO_URL || '').trim()
+  : ''
 
 function withTimeout(promise, timeoutMs) {
   let timer

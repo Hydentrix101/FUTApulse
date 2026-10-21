@@ -85,6 +85,7 @@ function EventCard({ event, onComing, onRemind, onReport, viewerProfile, isHot =
   const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false)
   const [shareFeedback, setShareFeedback] = useState('')
   const [currentTime, setCurrentTime] = useState(0)
+  const [recapPhotoIndex, setRecapPhotoIndex] = useState(0)
   const [showReminderNudge, setShowReminderNudge] = useState(false)
   const reminderNudgeTimer = useRef(null)
   const isReminded = Boolean(event.isReminded || event.reminded)
@@ -106,7 +107,15 @@ function EventCard({ event, onComing, onRemind, onReport, viewerProfile, isHot =
     : organizerFallbackStage === 1
       ? organizerFacultyLogo
       : FACULTY_LOGO_FALLBACK
-  const bannerSource = event.banner || event.image || ''
+  const recapPhotos = Array.isArray(event.recapPhotos) ? event.recapPhotos : []
+  const eventEndTimestamp = Date.parse(event.endTime || '')
+  const recapWindowOpen = recapPhotos.length > 0
+    && Number.isFinite(eventEndTimestamp)
+    && currentTime >= eventEndTimestamp
+    && currentTime <= eventEndTimestamp + (30 * 60_000)
+  const recapPhoto = recapWindowOpen ? recapPhotos[recapPhotoIndex % recapPhotos.length] : null
+  const bannerSource = (typeof recapPhoto === 'string' ? recapPhoto : recapPhoto?.url) || event.banner || event.image || ''
+  const isCancelled = event.status === 'Cancelled'
   const isBannerUnavailable = !bannerSource || unavailableBannerSource === bannerSource
   const description = event.activity || event.description || 'Event details will be announced soon.'
   const venue = event.venue || 'Venue to be announced'
@@ -151,6 +160,14 @@ function EventCard({ event, onComing, onRemind, onReport, viewerProfile, isHot =
       window.clearTimeout(reminderNudgeTimer.current)
     }
   }, [])
+
+  useEffect(() => {
+    if (!recapWindowOpen || recapPhotos.length < 2) return undefined
+    const timer = window.setInterval(() => {
+      setRecapPhotoIndex((index) => (index + 1) % recapPhotos.length)
+    }, 5500)
+    return () => window.clearInterval(timer)
+  }, [event.id, recapPhotos.length, recapWindowOpen])
 
   const shareEvent = async () => {
     setShareFeedback('')
@@ -211,13 +228,15 @@ function EventCard({ event, onComing, onRemind, onReport, viewerProfile, isHot =
 
   return (
     <>
-    <article className={`event-card ${category}-platform ${isHotEvent ? 'is-hot-event' : ''} flex flex-col overflow-hidden p-4 text-slate-100`}>
+    <article className={`event-card ${category}-platform ${isHotEvent ? 'is-hot-event' : ''} ${isCancelled ? 'is-cancelled-event' : ''} flex flex-col overflow-hidden p-4 text-slate-100`}>
       <div className="absolute left-1/2 top-2 z-10 -translate-x-1/2 rounded-full border border-slate-600/80 bg-slate-950/90 px-2.5 py-1 text-[9px] font-bold tracking-wide text-slate-100">
         {getTargetLabel(event.audience)}
       </div>
       <span className={`category-badge ${categoryClass}`}>
         {isHotEvent && <><Flame size={12} aria-hidden="true" /> HOT · </>}{categoryLabel}
       </span>
+      {isCancelled && <div className="event-cancellation-notice" role="alert">⚠️ CANCELLATION NOTICE — This event has been called off.</div>}
+      {!isCancelled && event.isEnded && recapPhotos.length > 0 && <div className="event-recap-notice" role="status">Event recap is live · {recapPhotos.length} {recapPhotos.length === 1 ? 'photo' : 'photos'}</div>}
 
       <header className="card-header grid min-h-[98px] grid-cols-[76px_minmax(0,1fr)_76px] items-end gap-1 pt-7">
         <div className="organizer-info organizer-avatar-wrap flex w-[76px] shrink-0 flex-col items-center gap-1 text-center">
@@ -351,10 +370,10 @@ function EventCard({ event, onComing, onRemind, onReport, viewerProfile, isHot =
       </div>
 
       <footer className="event-card-actions-grid">
-        {readOnly ? (
+        {readOnly || isCancelled ? (
           <div className="event-action-row event-action-row-share event-card-read-only-actions">
             {shareAction}
-            <p>Sign in to mark Coming, set reminders, or report this event.</p>
+              <p>{isCancelled ? 'This event has been cancelled.' : 'Sign in to mark Coming, set reminders, or report this event.'}</p>
           </div>
         ) : (
           <div className="event-action-row event-action-row-all">

@@ -1,6 +1,7 @@
 const env = import.meta.env
 
 const readValue = (key) => String(env[key] || '').trim()
+const isAdsLive = readValue('VITE_IS_ADS_LIVE').toLowerCase() === 'true'
 
 const platformConfig = (platform) => {
   const prefix = platform === 'ios' ? 'VITE_ADMOB_IOS' : 'VITE_ADMOB_ANDROID'
@@ -12,7 +13,8 @@ const platformConfig = (platform) => {
 }
 
 export const mobileAdsConfig = Object.freeze({
-  mode: readValue('VITE_ADS_MODE').toLowerCase() === 'admob' ? 'admob' : 'mock',
+  isAdsLive,
+  mode: isAdsLive && readValue('VITE_ADS_MODE').toLowerCase() === 'admob' ? 'admob' : 'mock',
   android: platformConfig('android'),
   ios: platformConfig('ios'),
 })

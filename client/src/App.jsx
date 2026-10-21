@@ -9,6 +9,9 @@ import AdSlot from './components/AdSlot'
 import LaunchAdGate from './components/LaunchAdGate'
 import BrandHeart from './components/BrandHeart'
 import { API_BASE_URL } from './config/api'
+import { io } from 'socket.io-client'
+import { Capacitor } from '@capacitor/core'
+import { PushNotifications } from '@capacitor/push-notifications'
 
 const EventCard = lazy(() => import('./components/EventCard'))
 const EventEditor = lazy(() => import('./components/EventEditor'))
@@ -43,6 +46,7 @@ const REPORT_REASON_LABELS = {
   duplicate: 'Duplicate event',
   other: 'Other concern',
 }
+const DEFAULT_CATEGORY_PREFERENCES = Object.freeze(Object.fromEntries(CATEGORY_DATA.map(({ id }) => [id, true])))
 
 function readStored(key, fallback) {
   try {
@@ -59,6 +63,13 @@ function readStoredValue(key, fallback = '') {
   } catch {
     return fallback
   }
+}
+
+function decodeVapidKey(value) {
+  const normalized = String(value).replace(/-/g, '+').replace(/_/g, '/')
+  const padded = normalized.padEnd(normalized.length + ((4 - normalized.length % 4) % 4), '=')
+  const decoded = window.atob(padded)
+  return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
 }
 
 function readInitialEventCache() {
@@ -346,6 +357,18 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
 }
 
 function App() {
+  const pathname = window.location.pathname.replace(/\/+$/, '') || '/'
+  const legalPages = {
+    '/privacy': 'privacy',
+    '/terms': 'terms',
+    '/about': 'about',
+  }
+
+  if (legalPages[pathname]) return <LegalPage page={legalPages[pathname]} />
+  return <FutaPulseApp />
+}
+
+function FutaPulseApp() {
   const hasSharedEventLink = new URLSearchParams(window.location.search).has('event')
   const [launchVisible, setLaunchVisible] = useState(true)
   const [launchSequenceReady, setLaunchSequenceReady] = useState(false)
@@ -358,6 +381,9 @@ function App() {
   const [profile, setProfile] = useState(null)
   const [profileOpen, setProfileOpen] = useState(false)
   const [profileSaving, setProfileSaving] = useState(false)
+  const [categoryPreferencesDraft, setCategoryPreferencesDraft] = useState(null)
+  const [categoryPreferencesOpen, setCategoryPreferencesOpen] = useState(false)
+  const [categoryPreferencesSaving, setCategoryPreferencesSaving] = useState(false)
   const [hasDeviceAccount, setHasDeviceAccount] = useState(() => {
     const knownAccounts = readStored('futapulse-known-accounts', [])
     return Boolean((Array.isArray(knownAccounts) && knownAccounts.length) || readStoredValue('futapulse-remembered-username'))
@@ -382,6 +408,7 @@ function App() {
   const [pausedAutoScrollTracks, setPausedAutoScrollTracks] = useState({})
   const [documentVisible, setDocumentVisible] = useState(() => !document.hidden)
   const handledSharedEventId = useRef('')
+  const fetchingSharedEventId = useRef('')
   const [search, setSearch] = useState('')
   const [searchFocused, setSearchFocused] = useState(false)
   const [recentSearches, setRecentSearches] = useState(() => {
@@ -421,6 +448,8 @@ function App() {
   const [reportReviewCases, setReportReviewCases] = useState([])
   const [reportReviewBusyId, setReportReviewBusyId] = useState('')
   const [activeEventAlert, setActiveEventAlert] = useState(null)
+  const [homeAnnouncement, setHomeAnnouncement] = useState(null)
+  const handledNotificationIds = useRef(new Set())
   const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [settingsPage, setSettingsPage] = useState('menu')
   const [notifications, setNotifications] = useState(() => readStored('futapulse-notification-preferences', { reminders: true, updates: true }))
@@ -429,6 +458,11 @@ function App() {
   const [eventDeleteTarget, setEventDeleteTarget] = useState(null)
   const [eventDeleting, setEventDeleting] = useState(false)
   const [eventEditor, setEventEditor] = useState(null)
+  const [recapUploadTarget, setRecapUploadTarget] = useState(null)
+  const [recapUploading, setRecapUploading] = useState(false)
+  const [organizerBroadcastTarget, setOrganizerBroadcastTarget] = useState(null)
+  const [organizerBroadcastText, setOrganizerBroadcastText] = useState('')
+  const [organizerBroadcastSending, setOrganizerBroadcastSending] = useState(false)
   const [visibleFullFeedCount, setVisibleFullFeedCount] = useState(EVENT_LIST_PAGE_SIZE)
   const [visibleSearchCount, setVisibleSearchCount] = useState(EVENT_LIST_PAGE_SIZE)
   const [visibleOrganizerCount, setVisibleOrganizerCount] = useState(EVENT_LIST_PAGE_SIZE)
@@ -450,17 +484,40 @@ function App() {
   const [pendingNewEmail, setPendingNewEmail] = useState('')
   const [feedbackSending, setFeedbackSending] = useState(false)
   const isFutapulseAdmin = Boolean(user?.emailVerified && String(user.email || '').toLowerCase() === FUTAPULSE_ADMIN_EMAIL)
+  const categoryPreferences = categoryPreferencesDraft || (profile
+    ? Object.fromEntries(CATEGORY_DATA.map(({ id }) => [
+      id,
+      typeof profile.notificationPreferences?.[id] === 'boolean' ? profile.notificationPreferences[id] : true,
+    ]))
+    : DEFAULT_CATEGORY_PREFERENCES)
+  const shouldShowCategoryPreferences = categoryPreferencesOpen
+    || (!sessionLoading && Boolean(session?.token && user && profile?.faculty && profile?.department && profile?.level)
+      && profile?.notificationPreferencesOnboardingComplete !== true)
   const toastTimer = useRef(null)
   const alarmAudioContextRef = useRef(null)
   const alarmSoundTimerRef = useRef(null)
+  const pushListenersRef = useRef([])
+  const sessionTokenRef = useRef(session?.token || '')
   const avatarInput = useRef(null)
   const eventBannerInput = useRef(null)
+  const recapPhotoInput = useRef(null)
   const engagementInFlight = useRef(false)
 
   const notify = useCallback((message, type = 'info') => {
     setToast({ message, type })
     window.clearTimeout(toastTimer.current)
     toastTimer.current = window.setTimeout(() => setToast(null), 3600)
+  }, [])
+
+  const receiveNotification = useCallback((payload) => {
+    if (!payload?.notificationId || handledNotificationIds.current.has(payload.notificationId)) return
+    window.clearTimeout(toastTimer.current)
+    handledNotificationIds.current.add(payload.notificationId)
+    if (handledNotificationIds.current.size > 250) {
+      handledNotificationIds.current = new Set([...handledNotificationIds.current].slice(-150))
+    }
+    setToast({ message: payload.message || payload.title || 'There is a new event update.', type: 'info', notification: payload })
+    toastTimer.current = window.setTimeout(() => setToast(null), 8000)
   }, [])
 
   const pauseAutoScroll = useCallback((trackId) => {
@@ -492,6 +549,7 @@ function App() {
 
   useEffect(() => () => {
     Object.values(autoScrollResumeTimersRef.current).forEach((timer) => window.clearTimeout(timer))
+    pushListenersRef.current.forEach((listener) => { void listener.remove() })
   }, [])
 
   const eventExpiryScheduleKey = events.map((event) => `${getEventId(event)}:${event.endTime || ''}`).join('|')
@@ -503,6 +561,35 @@ function App() {
     document.addEventListener('visibilitychange', updateVisibility)
     return () => document.removeEventListener('visibilitychange', updateVisibility)
   }, [])
+
+  useEffect(() => {
+    if (!session?.token || !user?.id) return undefined
+    const socket = io(API_BASE_URL, {
+      auth: { token: session.token },
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+    })
+    socket.on('home-notification', receiveNotification)
+    socket.on('connect_error', (error) => {
+      if (error.message !== 'Authentication required.' && error.message !== 'Session is no longer valid.') {
+        console.warn('Live notification connection is temporarily unavailable.', error.message)
+      }
+    })
+    const handleServiceWorkerMessage = (event) => {
+      if (event.data?.type === 'FUTAPULSE_NOTIFICATION') receiveNotification(event.data.payload)
+    }
+    navigator.serviceWorker?.addEventListener('message', handleServiceWorkerMessage)
+    return () => {
+      socket.removeAllListeners()
+      socket.disconnect()
+      navigator.serviceWorker?.removeEventListener('message', handleServiceWorkerMessage)
+    }
+  }, [receiveNotification, session?.token, user?.id])
+
+  useEffect(() => {
+    sessionTokenRef.current = session?.token || ''
+  }, [session?.token])
 
   const primeAlarmAudio = useCallback(() => {
     const AudioContextConstructor = window.AudioContext || window.webkitAudioContext
@@ -561,21 +648,6 @@ function App() {
     setDetailEvent(null)
   }, [stopAlarmRingtone, setActiveEventAlert, setDetailEvent])
 
-  const requestEventNotificationPermission = useCallback(() => {
-    if (!('Notification' in window)) {
-      return
-    }
-    if (Notification.permission !== 'default') {
-      return
-    }
-    try {
-      void Notification.requestPermission()
-        .catch((error) => console.warn('Unable to request notification permission.', error))
-    } catch (error) {
-      console.warn('Unable to request notification permission.', error)
-    }
-  }, [])
-
   const rememberSearch = useCallback((value) => {
     const query = String(value || '').trim().replace(/\s+/g, ' ')
     if (!query) return
@@ -626,6 +698,8 @@ function App() {
     setSession(null)
     setUser(null)
     setProfile(null)
+    setCategoryPreferencesDraft(null)
+    setCategoryPreferencesOpen(false)
     setProfileMenuOpen(false)
     setProfileOpen(false)
     notify('You have been logged out.')
@@ -950,7 +1024,31 @@ function App() {
     const requestedEventId = linkParams.get('event')
     if (!requestedEventId || handledSharedEventId.current === requestedEventId) return
     const sharedEvent = events.find((item) => String(getEventId(item)) === requestedEventId)
-    if (!sharedEvent) return
+    if (!sharedEvent) {
+      if (fetchingSharedEventId.current === requestedEventId) return
+      fetchingSharedEventId.current = requestedEventId
+      void fetch(`${API_BASE_URL}/api/events/${encodeURIComponent(requestedEventId)}`, {
+        headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
+        signal: AbortSignal.timeout(20_000),
+      }).then(async (response) => {
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}))
+          throw new Error(body.error || `The shared event could not be loaded (${response.status}).`)
+        }
+        return response.json()
+      }).then((data) => {
+        const shared = data.event
+        if (!shared || String(getEventId(shared)) !== requestedEventId) throw new Error('The shared event response was invalid.')
+        startTransition(() => setEvents((current) => current.some((item) => String(getEventId(item)) === requestedEventId)
+          ? current
+          : [...current, { ...shared, isDeepLinkOnly: shared.isDeepLinkOnly === true }]))
+      }).catch((error) => {
+        console.warn('Unable to restore the shared event link.', error)
+      }).finally(() => {
+        if (fetchingSharedEventId.current === requestedEventId) fetchingSharedEventId.current = ''
+      })
+      return
+    }
     const requestedCategory = linkParams.get('category')
     const selectedCategory = CATEGORY_DATA.some((item) => item.id === sharedEvent.category)
       ? sharedEvent.category
@@ -966,7 +1064,7 @@ function App() {
       setPendingFullEventId(requestedEventId)
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [events, activeTab])
+  }, [events, activeTab, session?.token])
 
   useEffect(() => {
     if (activeTab !== 'reminders') return undefined
@@ -985,7 +1083,7 @@ function App() {
   }, [theme])
 
   useEffect(() => {
-    if (!detailEvent && !profileMenuOpen && !profileOpen && !eventEditor && !reminderTarget && !reportTarget) return undefined
+    if (!detailEvent && !profileMenuOpen && !profileOpen && !eventEditor && !reminderTarget && !reportTarget && !organizerBroadcastTarget && !categoryPreferencesOpen) return undefined
     const onKeyDown = (event) => {
       if (event.key === 'Escape') {
         if (detailEvent) {
@@ -998,11 +1096,13 @@ function App() {
         setEventEditor(null)
         setReminderTarget(null)
         setReportTarget(null)
+        setOrganizerBroadcastTarget(null)
+        setCategoryPreferencesOpen(false)
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [detailEvent, profileMenuOpen, profileOpen, eventEditor, reminderTarget, reportTarget, profile, closeEventDetail])
+  }, [detailEvent, profileMenuOpen, profileOpen, eventEditor, reminderTarget, reportTarget, organizerBroadcastTarget, categoryPreferencesOpen, profile, closeEventDetail])
 
   useEffect(() => {
     const onHashChange = () => {
@@ -1015,6 +1115,8 @@ function App() {
 
   const publishedEvents = useMemo(
     () => events.filter((event) => {
+      if (event.status === 'Cancelled') return Date.parse(event.cancellationExpiresAt || '') > feedClock
+      if (event.isDeepLinkOnly === true) return true
       if (!['Published', 'Live', undefined].includes(event.status)) return false
       return isWithinEventDisplayWindow(event, feedClock)
     }),
@@ -1165,7 +1267,6 @@ function App() {
         : event))
       if (!isGoing && notifications.reminders !== false) {
         primeAlarmAudio()
-        requestEventNotificationPermission()
       }
       notify(isGoing ? 'Your attendance update was removed.' : 'Your attendance was confirmed by the server.', 'success')
     } catch (error) {
@@ -1173,7 +1274,7 @@ function App() {
     } finally {
       onlineEngagementsInFlight.current.delete(`rsvp:${eventId}`)
     }
-  }, [goingIds, notifications.reminders, primeAlarmAudio, requestEventNotificationPermission, notify, session])
+  }, [goingIds, notifications.reminders, primeAlarmAudio, notify, session])
 
   const showEventAlert = useCallback((event, kind) => {
     if (!event) return
@@ -1321,6 +1422,106 @@ function App() {
     }
   }
 
+  const saveCategoryPreferences = async (nextPreferences = categoryPreferences, requestPermission = false) => {
+    if (!session?.token || categoryPreferencesSaving) return false
+    setCategoryPreferencesSaving(true)
+    try {
+      const result = await apiRequest('/api/notifications/preferences', {
+        method: 'PATCH',
+        body: JSON.stringify({ notificationPreferences: nextPreferences }),
+      }, session.token)
+      const nextProfile = {
+        ...(profile || {}),
+        notificationPreferences: result.notificationPreferences,
+        notificationPreferencesOnboardingComplete: result.notificationPreferencesOnboardingComplete,
+      }
+      setCategoryPreferencesDraft(result.notificationPreferences)
+      setProfile(nextProfile)
+      const updatedUser = { ...user, profile: nextProfile }
+      setUser(updatedUser)
+      setSession((current) => current ? { ...current, user: updatedUser } : current)
+      setCategoryPreferencesOpen(false)
+      notify('Your event interests have been saved.', 'success')
+      if (requestPermission) await enablePushNotifications()
+      return true
+    } catch (error) {
+      notify(error.message || 'Unable to save your event interests. Please try again.', 'error')
+      return false
+    } finally {
+      setCategoryPreferencesSaving(false)
+    }
+  }
+
+  const enablePushNotifications = async () => {
+    if (!session?.token) {
+      notify('Sign in before enabling notifications.', 'error')
+      return
+    }
+    try {
+      const config = await apiRequest('/api/notifications/config')
+      if (Capacitor.isNativePlatform()) {
+        if (!config.androidPushConfigured) throw new Error('Android push is not configured on the FUTApulse server yet.')
+        if (!pushListenersRef.current.length) {
+          pushListenersRef.current = [
+            await PushNotifications.addListener('registration', async ({ value }) => {
+              try {
+                await apiRequest('/api/notifications/devices/android', {
+                  method: 'POST',
+                  body: JSON.stringify({ token: value }),
+                }, sessionTokenRef.current)
+                notify('Push notifications are enabled on this device.', 'success')
+              } catch (error) {
+                notify(error.message || 'The Android push token could not be registered.', 'error')
+              }
+            }),
+            await PushNotifications.addListener('registrationError', (error) => {
+              console.error('Android push registration failed.', error)
+              notify('Android notifications could not be enabled. Check the Firebase Android setup.', 'error')
+            }),
+            await PushNotifications.addListener('pushNotificationActionPerformed', ({ notification }) => {
+              const data = notification?.data || {}
+              focusNotificationEvent({
+                notificationId: data.notificationId,
+                eventId: data.eventId,
+                category: data.category,
+                title: data.title || notification?.title,
+                message: data.message || notification?.body,
+              })
+            }),
+          ]
+        }
+        let permission = await PushNotifications.checkPermissions()
+        if (permission.receive !== 'granted') permission = await PushNotifications.requestPermissions()
+        if (permission.receive !== 'granted') throw new Error('Notification permission was not granted on this device.')
+        await PushNotifications.register()
+        return
+      }
+      if (!('Notification' in window) || !('serviceWorker' in navigator)) {
+        throw new Error('This browser does not support web push notifications.')
+      }
+      if (!config.webPushConfigured || !config.webPushPublicKey) {
+        throw new Error('Web Push is not configured on the FUTApulse server yet.')
+      }
+      const permission = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission
+      if (permission !== 'granted') throw new Error('Notification permission was not granted in this browser.')
+      const registration = await navigator.serviceWorker.ready
+      let subscription = await registration.pushManager.getSubscription()
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: decodeVapidKey(config.webPushPublicKey),
+        })
+      }
+      await apiRequest('/api/notifications/devices/web', {
+        method: 'POST',
+        body: JSON.stringify({ subscription }),
+      }, session.token)
+      notify('Push notifications are enabled in this browser.', 'success')
+    } catch (error) {
+      notify(error.message || 'Unable to enable notifications on this device.', 'error')
+    }
+  }
+
   const saveEditedProfile = async (nextProfile) => {
     if (!session?.token) throw new Error('Sign in again before saving your profile.')
     setProfileSaving(true)
@@ -1349,6 +1550,63 @@ function App() {
       notify('Profile saved successfully.', 'success')
     } finally {
       setProfileSaving(false)
+    }
+  }
+
+  const uploadEventRecap = async (files) => {
+    if (!recapUploadTarget || !session?.token || !files?.length) return
+    const existingCount = Array.isArray(recapUploadTarget.recapPhotos) ? recapUploadTarget.recapPhotos.length : 0
+    if (existingCount + files.length > 5) {
+      notify('An event recap can contain at most five photos.', 'error')
+      return
+    }
+    const invalidFile = files.find((file) => !['image/jpeg', 'image/webp'].includes(file.type) || file.size > 5 * 1024 * 1024)
+    if (invalidFile) {
+      notify('Choose JPEG or WebP photos no larger than 5 MB each.', 'error')
+      return
+    }
+    setRecapUploading(true)
+    const formData = new FormData()
+    files.forEach((file) => formData.append('photos', file))
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/events/${encodeURIComponent(String(getEventId(recapUploadTarget)))}/recap-photos`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { Authorization: `Bearer ${session.token}` },
+        body: formData,
+        signal: AbortSignal.timeout(90_000),
+      })
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(result.error || `Recap upload failed (${response.status}).`)
+      setEvents((current) => current.map((event) => String(getEventId(event)) === String(getEventId(recapUploadTarget))
+        ? { ...event, ...result.event }
+        : event))
+      setRecapUploadTarget(null)
+      notify('Your event recap photos are live.', 'success')
+    } catch (error) {
+      notify(error.message || 'Unable to upload recap photos.', 'error')
+    } finally {
+      setRecapUploading(false)
+      if (recapPhotoInput.current) recapPhotoInput.current.value = ''
+    }
+  }
+
+  const sendOrganizerBroadcast = async (event) => {
+    event.preventDefault()
+    if (!organizerBroadcastTarget || !organizerBroadcastText.trim() || !session?.token) return
+    setOrganizerBroadcastSending(true)
+    try {
+      const result = await apiRequest(`/api/events/${encodeURIComponent(String(getEventId(organizerBroadcastTarget)))}/announcements`, {
+        method: 'POST',
+        body: JSON.stringify({ message: organizerBroadcastText.trim() }),
+      }, session.token)
+      setOrganizerBroadcastTarget(null)
+      setOrganizerBroadcastText('')
+      notify(`Announcement queued for ${result.recipientCount} eligible users.`, 'success')
+    } catch (error) {
+      notify(error.message || 'Unable to send the event announcement.', 'error')
+    } finally {
+      setOrganizerBroadcastSending(false)
     }
   }
 
@@ -1622,7 +1880,7 @@ function App() {
   )
   const organizerEvents = useMemo(() => events
     .filter((event) => String(event.createdByUserId || '') === String(user?.id || ''))
-    .filter((event) => organizerTab === 'drafts' ? event.status === 'Draft' : ['Published', 'Live'].includes(event.status)), [events, user?.id, organizerTab])
+    .filter((event) => organizerTab === 'drafts' ? event.status === 'Draft' : ['Published', 'Live', 'Cancelled'].includes(event.status)), [events, user?.id, organizerTab])
 
   const changeSearch = (value) => {
     setSearch(value)
@@ -1666,6 +1924,19 @@ function App() {
     if (!eventId) window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 0)
   }
 
+  const focusNotificationEvent = (notification) => {
+    if (!notification?.eventId) return
+    const category = CATEGORY_DATA.some((item) => item.id === notification.category) ? notification.category : 'all'
+    setHomeAnnouncement(notification)
+    setHomeCategory(category)
+    setExpandedHomeCategory(category)
+    setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
+    setPendingFullEventId(String(notification.eventId))
+    setActiveTab('home')
+    window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 0)
+    window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 100)
+  }
+
   useEffect(() => {
     if (activeTab !== 'home' || !expandedHomeCategory || !pendingFullEventId) return undefined
     const frame = window.requestAnimationFrame(() => {
@@ -1696,6 +1967,20 @@ function App() {
       return
     }
     const reminder = { label, notifyAt: new Date(notifyAt).toISOString() }
+    let backgroundDeliveryAvailable = false
+    try {
+      const notificationConfig = await apiRequest('/api/notifications/config')
+      if (notificationConfig.durableSchedulingAvailable) {
+        await apiRequest(`/api/events/${encodeURIComponent(String(reminderTarget))}/reminders/schedule`, {
+          method: 'POST',
+          body: JSON.stringify({ notifyAt: reminder.notifyAt }),
+        }, session?.token)
+        backgroundDeliveryAvailable = true
+      }
+    } catch (error) {
+      notify(error.message || 'Unable to schedule this reminder on the server. No reminder was saved.', 'error')
+      return
+    }
     const next = { ...reminderTimes, [String(reminderTarget)]: reminder }
     setReminderTimes(next)
     safeSetStored('futapulse-reminders', JSON.stringify(next))
@@ -1703,23 +1988,11 @@ function App() {
       void handleReminder(reminderTarget, true, { silent: true })
     }
     setReminderTarget(null)
-    if ('Notification' in window && notifications.reminders !== false) {
-      try {
-        const permission = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission
-        if (permission === 'granted') {
-          notify(`Reminder set for ${label}.`, 'success')
-        } else {
-          notify(`Saved ${label} reminder. Enable notifications to receive an alert when FUTApulse is open in the background.`, 'info')
-        }
-      } catch (error) {
-        console.error('Unable to enable event notification.', error)
-        notify('Reminder saved, but browser alerts could not be enabled.', 'error')
-      }
-    } else if (notifications.reminders === false) {
-      notify(`Saved ${label} reminder. Alerts are currently turned off in notification preferences.`, 'info')
-    } else {
-      notify(`Reminder set for ${label}.`, 'success')
-    }
+    notify(!backgroundDeliveryAvailable
+      ? `Saved ${label} reminder for this device. Background delivery is unavailable until the server uses shared MongoDB scheduling.`
+      : notifications.reminders === false
+      ? `Saved ${label} reminder. Alerts are currently turned off in notification preferences.`
+      : `Saved ${label} reminder. Enable notifications from your Profile settings to receive alerts when FUTApulse is closed.`, 'success')
   }
 
   const autosaveEventDraft = async (eventData, banner) => {
@@ -1928,7 +2201,7 @@ function App() {
 
   if ((!session?.token || !user) && !isGuestSharedView) {
     return (
-      <div className={`app-root theme-${theme}`}>
+      <div className={`app-root legal-auth-app theme-${theme}`}>
         <div className="auth-app-frame">
           <AuthScreen
             initialUsername={rememberedUsername}
@@ -1941,7 +2214,12 @@ function App() {
             }}
           />
         </div>
-        {toast && <Toast toast={toast} />}
+        <footer className="auth-legal-footer" aria-label="Legal and information links">
+          <a href="/privacy">Privacy</a>
+          <a href="/terms">Terms</a>
+          <a href="/about">About &amp; Contact</a>
+        </footer>
+        {toast && <Toast toast={toast} onAction={toast.notification ? () => focusNotificationEvent(toast.notification) : undefined} />}
       </div>
     )
   }
@@ -1995,6 +2273,12 @@ function App() {
         <main className="app-main">
           {activeTab === 'home' && (
             <>
+              {homeAnnouncement && (
+                <button type="button" className="home-announcement-pill" onClick={() => focusNotificationEvent(homeAnnouncement)}>
+                  <span>{homeAnnouncement.title || homeAnnouncement.message}</span>
+                  <span>View event <ChevronRight size={15} /></span>
+                </button>
+              )}
               <section className={`category-filter-shell ${homeCategory !== 'all' ? 'is-sticky-category' : ''}`}>
                 <div ref={categoryFilterBarRef} className="category-filter-bar" role="tablist" aria-label="Filter events by category">
                   {[{ id: 'all', label: 'All' }, ...CATEGORY_DATA.map(({ id, label }) => ({ id, label }))].map((filter) => (
@@ -2292,7 +2576,17 @@ function App() {
                   {organizerEvents.length ? <div className="profile-events-list">
                     {organizerEvents.slice(0, visibleOrganizerCount).map((event) => <article key={getEventId(event)} className="profile-event-item">
                       <div className="profile-event-item-left"><span className={`profile-event-accent-bar ${event.category}`} /><div className="profile-event-info"><span className={`profile-item-badge ${event.status === 'Draft' ? 'draft' : 'published'}`}>{event.status}</span><strong>{event.title}</strong><span>{event.venue || 'Venue not set'} · {event.date ? new Date(event.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'Date not set'}</span></div></div>
-                      {String(event.createdByUserId) === String(user.id) && <div className="profile-event-actions"><button type="button" className="btn-item-edit" onClick={() => { setEventDuplicateState({ code: '', matches: [] }); setEventEditor(event) }}>Edit</button><button type="button" className="btn-item-delete" onClick={() => setEventDeleteTarget(event)} aria-label={`Delete ${event.status === 'Draft' ? 'draft' : 'event'} ${event.title}`}><Trash2 size={17} /><span>Delete</span></button></div>}
+                      {organizerTab === 'events' && event.status !== 'Cancelled' && hasEventEnded(event, clockNow) && clockNow - Date.parse(event.endTime || '') <= 7 * 24 * 60 * 60_000 && (
+                        <div className="profile-recap-prompt">
+                          <span>{event.recapPhotos?.length ? `${event.recapPhotos.length}/5 recap photos shared` : 'Your event has ended. Share a few look-back photos?'}</span>
+                          {(event.recapPhotos?.length || 0) < 5 && <button type="button" disabled={recapUploading} onClick={() => { setRecapUploadTarget(event); window.setTimeout(() => recapPhotoInput.current?.click(), 0) }}>{recapUploading ? 'Uploading…' : '＋ Add recap photos'}</button>}
+                        </div>
+                      )}
+                      {String(event.createdByUserId) === String(user.id) && <div className="profile-event-actions">
+                        {['Published', 'Live'].includes(event.status) && <button type="button" className="btn-item-edit" onClick={() => { setOrganizerBroadcastTarget(event); setOrganizerBroadcastText('') }}>Broadcast</button>}
+                        <button type="button" className="btn-item-edit" onClick={() => { setEventDuplicateState({ code: '', matches: [] }); setEventEditor(event) }}>Edit</button>
+                        <button type="button" className="btn-item-delete" onClick={() => setEventDeleteTarget(event)} aria-label={`${['Published', 'Live'].includes(event.status) ? 'Cancel' : 'Delete'} ${event.status === 'Draft' ? 'draft' : 'event'} ${event.title}`}><Trash2 size={17} /><span>{['Published', 'Live'].includes(event.status) ? 'Cancel' : 'Delete'}</span></button>
+                      </div>}
                     </article>)}
                     {visibleOrganizerCount < organizerEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleOrganizerCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more</button>}
                   </div> : <p className="profile-events-empty">{organizerTab === 'events' ? 'No uploaded events yet. Create your first campus event!' : 'No saved drafts. All your events have been published.'}</p>}
@@ -2300,6 +2594,15 @@ function App() {
             </div>
           )}
         </main>
+
+        <footer className="app-legal-footer">
+          <span>FUTApulse · Built for campus life</span>
+          <nav aria-label="Legal and information links">
+            <a href="/privacy">Privacy</a>
+            <a href="/terms">Terms</a>
+            <a href="/about">About &amp; Contact</a>
+          </nav>
+        </footer>
 
         <nav className="app-navbar" aria-label="Primary navigation">
           {NAV_ITEMS.map(({ id, label, Icon }) => (
@@ -2360,12 +2663,52 @@ function App() {
         /></Suspense>
       )}
 
+      {shouldShowCategoryPreferences && (
+        <div className="modal-backdrop category-preferences-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && profile?.notificationPreferencesOnboardingComplete) setCategoryPreferencesOpen(false) }}>
+          <section className="category-preferences-modal glass-panel" role="dialog" aria-modal="true" aria-labelledby="category-preferences-title">
+            <span className="explore-eyebrow">LET'S KNOW YOU BETTER</span>
+            <h2 id="category-preferences-title">Let's know you better!</h2>
+            <p>Choose the event categories you want to hear about. You can change these any time in Profile settings.</p>
+            <div className="category-preferences-list">
+              {CATEGORY_DATA.map(({ id, label, description }) => (
+                <label key={id} className="category-preference-row">
+                  <span><strong>{label}</strong><small>{description}</small></span>
+                  <input
+                    type="checkbox"
+                    checked={categoryPreferences[id] !== false}
+                    disabled={categoryPreferencesSaving}
+                    onChange={(event) => setCategoryPreferencesDraft((current) => ({ ...(current || categoryPreferences), [id]: event.target.checked }))}
+                  />
+                </label>
+              ))}
+            </div>
+            <div className="category-preferences-actions">
+              {profile?.notificationPreferencesOnboardingComplete && <button type="button" className="profile-edit-pill" onClick={() => setCategoryPreferencesOpen(false)}>Cancel</button>}
+              <button type="button" className="setup-submit" disabled={categoryPreferencesSaving} onClick={() => { void saveCategoryPreferences(categoryPreferences) }}>
+                {categoryPreferencesSaving ? 'Saving…' : 'Save interests'} <span>→</span>
+              </button>
+              <button type="button" className="category-enable-notifications" disabled={categoryPreferencesSaving} onClick={() => { void saveCategoryPreferences(categoryPreferences, true) }}>Enable notifications</button>
+            </div>
+            <small className="category-preferences-note">Your phone or browser will ask for permission only when you choose Enable notifications.</small>
+          </section>
+        </div>
+      )}
+
       {avatarPhotoSource && <Suspense fallback={null}><ProfilePhotoCropper
         source={avatarPhotoSource}
         saving={avatarUploading}
         onCancel={() => setAvatarPhotoSource('')}
         onSave={uploadProfilePhoto}
       /></Suspense>}
+
+      <input
+        ref={recapPhotoInput}
+        type="file"
+        accept="image/jpeg,image/webp"
+        multiple
+        hidden
+        onChange={(event) => { void uploadEventRecap(Array.from(event.target.files || [])) }}
+      />
 
       {reminderTarget && (
         <div className="modal-backdrop reminder-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setReminderTarget(null) }}>
@@ -2426,6 +2769,9 @@ function App() {
                   <button type="button" className="profile-option" onClick={() => setSettingsPage('guidelines')}><Shield size={18} /><span>Community Guidelines</span><ChevronRight size={18} /></button>
                   <button type="button" className="profile-option" onClick={toggleTheme}><Sparkles size={18} /><span>Switch Theme</span><b>{theme}</b></button>
                   <button type="button" className="profile-option" onClick={() => setSettingsPage('feedback')}><Heart size={18} /><span>Feedback &amp; Bug Report</span><ChevronRight size={18} /></button>
+                  <a className="profile-option profile-legal-link" href="/privacy"><Shield size={18} /><span>Privacy Policy</span><ChevronRight size={18} /></a>
+                  <a className="profile-option profile-legal-link" href="/terms"><Shield size={18} /><span>Terms of Service</span><ChevronRight size={18} /></a>
+                  <a className="profile-option profile-legal-link" href="/about"><Heart size={18} /><span>About &amp; Contact</span><ChevronRight size={18} /></a>
                   {isFutapulseAdmin && <button type="button" className="profile-option" onClick={() => setSettingsPage('event-reports')}><Shield size={18} /><span>Reported event review</span><b>{reportReviewCases.length}</b></button>}
                   <button type="button" className="profile-option profile-option-logout" onClick={logout}><LogOut size={18} /><span>Log Out</span><ChevronRight size={18} /></button>
                 </div>
@@ -2498,7 +2844,30 @@ function App() {
                     )}
                   </>
                 )}
-                {settingsPage === 'notifications' && <><span className="explore-eyebrow">YOUR ALERTS</span><h2>Notification preferences</h2>{[['reminders', 'Event reminders'], ['updates', 'Campus event updates']].map(([key, label]) => <label key={key} className="preference-toggle"><span>{label}</span><input type="checkbox" checked={notifications[key] !== false} onChange={(event) => setNotifications((current) => { const next = { ...current, [key]: event.target.checked }; safeSetStored('futapulse-notification-preferences', JSON.stringify(next)); return next })} /></label>)}<p className="options-detail-copy">Preferences are saved on this device.</p></>}
+                {settingsPage === 'notifications' && <>
+                  <span className="explore-eyebrow">YOUR ALERTS</span><h2>Notification preferences</h2>
+                  {CATEGORY_DATA.map(({ id, label }) => (
+                    <label key={id} className="preference-toggle">
+                      <span>{label} events</span>
+                      <input
+                        type="checkbox"
+                        checked={categoryPreferences[id] !== false}
+                        disabled={categoryPreferencesSaving}
+                        onChange={(event) => {
+                          const next = { ...categoryPreferences, [id]: event.target.checked }
+                          setCategoryPreferencesDraft(next)
+                          void saveCategoryPreferences(next)
+                        }}
+                      />
+                    </label>
+                  ))}
+                  <p className="options-detail-copy">Choose which event categories can send you new-event alerts. RSVP and event reminders are managed separately.</p>
+                  <button type="button" className="profile-edit-pill" onClick={() => setCategoryPreferencesOpen(true)}>Review interests</button>
+                  <div className="notification-local-preferences">
+                    { [['reminders', 'Event reminders'], ['updates', 'Campus event updates']].map(([key, label]) => <label key={key} className="preference-toggle"><span>{label}</span><input type="checkbox" checked={notifications[key] !== false} onChange={(event) => setNotifications((current) => { const next = { ...current, [key]: event.target.checked }; safeSetStored('futapulse-notification-preferences', JSON.stringify(next)); return next })} /></label>)}
+                  </div>
+                  <p className="options-detail-copy">Reminder and display settings are saved on this device.</p>
+                </>}
                 {settingsPage === 'guidelines' && (
                   <>
                     <span className="explore-eyebrow">USING FUTAPULSE WELL</span><h2>Community Guidelines</h2>
@@ -2542,13 +2911,26 @@ function App() {
         <div className="modal-backdrop event-delete-backdrop" role="presentation" onMouseDown={(event) => { if (!eventDeleting && event.target === event.currentTarget) setEventDeleteTarget(null) }}>
           <section className="event-delete-modal glass-panel" role="dialog" aria-modal="true" aria-labelledby="delete-event-title">
             <span className="event-delete-icon"><Trash2 size={22} /></span>
-            <h2 id="delete-event-title">Delete this {eventDeleteTarget.status === 'Draft' ? 'draft' : 'event'}?</h2>
-            <p><strong>{eventDeleteTarget.title || 'Untitled draft'}</strong> will be removed from your account and the app. This cannot be undone.</p>
+            <h2 id="delete-event-title">{eventDeleteTarget.status === 'Draft' ? 'Delete this draft?' : 'Cancel this event?'}</h2>
+            <p><strong>{eventDeleteTarget.title || 'Untitled draft'}</strong>{eventDeleteTarget.status === 'Draft' ? ' will be permanently deleted.' : ' will be marked as cancelled, attendees will be notified, and a temporary cancellation notice will remain visible.'}</p>
             <div className="event-delete-actions">
               <button type="button" className="profile-edit-pill" onClick={() => setEventDeleteTarget(null)} disabled={eventDeleting}>Keep it</button>
-              <button type="button" className="delete-account-submit" onClick={() => { void deleteOwnedEvent(eventDeleteTarget) }} disabled={eventDeleting}>{eventDeleting ? 'Deleting…' : 'Delete permanently'}</button>
+              <button type="button" className="delete-account-submit" onClick={() => { void deleteOwnedEvent(eventDeleteTarget) }} disabled={eventDeleting}>{eventDeleting ? 'Saving…' : eventDeleteTarget.status === 'Draft' ? 'Delete permanently' : 'Confirm cancellation'}</button>
             </div>
           </section>
+        </div>
+      )}
+
+      {organizerBroadcastTarget && (
+        <div className="modal-backdrop organizer-broadcast-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !organizerBroadcastSending) setOrganizerBroadcastTarget(null) }}>
+          <form className="organizer-broadcast-modal glass-panel" role="dialog" aria-modal="true" aria-labelledby="organizer-broadcast-title" onSubmit={sendOrganizerBroadcast}>
+            <span className="explore-eyebrow">DAY-OF EVENT UPDATE</span>
+            <h2 id="organizer-broadcast-title">Broadcast to your event audience</h2>
+            <p>{organizerBroadcastTarget.title} · sent to attendees and users following this category.</p>
+            <label htmlFor="organizer-broadcast-message">Announcement</label>
+            <textarea id="organizer-broadcast-message" rows={4} maxLength={240} value={organizerBroadcastText} onChange={(event) => setOrganizerBroadcastText(event.target.value)} placeholder="Example: Doors are open!" required />
+            <div className="organizer-broadcast-footer"><span>{organizerBroadcastText.length}/240 · one broadcast per minute</span><div><button type="button" className="profile-edit-pill" onClick={() => setOrganizerBroadcastTarget(null)} disabled={organizerBroadcastSending}>Cancel</button><button type="submit" className="setup-submit" disabled={organizerBroadcastSending || !organizerBroadcastText.trim()}>{organizerBroadcastSending ? 'Sending…' : 'Send update'} <span>→</span></button></div></div>
+          </form>
         </div>
       )}
 
@@ -2597,7 +2979,7 @@ function App() {
           </section>
         </div>
       )}
-      {toast && <Toast toast={toast} />}
+      {toast && <Toast toast={toast} onAction={toast.notification ? () => focusNotificationEvent(toast.notification) : undefined} />}
     </div>
   )
 }
@@ -2617,6 +2999,69 @@ function CommunityGuidelines() {
   )
 }
 
+function LegalPage({ page }) {
+  const title = page === 'privacy' ? 'Privacy Policy' : page === 'terms' ? 'Terms of Service' : 'About FUTApulse'
+  return (
+    <div className="legal-page-shell">
+      <main className="legal-page-panel">
+        <a className="legal-page-brand" href="/">FUTApulse <span>♥</span></a>
+        <span className="explore-eyebrow">FUTA CAMPUS EVENTS</span>
+        <h1>{title}</h1>
+        {page === 'privacy' && (
+          <>
+            <p className="legal-updated">Last updated: October 21, 2026</p>
+            <p>FUTApulse helps students discover campus events, publish event information, and plan to attend. This policy explains what information the service uses and how to request its deletion.</p>
+            <h2>Information we use</h2>
+            <p>We use account details such as your email address, username, and the profile information you choose to provide (including name, faculty, department, and level). We also process events you publish, attendance and reminder actions, category notification preferences, reports you submit, and push-device subscription data when you enable notifications.</p>
+            <h2>Google sign-in</h2>
+            <p>If you choose Google sign-in, FUTApulse uses Google OAuth to verify your identity and receive basic account information such as your email address and profile name. The sign-in flow requests the OpenID, email, and profile scopes. FUTApulse does not request access to read your Gmail inbox.</p>
+            <h2>Notifications and device data</h2>
+            <p>If you enable browser or Android push notifications, the relevant push service provides a device token or subscription endpoint so FUTApulse can deliver event alerts and reminders. You can disable notifications through your device or browser settings; removing your FUTApulse account also removes its registered push devices and pending notifications.</p>
+            <h2>Advertising and cookies</h2>
+            <p>Advertising is not currently enabled in this app; sponsor placements use FUTApulse house content. If third-party advertising such as Google AdSense or AdMob is enabled later, those vendors may use cookies, mobile advertising identifiers, or similar technologies to measure ads and, where permitted by your settings and applicable law, personalize them. Their processing is governed by their own privacy policies. This policy will be updated before third-party ads are activated.</p>
+            <h2>How long information is kept and account deletion</h2>
+            <p>Account information is kept while the account is active. You can request account deletion from Account &amp; Security Settings. When deletion completes, the active service removes the account, its profile, events it owns, engagement records, registered push devices, and pending notification jobs. Limited backup copies may remain until they are removed under the database provider’s configured backup-retention cycle; the applicable cycle should be confirmed with the service operator. Information required to address abuse, security, or legal obligations may be retained only where permitted or required.</p>
+            <h2>Sharing and service providers</h2>
+            <p>FUTApulse uses infrastructure and delivery providers to host the service, store data and event images, send verification email, process Google sign-in, and deliver push notifications. Information is shared with those providers only as needed to operate the feature. FUTApulse does not sell student profile data.</p>
+            <h2>Your choices and contact</h2>
+            <p>You may update profile details, notification preferences, or request account deletion in the app. For privacy or support questions, contact <a href="mailto:futapulse.ng@gmail.com">futapulse.ng@gmail.com</a>.</p>
+          </>
+        )}
+        {page === 'terms' && (
+          <>
+            <p className="legal-updated">Last updated: October 21, 2026</p>
+            <p>By using FUTApulse, you agree to use it responsibly to discover and share relevant campus events.</p>
+            <h2>Accounts and event information</h2>
+            <p>Keep your account information accurate and protect your sign-in credentials. Organizers are responsible for the accuracy and safety of event titles, schedules, venues, audience details, and updates they publish.</p>
+            <h2>Community safety</h2>
+            <p>Do not publish misleading, unlawful, discriminatory, harmful, harassing, unrelated, or repeated event content. Do not misuse reporting or attempt to disrupt the service. FUTApulse may review reported content, cancel an event, or temporarily restrict an account’s ability to post when needed to protect the community.</p>
+            <h2>Availability and changes</h2>
+            <p>FUTApulse is provided as a developing campus service. Features, notifications, and availability may change; push delivery can also depend on network, operating-system, and provider settings. Do not rely on the service as an emergency alert system.</p>
+            <h2>Account deletion and contact</h2>
+            <p>You can request account deletion in Account &amp; Security Settings. Questions about these terms can be sent to <a href="mailto:futapulse.ng@gmail.com">futapulse.ng@gmail.com</a>.</p>
+          </>
+        )}
+        {page === 'about' && (
+          <>
+            <p>FUTApulse is a campus event discovery and planning app built for the Federal University of Technology, Akure community.</p>
+            <h2>What you can do</h2>
+            <p>Explore campus events, publish event details, RSVP, set reminders, and receive updates based on your preferences.</p>
+            <h2>Support</h2>
+            <p>For account help, privacy requests, accessibility feedback, or to report a service issue, email <a href="mailto:futapulse.ng@gmail.com">futapulse.ng@gmail.com</a>.</p>
+            <p>For event-specific concerns, use the report action on the event card so the report is attached to the relevant listing.</p>
+          </>
+        )}
+        <div className="legal-page-actions">
+          <a href="/">Back to FUTApulse</a>
+          {page !== 'privacy' && <a href="/privacy">Privacy</a>}
+          {page !== 'terms' && <a href="/terms">Terms</a>}
+          {page !== 'about' && <a href="/about">About</a>}
+        </div>
+      </main>
+    </div>
+  )
+}
+
 function AccountPasswordInput({ name, label, minLength = 6, autoComplete = 'current-password' }) {
   const [visible, setVisible] = useState(false)
   return (
@@ -2632,9 +3077,9 @@ function AccountPasswordInput({ name, label, minLength = 6, autoComplete = 'curr
   )
 }
 
-function Toast({ toast }) {
+function Toast({ toast, onAction }) {
   const Icon = toast.type === 'success' ? Check : toast.type === 'error' ? X : Sparkles
-  return <div className={`futa-toast toast-${toast.type}`} role={toast.type === 'error' ? 'alert' : 'status'}><Icon size={17} /><span>{toast.message}</span></div>
+  return <div className={`futa-toast toast-${toast.type}`} role={toast.type === 'error' ? 'alert' : 'status'}><Icon size={17} /><span>{toast.message}</span>{onAction && <button type="button" onClick={onAction}>View event</button>}</div>
 }
 
 export default App
