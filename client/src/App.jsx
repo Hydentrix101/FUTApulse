@@ -8,7 +8,7 @@ import CountdownPill from './components/CountdownPill'
 import AdSlot from './components/AdSlot'
 import LaunchAdGate from './components/LaunchAdGate'
 import BrandHeart from './components/BrandHeart'
-import { API_BASE_URL } from './config/api'
+import { API_BASE_URL, SOCKET_BASE_URL } from './config/api'
 import { io } from 'socket.io-client'
 
 const EventCard = lazy(() => import('./components/EventCard'))
@@ -69,6 +69,19 @@ function decodeVapidKey(value) {
   const padded = normalized.padEnd(normalized.length + ((4 - normalized.length % 4) % 4), '=')
   const decoded = window.atob(padded)
   return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
+}
+
+function requestBrowserNotificationPermission() {
+  if (!('Notification' in window)) return Promise.resolve({ permission: 'unsupported' })
+  if (Notification.permission !== 'default') return Promise.resolve({ permission: Notification.permission })
+  try {
+    return Notification.requestPermission().then(
+      (permission) => ({ permission }),
+      (error) => ({ error }),
+    )
+  } catch (error) {
+    return Promise.resolve({ error })
+  }
 }
 
 function readInitialEventCache() {
@@ -413,6 +426,8 @@ function FutaPulseApp() {
   const [activeTab, setActiveTab] = useState(() => new URLSearchParams(window.location.search).has('event')
     ? 'home'
     : window.location.hash.replace('#', '') || 'home')
+  const tabHistoryRef = useRef([])
+  const lastTrackedTabRef = useRef(activeTab)
   const [events, setEvents] = useState([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
@@ -613,7 +628,7 @@ function FutaPulseApp() {
 
   useEffect(() => {
     if (!session?.token || !user?.id) return undefined
-    const socket = io(API_BASE_URL, {
+    const socket = io(SOCKET_BASE_URL, {
       auth: { token: session.token },
       transports: ['websocket', 'polling'],
       reconnection: true,
@@ -973,7 +988,7 @@ function FutaPulseApp() {
 
   useEffect(() => {
     if (window.location.hash !== `#${activeTab}`) {
-      window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}#${activeTab}`)
+      window.history.replaceState(window.history.state || {}, '', `${window.location.pathname}${window.location.search}#${activeTab}`)
     }
   }, [activeTab])
 
@@ -1470,6 +1485,147 @@ function FutaPulseApp() {
     if (id === 'profile' && !profile) setProfileOpen(true)
   }
 
+  const handleAppBack = useCallback(() => {
+    if (eventEditor) {
+      setEventEditor(null)
+      setEventDuplicateState({ code: '', matches: [] })
+      return
+    }
+    if (organizerBroadcastTarget && !organizerBroadcastSending) {
+      setOrganizerBroadcastTarget(null)
+      return
+    }
+    if (eventDeleteTarget && !eventDeleting) {
+      setEventDeleteTarget(null)
+      return
+    }
+    if (recapUploadTarget && !recapUploading) {
+      setRecapUploadTarget(null)
+      setRecapPhotoFiles([])
+      return
+    }
+    if (reportTarget) {
+      setReportTarget(null)
+      return
+    }
+    if (reminderTarget) {
+      setReminderTarget(null)
+      return
+    }
+    if (detailEvent) {
+      closeEventDetail()
+      return
+    }
+    if (avatarPhotoSource) {
+      setAvatarPhotoSource('')
+      return
+    }
+    if (facultyLogoOpen) {
+      setFacultyLogoOpen(false)
+      return
+    }
+    if (profileMenuOpen) {
+      if (securityAction) {
+        setSecurityAction('')
+        setEmailChangePending(false)
+        setPendingNewEmail('')
+      } else if (settingsPage !== 'menu') {
+        setSettingsPage('menu')
+      } else {
+        setProfileMenuOpen(false)
+      }
+      return
+    }
+    if (categoryPreferencesOpen && profile?.notificationPreferencesOnboardingComplete) {
+      setCategoryPreferencesOpen(false)
+      return
+    }
+    if (profileOpen && profile) {
+      setProfileOpen(false)
+      return
+    }
+
+    const previousTab = tabHistoryRef.current.pop()
+    if (previousTab && previousTab !== activeTab) {
+      lastTrackedTabRef.current = previousTab
+      setActiveTab(previousTab)
+      return
+    }
+    if (activeTab !== 'home') {
+      lastTrackedTabRef.current = 'home'
+      setActiveTab('home')
+      return
+    }
+    notify("You're already on the home screen.", 'info')
+  }, [
+    activeTab,
+    avatarPhotoSource,
+    categoryPreferencesOpen,
+    closeEventDetail,
+    detailEvent,
+    eventDeleteTarget,
+    eventDeleting,
+    eventEditor,
+    facultyLogoOpen,
+    notify,
+    organizerBroadcastSending,
+    organizerBroadcastTarget,
+    profile,
+    profileMenuOpen,
+    profileOpen,
+    recapUploading,
+    recapUploadTarget,
+    reminderTarget,
+    reportTarget,
+    securityAction,
+    settingsPage,
+    setActiveTab,
+    setAvatarPhotoSource,
+    setCategoryPreferencesOpen,
+    setEmailChangePending,
+    setEventDeleteTarget,
+    setEventDuplicateState,
+    setEventEditor,
+    setFacultyLogoOpen,
+    setOrganizerBroadcastTarget,
+    setPendingNewEmail,
+    setProfileMenuOpen,
+    setProfileOpen,
+    setRecapPhotoFiles,
+    setRecapUploadTarget,
+    setReminderTarget,
+    setReportTarget,
+    setSecurityAction,
+    setSettingsPage,
+  ])
+
+  useEffect(() => {
+    const guardStateKey = '__futapulseBackGuard'
+    if (!window.history.state?.[guardStateKey]) {
+      window.history.pushState(
+        { ...(window.history.state || {}), [guardStateKey]: true },
+        '',
+        window.location.href,
+      )
+    }
+
+    const onPopState = (event) => {
+      if (event.state?.[guardStateKey]) return
+      handleAppBack()
+      window.history.forward()
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [handleAppBack])
+
+  useEffect(() => {
+    if (lastTrackedTabRef.current !== activeTab) {
+      tabHistoryRef.current.push(lastTrackedTabRef.current)
+      if (tabHistoryRef.current.length > 20) tabHistoryRef.current.shift()
+      lastTrackedTabRef.current = activeTab
+    }
+  }, [activeTab])
+
   const saveProfile = async (nextProfile) => {
     if (!session?.token) throw new Error('Sign in again before saving your profile.')
     setProfileSaving(true)
@@ -1500,7 +1656,7 @@ function FutaPulseApp() {
     }
   }
 
-  const saveCategoryPreferences = async (nextPreferences = categoryPreferences, requestPermission = false) => {
+  const saveCategoryPreferences = async (nextPreferences = categoryPreferences, permissionRequest = null) => {
     if (!session?.token || categoryPreferencesSaving) return false
     setCategoryPreferencesSaving(true)
     try {
@@ -1520,7 +1676,7 @@ function FutaPulseApp() {
       setSession((current) => current ? { ...current, user: updatedUser } : current)
       setCategoryPreferencesOpen(false)
       notify('Your event interests have been saved.', 'success')
-      if (requestPermission) await enablePushNotifications()
+      if (permissionRequest) await enablePushNotifications(permissionRequest)
       return true
     } catch (error) {
       notify(error.message || 'Unable to save your event interests. Please try again.', 'error')
@@ -1530,22 +1686,32 @@ function FutaPulseApp() {
     }
   }
 
-  const enablePushNotifications = async () => {
+  const enablePushNotifications = async (permissionRequest = null) => {
     if (!session?.token) {
       notify('Sign in before enabling notifications.', 'error')
       return
     }
     setNotificationDeliveryError('')
     try {
-      const config = await apiRequest('/api/notifications/config')
       if (!('Notification' in window) || !('serviceWorker' in navigator)) {
         throw new Error('This browser does not support web push notifications.')
       }
+      const permissionResult = permissionRequest
+        ? await permissionRequest
+        : await requestBrowserNotificationPermission()
+      if (permissionResult.error) throw permissionResult.error
+      const permission = permissionResult.permission
+      if (permission !== 'granted') {
+        throw new Error(permission === 'denied'
+          ? 'Notifications are blocked for this site. Allow them in your browser or device settings, then try again.'
+          : 'Notification permission was not granted in this browser.')
+      }
+      setNotificationDeliveryPermission(permission)
+
+      const config = await apiRequest('/api/notifications/config')
       if (!config.webPushConfigured || !config.webPushPublicKey) {
         throw new Error('Web Push is not configured on the FUTApulse server yet.')
       }
-      const permission = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission
-      if (permission !== 'granted') throw new Error('Notification permission was not granted in this browser.')
       const registration = await navigator.serviceWorker.ready
       let subscription = await registration.pushManager.getSubscription()
       if (!subscription) {
@@ -1667,7 +1833,17 @@ function FutaPulseApp() {
       }, session.token)
       setOrganizerBroadcastTarget(null)
       setOrganizerBroadcastText('')
-      notify(`Announcement queued for ${result.recipientCount} eligible users.`, 'success')
+      const recipientCount = Number(result.recipientCount) || 0
+      const pushReadyDeviceCount = Number(result.pushReadyDeviceCount) || 0
+      if (recipientCount === 0) {
+        notify('No eligible recipients found. Broadcasts go to event attendees and users following this category.', 'info')
+      } else if (!result.pushConfigured) {
+        notify(`Broadcast queued for ${recipientCount} eligible users, but server background push is not configured.`, 'info')
+      } else if (pushReadyDeviceCount === 0) {
+        notify(`Broadcast queued for ${recipientCount} eligible users, but no devices are registered for background push. Recipients need to enable alerts on their devices.`, 'info')
+      } else {
+        notify(`Broadcast queued for ${recipientCount} eligible users across ${pushReadyDeviceCount} push-enabled devices.`, 'success')
+      }
     } catch (error) {
       notify(error.message || 'Unable to send the event announcement.', 'error')
     } finally {
@@ -2840,7 +3016,10 @@ function FutaPulseApp() {
               <button type="button" className="setup-submit" disabled={categoryPreferencesSaving} onClick={() => { void saveCategoryPreferences(categoryPreferences) }}>
                 {categoryPreferencesSaving ? 'Saving…' : 'Save interests'} <span>→</span>
               </button>
-              <button type="button" className="category-enable-notifications" disabled={categoryPreferencesSaving} onClick={() => { void saveCategoryPreferences(categoryPreferences, true) }}>Enable notifications</button>
+              <button type="button" className="category-enable-notifications" disabled={categoryPreferencesSaving} onClick={() => {
+                const permissionRequest = requestBrowserNotificationPermission()
+                void saveCategoryPreferences(categoryPreferences, permissionRequest)
+              }}>Save &amp; enable device alerts</button>
             </div>
             <small className="category-preferences-note">Your phone or browser will ask for permission only when you choose Enable notifications.</small>
           </section>

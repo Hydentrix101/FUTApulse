@@ -74,9 +74,9 @@ export default function PwaExperience() {
 
   function getInstallInstructions() {
     if (isAppleMobileDevice()) return 'In Safari, tap Share, then choose “Add to Home Screen”.'
-    if (/Android/i.test(navigator.userAgent)) return 'Open your browser menu (⋮), then choose “Install app” or “Add to Home screen”.'
-    if (/Edg|Chrome/i.test(navigator.userAgent)) return 'Use the install icon in the address bar or choose “Install FUTApulse” from your browser menu.'
-    return 'Open your browser menu and choose “Install app” or “Add to Home Screen” if available.'
+    if (/Android/i.test(navigator.userAgent)) return 'This browser has not offered its install prompt yet. Open FUTApulse in Chrome, refresh the page, then tap Install again. If Chrome offers Add to Home screen instead, choose that.'
+    if (/Edg|Chrome/i.test(navigator.userAgent)) return 'This browser has not offered its install prompt yet. Refresh FUTApulse and tap Install again, or use the browser’s install icon if available.'
+    return 'Open FUTApulse in a supported browser and tap Install again. Some browsers only offer Add to Home Screen from their Share or browser menu.'
   }
 
   async function applyUpdate() {
@@ -95,9 +95,9 @@ export default function PwaExperience() {
           <div className="pwa-prompt-icon"><Download size={19} aria-hidden="true" /></div>
           <div className="pwa-prompt-copy">
             <strong>Take FUTApulse with you</strong>
-            <span>{manualInstallAvailable ? 'Add FUTApulse to your device for a faster, app-like experience.' : 'Install FUTApulse for a fast, app-like campus experience.'}</span>
+            <span>{manualInstallAvailable ? 'Install FUTApulse on your device for a faster, app-like experience.' : 'Add FUTApulse to your device for a fast, app-like campus experience.'}</span>
           </div>
-          <button className="pwa-action-button" type="button" onClick={installApp}>{manualInstallAvailable ? 'How to install' : 'Install'}</button>
+          <button className="pwa-action-button" type="button" onClick={installApp}>Install</button>
           <button className="pwa-dismiss-button" type="button" aria-label="Dismiss install prompt" onClick={() => setInstallDismissed(true)}><X size={17} /></button>
         </section>
       )}
