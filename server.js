@@ -2986,6 +2986,9 @@ app.post("/api/events/:eventId/announcements", async (request, response) => {
     }, { $set: { lastAnnouncementAt: now } }, { new: true }).exec();
     if (!claimedEvent) return response.status(429).json({ error: "Please wait one minute between announcements for this event." });
     const recipients = await getEventNotificationAudience(event, true);
+    const pushReadyDeviceCount = recipients.length
+      ? await PushDevice.countDocuments({ userId: { $in: recipients }, platform: "web", enabled: true }).exec()
+      : 0;
     await enqueueNotifications(recipients, {
       idempotencyKey: `organizer-announcement:${event.id}:${now.toISOString()}`,
       event,
@@ -2993,7 +2996,12 @@ app.post("/api/events/:eventId/announcements", async (request, response) => {
       title: `Update: ${event.title}`,
       message
     });
-    return response.status(202).json({ queued: true, recipientCount: recipients.length });
+    return response.status(202).json({
+      queued: true,
+      recipientCount: recipients.length,
+      pushReadyDeviceCount,
+      pushConfigured: Boolean(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY)
+    });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
     console.error("Organizer event announcement failed.", error);
