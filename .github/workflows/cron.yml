@@ -11,5 +11,5 @@ jobs:
     steps:
       - name: Hit Backend Notification Worker
         run: |
-          curl -X POST https://futapulse.onrender.com/api/notifications/process-due \
+          curl -s -X GET https://futapulse.onrender.com/api/ready \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET_KEY }}"
