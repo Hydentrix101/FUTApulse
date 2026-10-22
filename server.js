@@ -10,7 +10,6 @@ const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
 const { Server: SocketServer } = require("socket.io");
 const webPush = require("web-push");
-const firebaseAdmin = require("firebase-admin");
 const cloudinary = require("cloudinary").v2;
 const multer = require("multer");
 
@@ -289,10 +288,16 @@ function toPublicEvent(event, viewerId = "") {
     attendeeUserIds = [],
     hypedUserIds = [],
     reminderUserIds = [],
+    viewCount,
+    recapPromptDismissed,
     ...publicEvent
   } = event;
   const endAt = new Date(event.endTime || "");
   publicEvent.isEnded = Number.isFinite(endAt.getTime()) && endAt.getTime() <= Date.now();
+  if (viewerId && String(event.createdByUserId || "") === String(viewerId)) {
+    if (Number.isFinite(Number(viewCount))) publicEvent.viewCount = Number(viewCount);
+    if (typeof recapPromptDismissed === "boolean") publicEvent.recapPromptDismissed = recapPromptDismissed;
+  }
   if (viewerId) {
     publicEvent.isGoing = Array.isArray(attendeeUserIds) && attendeeUserIds.includes(String(viewerId));
     publicEvent.isHyped = Array.isArray(hypedUserIds) && hypedUserIds.includes(String(viewerId));
@@ -362,10 +367,26 @@ engagementActionSchema.index({ eventId: 1, userId: 1, type: 1 }, { unique: true 
 engagementActionSchema.index({ userId: 1, type: 1, updatedAt: -1 });
 const EngagementAction = mongoose.models.FutapulseEngagementAction
   || mongoose.model("FutapulseEngagementAction", engagementActionSchema, "engagement_actions");
+const eventViewSchema = new mongoose.Schema({
+  eventId: { type: String, required: true },
+  userId: { type: String, required: true }
+}, { timestamps: true });
+eventViewSchema.index({ eventId: 1, userId: 1 }, { unique: true });
+eventViewSchema.index({ eventId: 1, createdAt: -1 });
+const EventView = mongoose.models.FutapulseEventView
+  || mongoose.model("FutapulseEventView", eventViewSchema, "event_views");
+const recapPromptDismissalSchema = new mongoose.Schema({
+  eventId: { type: String, required: true },
+  userId: { type: String, required: true },
+  dismissedAt: { type: Date, required: true }
+}, { timestamps: true });
+recapPromptDismissalSchema.index({ eventId: 1, userId: 1 }, { unique: true });
+const RecapPromptDismissal = mongoose.models.FutapulseRecapPromptDismissal
+  || mongoose.model("FutapulseRecapPromptDismissal", recapPromptDismissalSchema, "recap_prompt_dismissals");
 const pushDeviceSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
   deviceKey: { type: String, required: true, unique: true },
-  platform: { type: String, enum: ["web", "android"], required: true },
+  platform: { type: String, enum: ["web"], required: true },
   endpoint: { type: String, required: true },
   subscription: { type: mongoose.Schema.Types.Mixed, required: true },
   enabled: { type: Boolean, default: true, index: true }
@@ -394,7 +415,6 @@ const NotificationJob = mongoose.models.FutapulseNotificationJob
   || mongoose.model("FutapulseNotificationJob", notificationJobSchema, "notification_jobs");
 let realtimeServer = null;
 let notificationWorkerTimer = null;
-let firebaseMessaging = null;
 
 function notificationEventLink(event) {
   const link = new URL(FRONTEND_URL);
@@ -483,6 +503,86 @@ async function enqueueCategoryAlert(event, kind = "new-event") {
   });
 }
 
+async function scheduleEventEndedRecapPrompt(event) {
+  if (!isMongoConnected() || !event?.id) return;
+  const eventId = String(event.id);
+  if (!event.createdByUserId || !["Published", "Live"].includes(event.status)) {
+    await cancelEventEndedRecapPrompts(eventId);
+    return;
+  }
+  const endTime = new Date(event.endTime || "");
+  if (!Number.isFinite(endTime.getTime()) || Date.now() - endTime.getTime() > 7 * 24 * 60 * 60_000) {
+    await cancelEventEndedRecapPrompts(eventId);
+    return;
+  }
+  const recipientUserId = String(event.createdByUserId);
+  const idempotencyKey = `event-ended-recap:${eventId}:${endTime.toISOString()}`;
+  const existing = await NotificationJob.findOne({ idempotencyKey }).exec();
+  if (existing?.status === "sent") return;
+
+  const dueAt = endTime.getTime() > Date.now() ? endTime : new Date();
+  const payload = {
+    notificationId: idempotencyKey,
+    kind: "event-ended-recap-prompt",
+    title: "Your event has ended",
+    message: `${String(event.title || "Your event").slice(0, 100)} has ended. Upload look-back photos to share the recap.`,
+    eventId,
+    eventTitle: String(event.title || ""),
+    category: String(event.category || ""),
+    venue: String(event.venue || ""),
+    url: notificationEventLink(event),
+    universal: false
+  };
+
+  await NotificationJob.updateMany({
+    eventId,
+    kind: "event-ended-recap-prompt",
+    idempotencyKey: { $ne: idempotencyKey },
+    status: { $in: ["pending", "processing"] }
+  }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
+
+  if (existing) {
+    existing.payload = payload;
+    existing.dueAt = dueAt;
+    existing.expiresAt = new Date(Math.max(Date.now(), dueAt.getTime()) + (8 * 24 * 60 * 60_000));
+    existing.nextAttemptAt = dueAt;
+    existing.status = "pending";
+    existing.attempts = 0;
+    existing.leaseUntil = null;
+    existing.lastError = "";
+    await existing.save();
+    return;
+  }
+  await enqueueNotification({
+    idempotencyKey,
+    recipientUserId,
+    event,
+    kind: "event-ended-recap-prompt",
+    title: payload.title,
+    message: payload.message,
+    dueAt
+  });
+}
+
+async function cancelEventEndedRecapPrompts(eventId) {
+  if (!isMongoConnected()) {
+    const database = readDatabase();
+    database.notificationJobs = (database.notificationJobs || []).map((job) => (
+      String(job.eventId) === String(eventId) && job.kind === "event-ended-recap-prompt"
+        && ["pending", "processing"].includes(job.status)
+        ? { ...job, status: "cancelled", leaseUntil: null }
+        : job
+    ));
+    writeDatabase(database);
+    return;
+  }
+  await NotificationJob.updateMany({
+    eventId: String(eventId),
+    kind: "event-ended-recap-prompt",
+    status: { $in: ["pending", "processing"] }
+  }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
+}
+
 function initializePushProviders() {
   if (process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY) {
     webPush.setVapidDetails(
@@ -490,13 +590,6 @@ function initializePushProviders() {
       process.env.WEB_PUSH_PUBLIC_KEY,
       process.env.WEB_PUSH_PRIVATE_KEY
     );
-  }
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON && !firebaseMessaging) {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-    const firebaseApp = firebaseAdmin.apps[0] || firebaseAdmin.initializeApp({
-      credential: firebaseAdmin.credential.cert(serviceAccount)
-    });
-    firebaseMessaging = firebaseApp.messaging();
   }
 }
 
@@ -510,6 +603,11 @@ function configureCloudinary() {
     secure: true
   });
   return true;
+}
+
+function getMissingCloudinaryVariables() {
+  return ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
+    .filter((variable) => !process.env[variable]);
 }
 
 const recapImageUpload = multer({
@@ -544,7 +642,7 @@ function uploadRecapImage(buffer, eventId) {
 async function dispatchNotificationJob(job) {
   const payload = { ...job.payload, createdAt: new Date().toISOString() };
   if (realtimeServer) realtimeServer.to(`user:${job.recipientUserId}`).emit("home-notification", payload);
-  const devices = await PushDevice.find({ userId: job.recipientUserId, enabled: true }).lean().exec();
+  const devices = await PushDevice.find({ userId: job.recipientUserId, platform: "web", enabled: true }).lean().exec();
   const failures = [];
   await Promise.all(devices.map(async (device) => {
     try {
@@ -557,19 +655,9 @@ async function dispatchNotificationJob(job) {
           urgency: "high",
           topic: crypto.createHash("sha256").update(job.idempotencyKey).digest("base64url").slice(0, 32)
         });
-      } else if (device.platform === "android") {
-        if (!firebaseMessaging) throw new Error("Firebase Cloud Messaging is not configured.");
-        await firebaseMessaging.send({
-          token: device.endpoint,
-          notification: { title: payload.title, body: payload.message },
-          data: Object.fromEntries(Object.entries(payload).map(([key, value]) => [key, String(value)])),
-          android: { priority: "high", collapseKey: job.idempotencyKey.slice(0, 64) }
-        });
       }
     } catch (error) {
       if (device.platform === "web" && [404, 410].includes(error.statusCode)) {
-        await PushDevice.updateOne({ deviceKey: device.deviceKey }, { $set: { enabled: false } }).exec();
-      } else if (device.platform === "android" && ["messaging/registration-token-not-registered", "messaging/invalid-registration-token"].includes(error.code)) {
         await PushDevice.updateOne({ deviceKey: device.deviceKey }, { $set: { enabled: false } }).exec();
       } else {
         failures.push(error);
@@ -706,6 +794,60 @@ async function listStoredEvents(viewerId = "") {
   });
 }
 
+async function getEventViewCounts(eventIds) {
+  const ids = [...new Set((eventIds || []).map(String).filter(Boolean))];
+  if (!ids.length) return new Map();
+  if (!isMongoConnected()) {
+    const database = readDatabase();
+    const counts = new Map();
+    const requestedIds = new Set(ids);
+    for (const view of database.eventViews || []) {
+      if (requestedIds.has(String(view.eventId))) {
+        counts.set(String(view.eventId), (counts.get(String(view.eventId)) || 0) + 1);
+      }
+    }
+    return counts;
+  }
+  const grouped = await EventView.aggregate([
+    { $match: { eventId: { $in: ids } } },
+    { $group: { _id: "$eventId", count: { $sum: 1 } } }
+  ]).exec();
+  return new Map(grouped.map((item) => [String(item._id), Number(item.count) || 0]));
+}
+
+async function decorateOwnerEventViews(events, viewerId) {
+  if (!viewerId || !events.length) return events;
+  const ownedEvents = events.filter((event) => String(event.createdByUserId || "") === String(viewerId));
+  if (!ownedEvents.length) return events;
+  const counts = await getEventViewCounts(ownedEvents.map((event) => event.id));
+  return events.map((event) => String(event.createdByUserId || "") === String(viewerId)
+    ? { ...event, viewCount: counts.get(String(event.id)) || 0 }
+    : event);
+}
+
+async function decorateOwnerRecapDismissals(events, viewerId) {
+  if (!viewerId || !events.length) return events;
+  const ownedEvents = events.filter((event) => String(event.createdByUserId || "") === String(viewerId));
+  if (!ownedEvents.length) return events;
+  const eventIds = ownedEvents.map((event) => String(event.id));
+  let dismissedIds;
+  if (isMongoConnected()) {
+    const dismissals = await RecapPromptDismissal.find({
+      userId: String(viewerId),
+      eventId: { $in: eventIds }
+    }).select("eventId").lean().exec();
+    dismissedIds = new Set(dismissals.map((item) => String(item.eventId)));
+  } else {
+    const dismissals = readDatabase().recapPromptDismissals || [];
+    dismissedIds = new Set(dismissals
+      .filter((item) => String(item.userId) === String(viewerId) && eventIds.includes(String(item.eventId)))
+      .map((item) => String(item.eventId)));
+  }
+  return events.map((event) => String(event.createdByUserId || "") === String(viewerId)
+    ? { ...event, recapPromptDismissed: dismissedIds.has(String(event.id)) }
+    : event);
+}
+
 async function findStoredEvent(eventId) {
   if (!isMongoConnected()) return readDatabase().events.find((item) => String(item.id) === String(eventId)) || null;
   const record = await EventRecord.findOne({ eventId: String(eventId) }).lean().exec();
@@ -766,17 +908,27 @@ async function deleteStoredEvent(eventId) {
     const database = readDatabase();
     database.events = database.events.filter((item) => String(item.id) !== String(eventId));
     database.eventReports = (database.eventReports || []).filter((item) => String(item.eventId) !== String(eventId));
+    database.eventViews = (database.eventViews || []).filter((item) => String(item.eventId) !== String(eventId));
+    database.recapPromptDismissals = (database.recapPromptDismissals || []).filter((item) => String(item.eventId) !== String(eventId));
     database.engagementActionIds = (database.engagementActionIds || []).filter((actionKey) => {
       const separator = String(actionKey).indexOf(":");
       return separator < 0 || String(actionKey).slice(0, separator) !== String(eventId);
     });
     writeDatabase(database);
+    await cancelEventEndedRecapPrompts(eventId);
     return;
   }
   await Promise.all([
     EventRecord.deleteOne({ eventId: String(eventId) }).exec(),
     EventReport.deleteOne({ eventId: String(eventId) }).exec(),
-    EngagementAction.deleteMany({ eventId: String(eventId) }).exec()
+    EngagementAction.deleteMany({ eventId: String(eventId) }).exec(),
+    EventView.deleteMany({ eventId: String(eventId) }).exec(),
+    RecapPromptDismissal.deleteMany({ eventId: String(eventId) }).exec(),
+    cancelEventEndedRecapPrompts(eventId),
+    NotificationJob.updateMany({
+      eventId: String(eventId),
+      status: { $in: ["pending", "processing"] }
+    }, { $set: { status: "cancelled", leaseUntil: null } }).exec()
   ]);
 }
 
@@ -788,6 +940,8 @@ async function deleteStoredEventsForOwner(ownerUserId) {
     database.events = database.events.filter((event) => !ownedIds.has(String(event.id)));
     database.eventReports = (database.eventReports || []).filter((item) => !ownedIds.has(String(item.eventId)));
     database.notificationJobs = (database.notificationJobs || []).filter((item) => !ownedIds.has(String(item.eventId)));
+    database.eventViews = (database.eventViews || []).filter((item) => !ownedIds.has(String(item.eventId)) && String(item.userId) !== ownerId);
+    database.recapPromptDismissals = (database.recapPromptDismissals || []).filter((item) => !ownedIds.has(String(item.eventId)) && String(item.userId) !== ownerId);
     database.engagementActionIds = (database.engagementActionIds || []).filter((key) => {
       const separator = String(key).indexOf(":");
       return separator < 0 || !ownedIds.has(String(key).slice(0, separator));
@@ -801,6 +955,14 @@ async function deleteStoredEventsForOwner(ownerUserId) {
     eventIds.length ? EventRecord.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
     eventIds.length ? EventReport.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
     eventIds.length ? NotificationJob.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
+    EventView.deleteMany({ $or: [
+      { userId: ownerId },
+      ...(eventIds.length ? [{ eventId: { $in: eventIds } }] : [])
+    ] }).exec(),
+    RecapPromptDismissal.deleteMany({ $or: [
+      { userId: ownerId },
+      ...(eventIds.length ? [{ eventId: { $in: eventIds } }] : [])
+    ] }).exec(),
     EngagementAction.deleteMany({ $or: [
       { userId: ownerId },
       ...(eventIds.length ? [{ eventId: { $in: eventIds } }] : [])
@@ -1325,13 +1487,41 @@ app.get("/api/config/google", (request, response) => {
 });
 
 app.get("/api/notifications/config", (request, response) => {
+  const recapUploadMissingVariables = getMissingCloudinaryVariables();
   response.json({
     durableSchedulingAvailable: isMongoConnected(),
     webPushConfigured: Boolean(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY),
     webPushPublicKey: process.env.WEB_PUSH_PUBLIC_KEY || null,
-    androidPushConfigured: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON),
-    recapUploadConfigured: Boolean(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET)
+    recapUploadConfigured: recapUploadMissingVariables.length === 0,
+    recapUploadMissingVariables
   });
+});
+
+app.get("/api/notifications/status", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Authentication required." });
+    const requestedPlatform = String(request.query.platform || "");
+    if (requestedPlatform !== "web") {
+      return response.status(400).json({ error: "Notification platform must be web." });
+    }
+    const userId = String(user._id || user.id);
+    const pushConfigured = Boolean(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY);
+    const deviceRegistered = isMongoConnected()
+      ? Boolean(await PushDevice.exists({ userId, platform: requestedPlatform, enabled: true }))
+      : false;
+    return response.json({
+      durableSchedulingAvailable: isMongoConnected(),
+      pushConfigured,
+      deviceRegistered
+    });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Session is no longer valid." });
+    }
+    console.error("Notification delivery status could not be loaded.", error);
+    return response.status(500).json({ error: "Unable to check notification delivery status." });
+  }
 });
 
 app.post("/api/notifications/devices/web", async (request, response) => {
@@ -1364,28 +1554,6 @@ app.post("/api/notifications/devices/web", async (request, response) => {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
     console.error("Web push subscription registration failed.", error);
     return response.status(500).json({ error: "Unable to register this browser for notifications." });
-  }
-});
-
-app.post("/api/notifications/devices/android", async (request, response) => {
-  try {
-    const user = await getAuthenticatedUser(request);
-    if (!user) return response.status(401).json({ error: "Authentication required." });
-    const token = typeof request.body?.token === "string" ? request.body.token.trim() : "";
-    if (token.length < 20 || token.length > 4096) return response.status(400).json({ error: "A valid Android push token is required." });
-    if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) return response.status(503).json({ error: "Firebase Cloud Messaging is not configured on the FUTApulse server yet." });
-    const deviceKey = crypto.createHash("sha256").update(token).digest("hex");
-    await PushDevice.findOneAndUpdate(
-      { deviceKey, userId: String(user._id || user.id) },
-      { $set: { platform: "android", endpoint: token, subscription: { token }, enabled: true } },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    ).exec();
-    return response.status(201).json({ registered: true });
-  } catch (error) {
-    if (error.code === 11000) return response.status(409).json({ error: "That push token is already linked to another account." });
-    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
-    console.error("Android push token registration failed.", error);
-    return response.status(500).json({ error: "Unable to register this Android device for notifications." });
   }
 });
 
@@ -2227,19 +2395,27 @@ app.get("/api/events", async (request, response) => {
       const isOwnerDraft = Boolean(user && event.status === "Draft" && String(event.createdByUserId || "") === String(user._id || user.id));
       const endedAt = new Date(event.endTime || "").getTime();
       const isOwnerRecentEndedEvent = Boolean(user
+        && event.status !== "Cancelled"
         && String(event.createdByUserId || "") === String(user._id || user.id)
         && Number.isFinite(endedAt)
         && endedAt <= Date.now()
         && Date.now() - endedAt <= 7 * 24 * 60 * 60_000);
-      const isActiveCancellation = event.status === "Cancelled" && new Date(event.cancellationExpiresAt || 0).getTime() > Date.now();
+      const cancelledAt = new Date(event.cancelledAt || "").getTime();
+      const isOwnerRecentCancellation = Boolean(user
+        && event.status === "Cancelled"
+        && String(event.createdByUserId || "") === String(user._id || user.id)
+        && Number.isFinite(cancelledAt)
+        && Date.now() - cancelledAt <= 7 * 24 * 60 * 60_000);
       return isOwnerDraft
         || isOwnerRecentEndedEvent
-        || isActiveCancellation
+        || isOwnerRecentCancellation
         || (["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event));
     });
     if (level) events = events.filter((event) => !event.audience || event.audience.includes("all") || event.audience.includes(level));
     if (category && category !== "all") events = events.filter((event) => event.category === category);
     events = await decorateEventsWithCurrentOrganizers(events, database);
+    events = await decorateOwnerEventViews(events, viewerId);
+    events = await decorateOwnerRecapDismissals(events, viewerId);
     return response.json({ events: events.map((event) => toPublicEvent(event, viewerId)) });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
@@ -2247,6 +2423,84 @@ app.get("/api/events", async (request, response) => {
     }
     console.error("Event list request failed.", error);
     return response.status(500).json({ error: "Unable to load campus events." });
+  }
+});
+
+app.post("/api/events/:eventId/views", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in to record an event view." });
+    const event = await findStoredEvent(request.params.eventId);
+    if (!event || !["Published", "Live"].includes(event.status) || !isWithinEventDisplayWindow(event)) {
+      return response.status(404).json({ error: "This event is no longer available." });
+    }
+    const userId = String(user._id || user.id);
+    if (String(event.createdByUserId || "") === userId) return response.json({ recorded: false });
+
+    if (!isMongoConnected()) {
+      const database = readDatabase();
+      const eventViews = database.eventViews || [];
+      const exists = eventViews.some((view) => String(view.eventId) === String(event.id) && String(view.userId) === userId);
+      if (!exists) {
+        eventViews.push({ eventId: String(event.id), userId, createdAt: new Date().toISOString() });
+        database.eventViews = eventViews;
+        writeDatabase(database);
+      }
+      return response.json({ recorded: !exists });
+    }
+    try {
+      await EventView.create({ eventId: String(event.id), userId });
+      return response.status(201).json({ recorded: true });
+    } catch (error) {
+      if (error.code === 11000) return response.json({ recorded: false });
+      throw error;
+    }
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Session is no longer valid." });
+    }
+    console.error("Event view could not be recorded.", error);
+    return response.status(500).json({ error: "Unable to record this event view." });
+  }
+});
+
+app.post("/api/events/:eventId/recap-prompt-dismissal", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in before dismissing this recap prompt." });
+    const event = await findStoredEvent(request.params.eventId);
+    const userId = String(user._id || user.id);
+    if (!event || String(event.createdByUserId || "") !== userId) {
+      return response.status(404).json({ error: "This event is not available in your organizer profile." });
+    }
+    const endedAt = new Date(event.endTime || "").getTime();
+    if (!Number.isFinite(endedAt) || endedAt > Date.now() || Date.now() - endedAt > 7 * 24 * 60 * 60_000) {
+      return response.status(409).json({ error: "The recap prompt can only be dismissed during the seven days after an event ends." });
+    }
+    const dismissedAt = new Date();
+    if (!isMongoConnected()) {
+      const database = readDatabase();
+      const dismissals = database.recapPromptDismissals || [];
+      const existingIndex = dismissals.findIndex((item) => String(item.eventId) === String(event.id) && String(item.userId) === userId);
+      const dismissal = { eventId: String(event.id), userId, dismissedAt: dismissedAt.toISOString() };
+      if (existingIndex < 0) dismissals.push(dismissal);
+      else dismissals[existingIndex] = dismissal;
+      database.recapPromptDismissals = dismissals;
+      writeDatabase(database);
+    } else {
+      await RecapPromptDismissal.updateOne(
+        { eventId: String(event.id), userId },
+        { $set: { dismissedAt } },
+        { upsert: true }
+      ).exec();
+    }
+    return response.json({ dismissed: true });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Session is no longer valid." });
+    }
+    console.error("Recap prompt dismissal could not be saved.", error);
+    return response.status(500).json({ error: "Unable to dismiss this recap prompt." });
   }
 });
 
@@ -2259,14 +2513,20 @@ app.get("/api/events/engagement", async (request, response) => {
     if (authorization.startsWith("Bearer ") && !user) return response.status(401).json({ error: "Session is no longer valid." });
     const viewerId = user ? String(user._id || user.id) : "";
     const events = await listStoredEvents(viewerId);
-    const updates = events
+    const eligibleEvents = events
       .filter((event) => (["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event))
-        || (event.status === "Cancelled" && new Date(event.cancellationExpiresAt || 0).getTime() > Date.now())
         || (viewerId && String(event.createdByUserId || "") === viewerId
-          && Number.isFinite(new Date(event.endTime || "").getTime())
-          && new Date(event.endTime).getTime() <= Date.now()
-          && Date.now() - new Date(event.endTime).getTime() <= 7 * 24 * 60 * 60_000))
-      .map((event) => {
+          && (event.status === "Cancelled"
+            ? Number.isFinite(new Date(event.cancelledAt || "").getTime())
+              && Date.now() - new Date(event.cancelledAt).getTime() <= 7 * 24 * 60 * 60_000
+            : Number.isFinite(new Date(event.endTime || "").getTime())
+              && new Date(event.endTime).getTime() <= Date.now()
+              && Date.now() - new Date(event.endTime).getTime() <= 7 * 24 * 60 * 60_000)));
+    const ownerEvents = viewerId
+      ? eligibleEvents.filter((event) => String(event.createdByUserId || "") === viewerId)
+      : [];
+    const ownerViewCounts = await getEventViewCounts(ownerEvents.map((event) => event.id));
+    const updates = eligibleEvents.map((event) => {
         const hasAction = (field) => viewerId && Array.isArray(event[field]) && event[field].includes(viewerId);
         const flameCount = Number(event.flameCount ?? event.hypeCount) || 0;
         const rsvpCount = Number(event.rsvpCount ?? event.turnoutCount) || 0;
@@ -2283,7 +2543,10 @@ app.get("/api/events/engagement", async (request, response) => {
           isGoing: Boolean(hasAction("attendeeUserIds")),
           isHyped: Boolean(hasAction("hypedUserIds")),
           isReminded: Boolean(hasAction("reminderUserIds")),
-          isHot: (rsvpCount * 2) + (reminderCount * 3) + flameCount >= HOT_EVENT_THRESHOLD
+          isHot: (rsvpCount * 2) + (reminderCount * 3) + flameCount >= HOT_EVENT_THRESHOLD,
+          ...(viewerId && String(event.createdByUserId || "") === viewerId
+            ? { viewCount: ownerViewCounts.get(String(event.id)) || 0 }
+            : {})
         };
       });
     return response.json({ updates });
@@ -2551,9 +2814,11 @@ app.post("/api/events", async (request, response) => {
       }
       await storeEvent(event);
       void enqueueCategoryAlert(event).catch((error) => console.error("New-event notifications could not be queued.", error));
+      void scheduleEventEndedRecapPrompt(event).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
       return response.status(201).json({ event: toPublicEvent(event), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
     await storeEvent(event);
+    void cancelEventEndedRecapPrompts(event.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
     return response.status(201).json({ event: toPublicEvent(event), similarEvents: [] });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
@@ -2613,6 +2878,7 @@ app.patch("/api/events/:eventId", async (request, response) => {
       }
       await storeEvent(updated);
       if (["Published", "Live"].includes(updated.status)) {
+        void scheduleEventEndedRecapPrompt(updated).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
         if (current.status === "Draft") {
           void enqueueCategoryAlert(updated).catch((error) => console.error("New-event notifications could not be queued.", error));
         } else {
@@ -2621,10 +2887,13 @@ app.patch("/api/events/:eventId", async (request, response) => {
             void notifyCriticalEventUpdate(current, updated).catch((error) => console.error("Event update notifications could not be queued.", error));
           }
         }
+      } else {
+        void cancelEventEndedRecapPrompts(updated.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
       }
       return response.json({ event: toPublicEvent(updated), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
     await storeEvent(updated);
+    void cancelEventEndedRecapPrompts(updated.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
     return response.json({ event: toPublicEvent(updated), similarEvents: [] });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
@@ -2644,7 +2913,9 @@ app.delete("/api/events/:eventId", async (request, response) => {
     if (String(event.createdByUserId || "") !== String(user._id || user.id)) {
       return response.status(403).json({ error: "Only the account that created this event can delete it." });
     }
-    if (["Published", "Live"].includes(event.status)) {
+    const eventEnded = Number.isFinite(new Date(event.endTime || "").getTime())
+      && new Date(event.endTime).getTime() <= Date.now();
+    if (["Published", "Live"].includes(event.status) && !eventEnded) {
       const cancelledAt = new Date();
       const cancelledEvent = {
         ...event,
@@ -2654,6 +2925,7 @@ app.delete("/api/events/:eventId", async (request, response) => {
         updatedAt: cancelledAt.toISOString()
       };
       await storeEvent(cancelledEvent);
+      void cancelEventEndedRecapPrompts(event.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
       if (isMongoConnected()) {
         await NotificationJob.updateMany({
           eventId: String(event.id),
@@ -2673,10 +2945,13 @@ app.delete("/api/events/:eventId", async (request, response) => {
       } catch (error) {
         console.error("Event cancellation was saved, but audience notifications could not be queued.", error);
       }
-      return response.json({ message: "Cancellation notice sent. This event will remain visible temporarily.", cancelled: true });
+      return response.json({ message: "Cancellation notice sent. The event is no longer in the public feed and remains in your profile for seven days.", cancelled: true });
     }
     await deleteStoredEvent(event.id);
-    return response.json({ message: "Draft deleted." });
+    return response.json({
+      message: event.status === "Draft" ? "Draft deleted." : "Event removed from your profile.",
+      removed: true
+    });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
       return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
@@ -2739,7 +3014,11 @@ app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
     const user = await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in before uploading event recap photos." });
     if (!isMongoConnected()) return response.status(503).json({ error: "Recap uploads require the shared MongoDB database." });
-    if (!configureCloudinary()) return response.status(503).json({ error: "Cloudinary is not configured on the FUTApulse server yet." });
+    if (!configureCloudinary()) {
+      return response.status(503).json({
+        error: `Cloudinary is not ready. Add the missing Render environment variable${getMissingCloudinaryVariables().length === 1 ? "" : "s"}: ${getMissingCloudinaryVariables().join(", ")}.`
+      });
+    }
     const event = await findStoredEvent(request.params.eventId);
     if (!event || !["Published", "Live"].includes(event.status)) return response.status(404).json({ error: "This event cannot accept recap photos." });
     if (String(event.createdByUserId || "") !== String(user._id || user.id)) {
@@ -3158,26 +3437,22 @@ app.get("/api/events/:eventId", async (request, response) => {
     const viewerId = user ? String(user._id || user.id) : "";
     const event = await findStoredEvent(request.params.eventId);
     if (!event) return response.status(404).json({ error: "Event not found." });
-    const isCancelled = event.status === "Cancelled"
-      && new Date(event.cancellationExpiresAt || 0).getTime() > Date.now();
-    const recapPublishedAt = new Date(event.recapPublishedAt || 0).getTime();
-    const hasRecentRecap = Array.isArray(event.recapPhotos) && event.recapPhotos.length > 0
-      && Number.isFinite(recapPublishedAt)
-      && Date.now() - recapPublishedAt <= 7 * 24 * 60 * 60_000;
     const isOwner = Boolean(viewerId && String(event.createdByUserId || "") === viewerId);
-    const ownerEndedRecently = isOwner && Number.isFinite(new Date(event.endTime || "").getTime())
-      && Date.now() - new Date(event.endTime).getTime() <= 7 * 24 * 60 * 60_000;
-    if (!isCancelled && !hasRecentRecap && !ownerEndedRecently
+    const eventEnd = new Date(event.endTime || "").getTime();
+    const ownerEndedRecently = isOwner && Number.isFinite(eventEnd)
+      && event.status !== "Cancelled"
+      && eventEnd <= Date.now()
+      && Date.now() - eventEnd <= 7 * 24 * 60 * 60_000;
+    const cancellationDate = new Date(event.cancelledAt || "").getTime();
+    const ownerCancelledRecently = isOwner && event.status === "Cancelled"
+      && Number.isFinite(cancellationDate)
+      && Date.now() - cancellationDate <= 7 * 24 * 60 * 60_000;
+    if (!ownerCancelledRecently && !ownerEndedRecently
       && !(["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event))) {
       return response.status(404).json({ error: "This event is no longer available." });
     }
     const [decoratedEvent] = await decorateEventsWithCurrentOrganizers([event], isMongoConnected() ? { users: [], events: [] } : readDatabase());
-    return response.json({
-      event: {
-        ...toPublicEvent(decoratedEvent, viewerId),
-        isDeepLinkOnly: hasRecentRecap && !isWithinEventDisplayWindow(event) && !isCancelled
-      }
-    });
+    return response.json({ event: toPublicEvent(decoratedEvent, viewerId) });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
     console.error("Event link request failed.", error);
@@ -3231,9 +3506,8 @@ async function startServer() {
     httpServer.listen(PORT, "0.0.0.0", () => {
       console.log(`FUTApulse API listening on port ${PORT}`);
       if (process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY) console.log("Web Push delivery is configured.");
-      if (firebaseMessaging) console.log("Firebase Cloud Messaging delivery is configured.");
-      if (!process.env.WEB_PUSH_PUBLIC_KEY && !process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-        console.warn("Background push is not configured; users can still receive live alerts while connected.");
+      if (!(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY)) {
+        console.warn("Web Push credentials are missing. Browser/OS permission alone cannot enable closed-app delivery. Configure Web Push credentials in Render.");
       }
     });
     if (isMongoConnected()) {
@@ -3255,6 +3529,7 @@ async function startServer() {
     .then(async () => {
       await Promise.all([
         User.init(), EmailChallenge.init(), EventRecord.init(), EngagementAction.init(), EventReport.init(),
+        EventView.init(), RecapPromptDismissal.init(),
         PushDevice.init(), NotificationJob.init()
       ]);
       databaseBackend = "mongodb";
@@ -3276,6 +3551,6 @@ if (require.main === module) {
 module.exports = {
   app,
   startServer,
-  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, PushDevice, NotificationJob },
+  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob },
   buildFacultyTurnoutBreakdown
 };

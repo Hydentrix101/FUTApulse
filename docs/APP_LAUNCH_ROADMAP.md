@@ -145,21 +145,19 @@ These are accepted product requirements or queued design tasks. They are not all
 
 ## Phase 4 - Mobile install and app packaging
 
-**Purpose:** Deliver a reliable installable PWA first, then package the same hosted client as an Android APK.
+**Purpose:** Deliver FUTApulse as a reliable installable Progressive Web App.
 
 - Add the PWA service worker, install prompt, update prompt, and an offline shell. Cache only versioned static app assets; never cache private API responses or authenticated data.
 - Verify the PWA manifest, icons, install flow, update flow, offline shell, and shared-event deep links on supported Android phones and iOS Safari.
-- After the hosted PWA is verified, add Capacitor for Android; configure app identity, icons, permissions, deep links, and secure API origins without duplicating backend logic.
 - Keep the app usable on narrow screens, touch input, mobile keyboards, interrupted connections, and lower-bandwidth networks.
-- Test install, update, sign-in persistence, event sharing/deep links, and back navigation on supported Android phones. Add native iOS packaging only if it becomes a launch target.
+- Test install, update, sign-in persistence, event sharing/deep links, and back navigation on supported Android phones and iOS Safari.
 
 ### Phase 4 implementation status
 
-- **Core PWA setup: Complete.** The existing `client/public/manifest.json` and `icon-192.png` / `icon-512.png` remain the install identity and assets. Vite generates the service worker. Precache is limited to build-time static assets; `/api` navigations are explicitly excluded from the app-shell fallback, and no private API runtime cache is configured.
+- **Core PWA setup: Complete.** `client/public/manifest.json` uses `icon-192.png` / `icon-512.png` as install identity assets. Vite generates the service worker. Precache is limited to build-time static assets; `/api` navigations are explicitly excluded from the app-shell fallback, and no private API runtime cache is configured.
 - The client offers browser-native install where available, iOS Safari Home Screen instructions, an offline-shell-ready message, and a user-controlled update/reload prompt.
 - **Final PWA verification remains:** install and launch from the Home Screen, sign in, open a shared event link, verify offline shell behavior without treating API data as available offline, then deploy an update and confirm the refresh prompt safely applies it on supported phones.
-- **Capacitor scaffold: Prepared.** The permanent Android ID is `ng.edu.futa.futapulse`; Capacitor core/Android/CLI dependencies, native project, branded launcher/splash assets, and Android build configuration are present. `npm run cap:sync:android --prefix client` rebuilds with the HTTPS Render API origin and syncs the native project.
-- **Before native authentication/device testing:** add `https://localhost` to Render's `CORS_ORIGIN` allowlist for the Android WebView; design a native refresh strategy because server refresh cookies are `SameSite=Lax`; and implement a supported native Google OAuth flow instead of assuming the browser popup works. Add verified Android App Links after the signing certificate fingerprint is available. Build/sign and physical-device validation require Android Studio, Android SDK/JDK, and a protected signing-key setup; do not commit signing credentials.
+- **Distribution model: PWA-only.** Capacitor, Android build tooling, and native push integrations are not part of the current client. Background push uses browser Web Push and requires VAPID credentials plus an installed/permission-enabled browser PWA where the platform requires it.
 
 **Exit condition:** Students can install/open the chosen mobile form, update it safely, and reach the correct event from a shared link. The beta team’s device results must be recorded before marking this phase fully verified.
 
@@ -168,7 +166,7 @@ These are accepted product requirements or queued design tasks. They are not all
 **Purpose:** Deliver reminders and important event changes through a real mobile delivery path.
 
 - Decide notification requirements separately for event reminders, event going-live alerts, and organizer changes to time/venue.
-- Select browser push for PWA, native push for Capacitor/Android, or both. Store device subscriptions/tokens on the server and let users manage them.
+- Use browser push for the PWA. Store web-push subscriptions on the server and let users manage them.
 - Schedule reminders on the server and make delivery idempotent; local timers may supplement an open app but must not be presented as dependable background delivery.
 - Send important event-change notices only when meaningful fields change; include the event deep link and changed details.
 - Respect OS permission, quiet/sound settings, battery restrictions, and user preferences. A push can alert and deep-link to the full event; the OS controls whether it can play a sound or open the app automatically.
