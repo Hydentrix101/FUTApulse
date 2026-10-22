@@ -73,10 +73,25 @@ export default function PwaExperience() {
   }
 
   function getInstallInstructions() {
-    if (isAppleMobileDevice()) return 'In Safari, tap Share, then choose “Add to Home Screen”.'
-    if (/Android/i.test(navigator.userAgent)) return 'This browser has not offered its install prompt yet. Open FUTApulse in Chrome, refresh the page, then tap Install again. If Chrome offers Add to Home screen instead, choose that.'
-    if (/Edg|Chrome/i.test(navigator.userAgent)) return 'This browser has not offered its install prompt yet. Refresh FUTApulse and tap Install again, or use the browser’s install icon if available.'
-    return 'Open FUTApulse in a supported browser and tap Install again. Some browsers only offer Add to Home Screen from their Share or browser menu.'
+    if (isAppleMobileDevice()) {
+      return 'On iPhone or iPad, open this page in Safari, tap Share, choose “Add to Home Screen”, then tap Add. iOS does not let websites open this system prompt directly.'
+    }
+    if (/Android/i.test(navigator.userAgent)) {
+      if (/SamsungBrowser/i.test(navigator.userAgent)) {
+        return 'In Samsung Internet, open the menu, tap “Add page to”, then choose “Home screen” and confirm.'
+      }
+      if (/Firefox/i.test(navigator.userAgent)) {
+        return 'In Firefox, open the menu (⋮), tap “Install”, then confirm.'
+      }
+      if (/EdgA|EdgiOS|Edg/i.test(navigator.userAgent)) {
+        return 'In Microsoft Edge, open the menu (⋯), choose “Apps” or “Add to phone”, then install FUTApulse.'
+      }
+      return 'In Chrome, tap the menu (⋮) in the top-right. Choose “Install app” or “Add to Home screen”, then confirm. If neither option appears, open FUTApulse in Chrome (not inside another app) and check again later. The browser controls when it can show the install prompt.'
+    }
+    if (/Edg|Chrome/i.test(navigator.userAgent)) {
+      return 'Open the browser menu and choose “Install FUTApulse” or “Install page as app”. If that option is missing, this browser has not made its install prompt available yet.'
+    }
+    return 'Open FUTApulse in your browser menu and look for “Install” or “Add to Home Screen”. Some browsers only offer this option from their Share or menu controls.'
   }
 
   async function applyUpdate() {

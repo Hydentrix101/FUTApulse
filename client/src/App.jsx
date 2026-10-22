@@ -428,6 +428,7 @@ function FutaPulseApp() {
     : window.location.hash.replace('#', '') || 'home')
   const tabHistoryRef = useRef([])
   const lastTrackedTabRef = useRef(activeTab)
+  const backGuardIdRef = useRef('')
   const [events, setEvents] = useState([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
@@ -495,6 +496,7 @@ function FutaPulseApp() {
   const [notificationDeliveryPermission, setNotificationDeliveryPermission] = useState('checking')
   const [notificationDeliveryError, setNotificationDeliveryError] = useState('')
   const [notificationStatusRefresh, setNotificationStatusRefresh] = useState(0)
+  const [autoNotificationPromptVisible, setAutoNotificationPromptVisible] = useState(false)
   const notificationDeliveryLoading = settingsPage === 'notifications'
     && !notificationDeliveryStatus
     && !notificationDeliveryError
@@ -535,6 +537,7 @@ function FutaPulseApp() {
   const [pendingNewEmail, setPendingNewEmail] = useState('')
   const [feedbackSending, setFeedbackSending] = useState(false)
   const isFutapulseAdmin = Boolean(user?.emailVerified && String(user.email || '').toLowerCase() === FUTAPULSE_ADMIN_EMAIL)
+  const notificationPromptAccountKey = user?.id || user?.username
   const categoryPreferences = categoryPreferencesDraft || (profile
     ? Object.fromEntries(CATEGORY_DATA.map(({ id }) => [
       id,
@@ -545,6 +548,7 @@ function FutaPulseApp() {
     || (!sessionLoading && Boolean(session?.token && user && profile?.faculty && profile?.department && profile?.level)
       && profile?.notificationPreferencesOnboardingComplete !== true)
   const toastTimer = useRef(null)
+  const notificationPromptAttemptedForUserRef = useRef('')
   const alarmAudioContextRef = useRef(null)
   const alarmSoundTimerRef = useRef(null)
   const avatarInput = useRef(null)
@@ -558,6 +562,16 @@ function FutaPulseApp() {
     window.clearTimeout(toastTimer.current)
     toastTimer.current = window.setTimeout(() => setToast(null), 3600)
   }, [])
+
+  const dismissAutoNotificationPrompt = useCallback(() => {
+    const accountKey = user?.id || user?.username
+    if (accountKey) {
+      safeSetStored(`futapulse-push-prompt-dismissed:${encodeURIComponent(String(accountKey))}`, 'true')
+    }
+    setAutoNotificationPromptVisible(false)
+    setProfileMenuOpen(false)
+    notify('You can set up device alerts later from Profile options → Notification Preferences.')
+  }, [notify, setAutoNotificationPromptVisible, setProfileMenuOpen, user?.id, user?.username])
 
   const recordEventView = useCallback(async (eventId) => {
     const token = session?.token
@@ -798,6 +812,60 @@ function FutaPulseApp() {
     })
     return () => { active = false }
   }, [settingsPage, session?.token, notificationStatusRefresh])
+
+  useEffect(() => {
+    const profileReady = profile?.notificationPreferencesOnboardingComplete === true
+    if (
+      !launchSequenceReady
+      || launchVisible
+      || isLaunchAdActive
+      || sessionLoading
+      || !session?.token
+      || !notificationPromptAccountKey
+      || !profileReady
+    ) return undefined
+
+    const accountKey = String(notificationPromptAccountKey)
+    if (!accountKey || notificationPromptAttemptedForUserRef.current === accountKey) return undefined
+    const dismissalKey = `futapulse-push-prompt-dismissed:${encodeURIComponent(accountKey)}`
+    if (readStoredValue(dismissalKey) === 'true') return undefined
+
+    let active = true
+    const permission = 'Notification' in window ? Notification.permission : 'unsupported'
+    apiRequest('/api/notifications/status?platform=web', {}, session.token)
+      .then((status) => {
+        if (!active) return
+        notificationPromptAttemptedForUserRef.current = accountKey
+        setNotificationDeliveryError('')
+        setNotificationDeliveryStatus(status)
+        setNotificationDeliveryPermission(permission)
+        if (permission !== 'granted' || !status.deviceRegistered) {
+          setAutoNotificationPromptVisible(true)
+          setSettingsPage('notifications')
+          setProfileMenuOpen(true)
+        }
+      })
+      .catch((error) => {
+        if (!active) return
+        notificationPromptAttemptedForUserRef.current = accountKey
+        setNotificationDeliveryError(error.message || 'We could not check this device’s notification setup.')
+        setNotificationDeliveryStatus(null)
+        setNotificationDeliveryPermission(permission)
+        setAutoNotificationPromptVisible(true)
+        setSettingsPage('notifications')
+        setProfileMenuOpen(true)
+      })
+
+    return () => { active = false }
+  }, [
+    isLaunchAdActive,
+    launchSequenceReady,
+    launchVisible,
+    profile?.notificationPreferencesOnboardingComplete,
+    session?.token,
+    sessionLoading,
+    notificationPromptAccountKey,
+  ])
 
   useEffect(() => {
     let splashFrame = 0
@@ -1180,6 +1248,10 @@ function FutaPulseApp() {
     if (!detailEvent && !profileMenuOpen && !profileOpen && !eventEditor && !reminderTarget && !reportTarget && !organizerBroadcastTarget && !categoryPreferencesOpen) return undefined
     const onKeyDown = (event) => {
       if (event.key === 'Escape') {
+        if (profileMenuOpen && autoNotificationPromptVisible) {
+          dismissAutoNotificationPrompt()
+          return
+        }
         if (detailEvent) {
           closeEventDetail()
           return
@@ -1196,7 +1268,7 @@ function FutaPulseApp() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [detailEvent, profileMenuOpen, profileOpen, eventEditor, reminderTarget, reportTarget, organizerBroadcastTarget, categoryPreferencesOpen, profile, closeEventDetail])
+  }, [autoNotificationPromptVisible, detailEvent, dismissAutoNotificationPrompt, profileMenuOpen, profileOpen, eventEditor, reminderTarget, reportTarget, organizerBroadcastTarget, categoryPreferencesOpen, profile, closeEventDetail])
 
   useEffect(() => {
     const onHashChange = () => {
@@ -1486,46 +1558,54 @@ function FutaPulseApp() {
   }
 
   const handleAppBack = useCallback(() => {
-    if (eventEditor) {
-      setEventEditor(null)
-      setEventDuplicateState({ code: '', matches: [] })
-      return
-    }
-    if (organizerBroadcastTarget && !organizerBroadcastSending) {
-      setOrganizerBroadcastTarget(null)
-      return
-    }
-    if (eventDeleteTarget && !eventDeleting) {
-      setEventDeleteTarget(null)
-      return
-    }
-    if (recapUploadTarget && !recapUploading) {
-      setRecapUploadTarget(null)
-      setRecapPhotoFiles([])
-      return
-    }
-    if (reportTarget) {
-      setReportTarget(null)
-      return
-    }
-    if (reminderTarget) {
-      setReminderTarget(null)
-      return
-    }
-    if (detailEvent) {
-      closeEventDetail()
-      return
-    }
-    if (avatarPhotoSource) {
-      setAvatarPhotoSource('')
+    if (recapUploadTarget) {
+      if (!recapUploading) {
+        setRecapUploadTarget(null)
+        setRecapPhotoFiles([])
+      }
       return
     }
     if (facultyLogoOpen) {
       setFacultyLogoOpen(false)
       return
     }
+    if (organizerBroadcastTarget) {
+      if (!organizerBroadcastSending) setOrganizerBroadcastTarget(null)
+      return
+    }
+    if (categoryPreferencesOpen) {
+      if (profile?.notificationPreferencesOnboardingComplete) {
+        setCategoryPreferencesOpen(false)
+      } else {
+        notify('Please save your event interests to continue.')
+      }
+      return
+    }
+    if (reminderTarget) {
+      setReminderTarget(null)
+      return
+    }
+    if (eventDeleteTarget) {
+      if (!eventDeleting) setEventDeleteTarget(null)
+      return
+    }
+    if (reportTarget) {
+      setReportTarget(null)
+      return
+    }
+    if (avatarPhotoSource) {
+      setAvatarPhotoSource('')
+      return
+    }
+    if (eventEditor) {
+      setEventEditor(null)
+      setEventDuplicateState({ code: '', matches: [] })
+      return
+    }
     if (profileMenuOpen) {
-      if (securityAction) {
+      if (autoNotificationPromptVisible) {
+        dismissAutoNotificationPrompt()
+      } else if (securityAction) {
         setSecurityAction('')
         setEmailChangePending(false)
         setPendingNewEmail('')
@@ -1536,12 +1616,17 @@ function FutaPulseApp() {
       }
       return
     }
-    if (categoryPreferencesOpen && profile?.notificationPreferencesOnboardingComplete) {
-      setCategoryPreferencesOpen(false)
+    if (detailEvent) {
+      closeEventDetail()
       return
     }
-    if (profileOpen && profile) {
-      setProfileOpen(false)
+    if (guidelinesOpen) {
+      notify('Please review and accept the Community Guidelines to continue.')
+      return
+    }
+    if (profileOpen) {
+      if (profile) setProfileOpen(false)
+      else notify('Please complete your profile setup to continue.')
       return
     }
 
@@ -1560,13 +1645,16 @@ function FutaPulseApp() {
   }, [
     activeTab,
     avatarPhotoSource,
+    autoNotificationPromptVisible,
     categoryPreferencesOpen,
     closeEventDetail,
     detailEvent,
+    dismissAutoNotificationPrompt,
     eventDeleteTarget,
     eventDeleting,
     eventEditor,
     facultyLogoOpen,
+    guidelinesOpen,
     notify,
     organizerBroadcastSending,
     organizerBroadcastTarget,
@@ -1601,18 +1689,23 @@ function FutaPulseApp() {
 
   useEffect(() => {
     const guardStateKey = '__futapulseBackGuard'
-    if (!window.history.state?.[guardStateKey]) {
+    if (!backGuardIdRef.current) {
+      backGuardIdRef.current = `guard-${Date.now()}-${Math.random().toString(36).slice(2)}`
       window.history.pushState(
-        { ...(window.history.state || {}), [guardStateKey]: true },
+        { ...(window.history.state || {}), [guardStateKey]: backGuardIdRef.current },
         '',
         window.location.href,
       )
     }
 
     const onPopState = (event) => {
-      if (event.state?.[guardStateKey]) return
+      if (event.state?.[guardStateKey] === backGuardIdRef.current) return
       handleAppBack()
-      window.history.forward()
+      window.history.pushState(
+        { ...(window.history.state || {}), [guardStateKey]: backGuardIdRef.current },
+        '',
+        window.location.href,
+      )
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
@@ -3107,13 +3200,20 @@ function FutaPulseApp() {
       )}
 
       {profileMenuOpen && (
-        <div className="profile-options-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setProfileMenuOpen(false) }}>
+        <div className="profile-options-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target !== event.currentTarget) return
+          if (autoNotificationPromptVisible) dismissAutoNotificationPrompt()
+          else setProfileMenuOpen(false)
+        }}>
           <section className="profile-options-panel" role="dialog" aria-modal="true" aria-labelledby="options-title">
             <button type="button" className="profile-options-close" aria-label="Close profile options" onClick={() => {
-              setProfileMenuOpen(false)
-              setSecurityAction('')
-              setEmailChangePending(false)
-              setPendingNewEmail('')
+              if (autoNotificationPromptVisible) dismissAutoNotificationPrompt()
+              else {
+                setProfileMenuOpen(false)
+                setSecurityAction('')
+                setEmailChangePending(false)
+                setPendingNewEmail('')
+              }
             }}><X size={20} /></button>
             {settingsPage === 'menu' ? (
               <>
@@ -3124,9 +3224,7 @@ function FutaPulseApp() {
                   <button type="button" className="profile-option" onClick={() => setSettingsPage('guidelines')}><Shield size={18} /><span>Community Guidelines</span><ChevronRight size={18} /></button>
                   <button type="button" className="profile-option" onClick={toggleTheme}><Sparkles size={18} /><span>Switch Theme</span><b>{theme}</b></button>
                   <button type="button" className="profile-option" onClick={() => setSettingsPage('feedback')}><Heart size={18} /><span>Feedback &amp; Bug Report</span><ChevronRight size={18} /></button>
-                  <a className="profile-option profile-legal-link" href="/privacy"><Shield size={18} /><span>Privacy Policy</span><ChevronRight size={18} /></a>
-                  <a className="profile-option profile-legal-link" href="/terms"><Shield size={18} /><span>Terms of Service</span><ChevronRight size={18} /></a>
-                  <a className="profile-option profile-legal-link" href="/about"><Heart size={18} /><span>About &amp; Contact</span><ChevronRight size={18} /></a>
+                  <button type="button" className="profile-option" onClick={() => setSettingsPage('about-policies')}><Shield size={18} /><span>About &amp; Policies</span><ChevronRight size={18} /></button>
                   {isFutapulseAdmin && <button type="button" className="profile-option" onClick={() => setSettingsPage('event-reports')}><Shield size={18} /><span>Reported event review</span><b>{reportReviewCases.length}</b></button>}
                   <button type="button" className="profile-option profile-option-logout" onClick={logout}><LogOut size={18} /><span>Log Out</span><ChevronRight size={18} /></button>
                 </div>
@@ -3134,6 +3232,10 @@ function FutaPulseApp() {
             ) : (
               <>
                 <button type="button" className="profile-options-back" onClick={() => {
+                  if (autoNotificationPromptVisible) {
+                    dismissAutoNotificationPrompt()
+                    return
+                  }
                   setSettingsPage('menu')
                   setSecurityAction('')
                   setEmailChangePending(false)
@@ -3202,26 +3304,31 @@ function FutaPulseApp() {
                 {settingsPage === 'notifications' && <>
                   <span className="explore-eyebrow">YOUR ALERTS</span><h2>Notification preferences</h2>
                   <section className="notification-delivery-status" aria-live="polite">
-                    <h3>Background alerts on this device</h3>
-                    {notificationDeliveryLoading && <p>Checking server and device readiness…</p>}
-                    {notificationDeliveryError && <p className="notification-delivery-error" role="alert">{notificationDeliveryError}</p>}
+                    <h3>Get alerts on this device</h3>
+                    <p>Allow FUTApulse to send alerts when you are away from the app. Your browser will ask you to allow notifications when you tap the button.</p>
+                    {notificationDeliveryLoading && <p>Checking whether this phone is ready…</p>}
+                    {notificationDeliveryError && <p className="notification-delivery-error" role="alert">We could not check the setup right now: {notificationDeliveryError} You can try again below.</p>}
                     {!notificationDeliveryLoading && !notificationDeliveryError && notificationDeliveryStatus && <>
-                      <p>Device permission: <strong>{currentNotificationDeliveryPermission === 'granted' ? 'Granted' : currentNotificationDeliveryPermission === 'denied' ? 'Blocked' : currentNotificationDeliveryPermission === 'unsupported' ? 'Not supported by this browser' : 'Not enabled'}</strong></p>
-                      <p>Server push service: <strong>{notificationDeliveryStatus.pushConfigured ? 'Configured' : 'Not configured'}</strong></p>
-                      <p>Device registration: <strong>{notificationDeliveryStatus.deviceRegistered ? 'Registered' : 'Not registered'}</strong></p>
-                      <p>Shared notification queue: <strong>{notificationDeliveryStatus.durableSchedulingAvailable ? 'Available' : 'Unavailable'}</strong></p>
+                      <p>Your browser’s permission: <strong>{currentNotificationDeliveryPermission === 'granted' ? 'Allowed' : currentNotificationDeliveryPermission === 'denied' ? 'Blocked' : currentNotificationDeliveryPermission === 'unsupported' ? 'Not supported' : 'Not allowed yet'}</strong></p>
+                      <p>FUTApulse alert service: <strong>{notificationDeliveryStatus.pushConfigured ? 'Ready' : 'Not set up yet'}</strong></p>
+                      <p>This device is connected: <strong>{notificationDeliveryStatus.deviceRegistered ? 'Yes' : 'Not yet'}</strong></p>
+                      <p>Reminder service: <strong>{notificationDeliveryStatus.durableSchedulingAvailable ? 'Ready' : 'Temporarily unavailable'}</strong></p>
                       {!notificationDeliveryStatus.pushConfigured
-                        ? <p>Background alerts require Web Push credentials on the server and notification permission on this device.</p>
+                        ? <p>The FUTApulse alert service is not set up yet. Please try again later or contact support; this is not a setting you can fix on your phone.</p>
                         : !notificationDeliveryStatus.durableSchedulingAvailable
-                          ? <p>Background reminders and queued alerts also require the shared MongoDB notification queue.</p>
+                          ? <p>The reminder service is temporarily unavailable. Please try again later.</p>
+                        : notificationDeliveryPermission === 'unsupported'
+                          ? <p>This browser does not support web notifications. Try FUTApulse in Chrome on Android, or install it from Safari’s Share menu on iPhone or iPad.</p>
                         : notificationDeliveryPermission !== 'granted'
-                          ? <p>Allow notifications in your browser or device settings, then enable push on this device.</p>
+                          ? notificationDeliveryPermission === 'denied'
+                            ? <p>Notifications are blocked for this site. Change FUTApulse’s notification permission in your browser or phone settings, then try again.</p>
+                            : <p>Tap the button below and choose Allow when your browser asks. If no permission prompt appears, check FUTApulse’s notification permission in your browser settings.</p>
                           : !notificationDeliveryStatus.deviceRegistered
-                            ? <p>This device has permission but is not registered with the server yet.</p>
-                            : <p>Background push is configured for this device. Delivery still depends on network and operating-system settings.</p>}
+                            ? <p>Notifications are allowed, but this device is not connected to FUTApulse yet. Tap below to finish setup.</p>
+                            : <p>This device is ready. Alerts can still be delayed by a weak connection, battery saver, or phone notification settings.</p>}
                     </>}
-                    <button type="button" className="profile-edit-pill" onClick={() => { void enablePushNotifications() }} disabled={notificationDeliveryLoading}>
-                      {currentNotificationDeliveryPermission === 'granted' ? 'Refresh / register this device' : 'Enable push on this device'}
+                    <button type="button" className="profile-edit-pill" onClick={() => { void enablePushNotifications() }} disabled={notificationDeliveryLoading || notificationDeliveryPermission === 'unsupported' || notificationDeliveryStatus?.pushConfigured === false}>
+                      {currentNotificationDeliveryPermission === 'granted' ? 'Connect this device' : 'Allow alerts on this device'}
                     </button>
                   </section>
                   {CATEGORY_DATA.map(({ id, label }) => (
@@ -3245,6 +3352,15 @@ function FutaPulseApp() {
                     { [['reminders', 'Event reminders'], ['updates', 'Campus event updates']].map(([key, label]) => <label key={key} className="preference-toggle"><span>{label}</span><input type="checkbox" checked={notifications[key] !== false} onChange={(event) => setNotifications((current) => { const next = { ...current, [key]: event.target.checked }; safeSetStored('futapulse-notification-preferences', JSON.stringify(next)); return next })} /></label>)}
                   </div>
                   <p className="options-detail-copy">Reminder and display settings are saved on this device.</p>
+                </>}
+                {settingsPage === 'about-policies' && <>
+                  <span className="explore-eyebrow">HELP &amp; IMPORTANT INFORMATION</span><h2>About &amp; Policies</h2>
+                  <p className="options-detail-copy">Learn how FUTApulse works, how we handle your information, and how to get support.</p>
+                  <div className="profile-options-list">
+                    <a className="profile-option profile-legal-link" href="/privacy"><Shield size={18} /><span>Privacy Policy</span><ChevronRight size={18} /></a>
+                    <a className="profile-option profile-legal-link" href="/terms"><Shield size={18} /><span>Terms of Service</span><ChevronRight size={18} /></a>
+                    <a className="profile-option profile-legal-link" href="/about"><Heart size={18} /><span>About &amp; Contact</span><ChevronRight size={18} /></a>
+                  </div>
                 </>}
                 {settingsPage === 'guidelines' && (
                   <>
