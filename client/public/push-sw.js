@@ -17,7 +17,7 @@ self.addEventListener('push', (event) => {
       body: payload.message || 'Tap to view the latest campus event update.',
       tag: payload.notificationId || undefined,
       data: { url: payload.url || '/' },
-      icon: '/android-chrome-192x192.png',
+      icon: '/icon-192.png',
       badge: '/favicon-32x32.png',
       renotify: false,
     })

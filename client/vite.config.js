@@ -16,8 +16,8 @@ export default defineConfig({
         'favicon.ico',
         'favicon.svg',
         'push-sw.js',
-        'android-chrome-192x192.png',
-        'android-chrome-512x512.png',
+        'icon-192.png',
+        'icon-512.png',
       ],
       manifest: false,
       workbox: {

@@ -10,8 +10,6 @@ import LaunchAdGate from './components/LaunchAdGate'
 import BrandHeart from './components/BrandHeart'
 import { API_BASE_URL } from './config/api'
 import { io } from 'socket.io-client'
-import { Capacitor } from '@capacitor/core'
-import { PushNotifications } from '@capacitor/push-notifications'
 
 const EventCard = lazy(() => import('./components/EventCard'))
 const EventEditor = lazy(() => import('./components/EventEditor'))
@@ -40,6 +38,7 @@ const FUTAPULSE_ADMIN_EMAIL = 'immanuelidowu1@gmail.com'
 const EVENT_LIST_PAGE_SIZE = 12
 const MAX_CACHED_EVENTS = 40
 const MAX_EVENT_CACHE_CHARACTERS = 360_000
+const EVENT_VIEW_THRESHOLDS = Array.from({ length: 101 }, (_, index) => index / 100)
 const REPORT_REASON_LABELS = {
   misleading: 'Misleading or false details',
   inappropriate: 'Inappropriate or harmful content',
@@ -172,6 +171,14 @@ function getEventId(event) {
   return event.id ?? event._id
 }
 
+function isMeaningfullyVisible(entry) {
+  if (!entry.isIntersecting) return false
+  const viewport = entry.rootBounds || { width: window.innerWidth, height: window.innerHeight }
+  const minimumWidth = Math.min(entry.boundingClientRect.width, viewport.width) * 0.5
+  const minimumHeight = Math.min(entry.boundingClientRect.height, viewport.height) * 0.5
+  return entry.intersectionRect.width >= minimumWidth && entry.intersectionRect.height >= minimumHeight
+}
+
 function syncEventOrganizerProfile(event, user, profile) {
   if (String(event.createdByUserId || '') !== String(user?.id || '')) return event
   return {
@@ -269,14 +276,29 @@ async function apiRequest(endpoint, options = {}, token = '') {
   return result
 }
 
-function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp, homeVariant = '' }) {
+function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp, onView, homeVariant = '' }) {
+  const previewRef = useRef(null)
   const category = CATEGORY_DATA.find((item) => item.id === event.category)
   const [avatarFailed, setAvatarFailed] = useState(false)
   const [bannerFailed, setBannerFailed] = useState(false)
   const fallback = `/Faculty%20Logo/${encodeURIComponent(event.organizerFaculty || event.faculty || 'SEET')}.png`
+  const eventId = getEventId(event)
+
+  useEffect(() => {
+    const preview = previewRef.current
+    if (!preview || !onView || typeof IntersectionObserver === 'undefined') return undefined
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some(isMeaningfullyVisible)) {
+        onView(String(eventId))
+        observer.disconnect()
+      }
+    }, { threshold: EVENT_VIEW_THRESHOLDS })
+    observer.observe(preview)
+    return () => observer.disconnect()
+  }, [eventId, onView])
 
   return (
-    <article className={`event-card-preview ${event.category || 'social'}-platform ${homeVariant ? `home-preview ${homeVariant}` : ''}`} onClick={onOpen} onKeyDown={(keyEvent) => {
+    <article ref={previewRef} className={`event-card-preview ${event.category || 'social'}-platform ${homeVariant ? `home-preview ${homeVariant}` : ''}`} onClick={onOpen} onKeyDown={(keyEvent) => {
       if (keyEvent.key === 'Enter' || keyEvent.key === ' ') {
         keyEvent.preventDefault()
         onOpen()
@@ -398,6 +420,7 @@ function FutaPulseApp() {
   const [homeCategory, setHomeCategory] = useState('all')
   const [expandedHomeCategory, setExpandedHomeCategory] = useState('')
   const [pendingFullEventId, setPendingFullEventId] = useState('')
+  const [pendingOrganizerEventId, setPendingOrganizerEventId] = useState('')
   const homeSectionRefs = useRef({})
   const categoryFilterBarRef = useRef(null)
   const categoryFilterButtonRefs = useRef({})
@@ -453,13 +476,26 @@ function FutaPulseApp() {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [settingsPage, setSettingsPage] = useState('menu')
   const [notifications, setNotifications] = useState(() => readStored('futapulse-notification-preferences', { reminders: true, updates: true }))
+  const [notificationDeliveryStatus, setNotificationDeliveryStatus] = useState(null)
+  const [notificationDeliveryPermission, setNotificationDeliveryPermission] = useState('checking')
+  const [notificationDeliveryError, setNotificationDeliveryError] = useState('')
+  const [notificationStatusRefresh, setNotificationStatusRefresh] = useState(0)
+  const notificationDeliveryLoading = settingsPage === 'notifications'
+    && !notificationDeliveryStatus
+    && !notificationDeliveryError
+  const currentNotificationDeliveryPermission = notificationDeliveryLoading
+    ? 'checking'
+    : notificationDeliveryPermission
   const [organizerTab, setOrganizerTab] = useState('events')
   const organizerTouchStart = useRef(null)
   const [eventDeleteTarget, setEventDeleteTarget] = useState(null)
   const [eventDeleting, setEventDeleting] = useState(false)
   const [eventEditor, setEventEditor] = useState(null)
   const [recapUploadTarget, setRecapUploadTarget] = useState(null)
+  const [recapPhotoFiles, setRecapPhotoFiles] = useState([])
   const [recapUploading, setRecapUploading] = useState(false)
+  const [recapUploadConfigured, setRecapUploadConfigured] = useState(null)
+  const [recapUploadMissingVariables, setRecapUploadMissingVariables] = useState([])
   const [organizerBroadcastTarget, setOrganizerBroadcastTarget] = useState(null)
   const [organizerBroadcastText, setOrganizerBroadcastText] = useState('')
   const [organizerBroadcastSending, setOrganizerBroadcastSending] = useState(false)
@@ -496,18 +532,32 @@ function FutaPulseApp() {
   const toastTimer = useRef(null)
   const alarmAudioContextRef = useRef(null)
   const alarmSoundTimerRef = useRef(null)
-  const pushListenersRef = useRef([])
-  const sessionTokenRef = useRef(session?.token || '')
   const avatarInput = useRef(null)
   const eventBannerInput = useRef(null)
   const recapPhotoInput = useRef(null)
   const engagementInFlight = useRef(false)
+  const viewedEventIdsRef = useRef(new Set())
 
   const notify = useCallback((message, type = 'info') => {
     setToast({ message, type })
     window.clearTimeout(toastTimer.current)
     toastTimer.current = window.setTimeout(() => setToast(null), 3600)
   }, [])
+
+  const recordEventView = useCallback(async (eventId) => {
+    const token = session?.token
+    const viewerId = user?.id
+    if (!token || !viewerId || !eventId) return
+    const viewKey = `${viewerId}:${eventId}`
+    if (viewedEventIdsRef.current.has(viewKey)) return
+    viewedEventIdsRef.current.add(viewKey)
+    try {
+      await apiRequest(`/api/events/${encodeURIComponent(String(eventId))}/views`, { method: 'POST' }, token)
+    } catch (error) {
+      viewedEventIdsRef.current.delete(viewKey)
+      console.warn('A visible event view could not be recorded.', error)
+    }
+  }, [session, user])
 
   const receiveNotification = useCallback((payload) => {
     if (!payload?.notificationId || handledNotificationIds.current.has(payload.notificationId)) return
@@ -549,7 +599,6 @@ function FutaPulseApp() {
 
   useEffect(() => () => {
     Object.values(autoScrollResumeTimersRef.current).forEach((timer) => window.clearTimeout(timer))
-    pushListenersRef.current.forEach((listener) => { void listener.remove() })
   }, [])
 
   const eventExpiryScheduleKey = events.map((event) => `${getEventId(event)}:${event.endTime || ''}`).join('|')
@@ -586,10 +635,6 @@ function FutaPulseApp() {
       navigator.serviceWorker?.removeEventListener('message', handleServiceWorkerMessage)
     }
   }, [receiveNotification, session?.token, user?.id])
-
-  useEffect(() => {
-    sessionTokenRef.current = session?.token || ''
-  }, [session?.token])
 
   const primeAlarmAudio = useCallback(() => {
     const AudioContextConstructor = window.AudioContext || window.webkitAudioContext
@@ -704,6 +749,40 @@ function FutaPulseApp() {
     setProfileOpen(false)
     notify('You have been logged out.')
   }, [notify, setProfileMenuOpen])
+
+  useEffect(() => {
+    let active = true
+    apiRequest('/api/notifications/config')
+      .then((config) => {
+        if (active) {
+          setRecapUploadConfigured(config.recapUploadConfigured === true)
+          setRecapUploadMissingVariables(Array.isArray(config.recapUploadMissingVariables) ? config.recapUploadMissingVariables : [])
+        }
+      })
+      .catch((error) => {
+        console.error('Recap upload availability could not be checked.', error)
+      })
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    if (settingsPage !== 'notifications' || !session?.token) return undefined
+    let active = true
+    Promise.all([
+      apiRequest('/api/notifications/status?platform=web', {}, session.token),
+      Promise.resolve('Notification' in window ? Notification.permission : 'unsupported'),
+    ]).then(([status, permission]) => {
+      if (!active) return
+      setNotificationDeliveryError('')
+      setNotificationDeliveryStatus(status)
+      setNotificationDeliveryPermission(permission)
+    }).catch((error) => {
+      if (!active) return
+      setNotificationDeliveryError(error.message || 'Unable to check this device’s notification readiness.')
+      setNotificationDeliveryStatus(null)
+    })
+    return () => { active = false }
+  }, [settingsPage, session?.token, notificationStatusRefresh])
 
   useEffect(() => {
     let splashFrame = 0
@@ -1041,7 +1120,7 @@ function FutaPulseApp() {
         if (!shared || String(getEventId(shared)) !== requestedEventId) throw new Error('The shared event response was invalid.')
         startTransition(() => setEvents((current) => current.some((item) => String(getEventId(item)) === requestedEventId)
           ? current
-          : [...current, { ...shared, isDeepLinkOnly: shared.isDeepLinkOnly === true }]))
+          : [...current, shared]))
       }).catch((error) => {
         console.warn('Unable to restore the shared event link.', error)
       }).finally(() => {
@@ -1115,8 +1194,7 @@ function FutaPulseApp() {
 
   const publishedEvents = useMemo(
     () => events.filter((event) => {
-      if (event.status === 'Cancelled') return Date.parse(event.cancellationExpiresAt || '') > feedClock
-      if (event.isDeepLinkOnly === true) return true
+      if (event.status === 'Cancelled') return false
       if (!['Published', 'Live', undefined].includes(event.status)) return false
       return isWithinEventDisplayWindow(event, feedClock)
     }),
@@ -1457,45 +1535,9 @@ function FutaPulseApp() {
       notify('Sign in before enabling notifications.', 'error')
       return
     }
+    setNotificationDeliveryError('')
     try {
       const config = await apiRequest('/api/notifications/config')
-      if (Capacitor.isNativePlatform()) {
-        if (!config.androidPushConfigured) throw new Error('Android push is not configured on the FUTApulse server yet.')
-        if (!pushListenersRef.current.length) {
-          pushListenersRef.current = [
-            await PushNotifications.addListener('registration', async ({ value }) => {
-              try {
-                await apiRequest('/api/notifications/devices/android', {
-                  method: 'POST',
-                  body: JSON.stringify({ token: value }),
-                }, sessionTokenRef.current)
-                notify('Push notifications are enabled on this device.', 'success')
-              } catch (error) {
-                notify(error.message || 'The Android push token could not be registered.', 'error')
-              }
-            }),
-            await PushNotifications.addListener('registrationError', (error) => {
-              console.error('Android push registration failed.', error)
-              notify('Android notifications could not be enabled. Check the Firebase Android setup.', 'error')
-            }),
-            await PushNotifications.addListener('pushNotificationActionPerformed', ({ notification }) => {
-              const data = notification?.data || {}
-              focusNotificationEvent({
-                notificationId: data.notificationId,
-                eventId: data.eventId,
-                category: data.category,
-                title: data.title || notification?.title,
-                message: data.message || notification?.body,
-              })
-            }),
-          ]
-        }
-        let permission = await PushNotifications.checkPermissions()
-        if (permission.receive !== 'granted') permission = await PushNotifications.requestPermissions()
-        if (permission.receive !== 'granted') throw new Error('Notification permission was not granted on this device.')
-        await PushNotifications.register()
-        return
-      }
       if (!('Notification' in window) || !('serviceWorker' in navigator)) {
         throw new Error('This browser does not support web push notifications.')
       }
@@ -1516,6 +1558,8 @@ function FutaPulseApp() {
         method: 'POST',
         body: JSON.stringify({ subscription }),
       }, session.token)
+      setNotificationDeliveryPermission('granted')
+      setNotificationStatusRefresh((current) => current + 1)
       notify('Push notifications are enabled in this browser.', 'success')
     } catch (error) {
       notify(error.message || 'Unable to enable notifications on this device.', 'error')
@@ -1553,7 +1597,22 @@ function FutaPulseApp() {
     }
   }
 
-  const uploadEventRecap = async (files) => {
+  const dismissRecapPrompt = async (event) => {
+    if (!session?.token) return
+    try {
+      await apiRequest(`/api/events/${encodeURIComponent(String(getEventId(event)))}/recap-prompt-dismissal`, {
+        method: 'POST',
+      }, session.token)
+      setEvents((current) => current.map((item) => String(getEventId(item)) === String(getEventId(event))
+        ? { ...item, recapPromptDismissed: true }
+        : item))
+    } catch (error) {
+      notify(error.message || 'Unable to dismiss this recap prompt.', 'error')
+    }
+  }
+
+  const uploadEventRecap = async () => {
+    const files = recapPhotoFiles
     if (!recapUploadTarget || !session?.token || !files?.length) return
     const existingCount = Array.isArray(recapUploadTarget.recapPhotos) ? recapUploadTarget.recapPhotos.length : 0
     if (existingCount + files.length > 5) {
@@ -1582,13 +1641,19 @@ function FutaPulseApp() {
         ? { ...event, ...result.event }
         : event))
       setRecapUploadTarget(null)
+      setRecapPhotoFiles([])
       notify('Your event recap photos are live.', 'success')
     } catch (error) {
       notify(error.message || 'Unable to upload recap photos.', 'error')
     } finally {
       setRecapUploading(false)
-      if (recapPhotoInput.current) recapPhotoInput.current.value = ''
     }
+  }
+
+  const chooseRecapPhotos = () => {
+    if (!recapUploadTarget || recapUploading) return
+    if (recapPhotoInput.current) recapPhotoInput.current.value = ''
+    recapPhotoInput.current?.click()
   }
 
   const sendOrganizerBroadcast = async (event) => {
@@ -1926,6 +1991,12 @@ function FutaPulseApp() {
 
   const focusNotificationEvent = (notification) => {
     if (!notification?.eventId) return
+    if (notification.kind === 'event-ended-recap-prompt') {
+      setOrganizerTab('events')
+      setPendingOrganizerEventId(String(notification.eventId))
+      switchTab('profile')
+      return
+    }
     const category = CATEGORY_DATA.some((item) => item.id === notification.category) ? notification.category : 'all'
     setHomeAnnouncement(notification)
     setHomeCategory(category)
@@ -1951,6 +2022,20 @@ function FutaPulseApp() {
     return () => window.cancelAnimationFrame(frame)
   }, [activeTab, expandedHomeCategory, pendingFullEventId, events, loading])
 
+  useEffect(() => {
+    if (activeTab !== 'profile' || !pendingOrganizerEventId) return undefined
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById(`profile-event-${pendingOrganizerEventId}`)
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        setPendingOrganizerEventId('')
+      } else if (!loading) {
+        setPendingOrganizerEventId('')
+      }
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [activeTab, pendingOrganizerEventId, events, loading, organizerTab])
+
   const saveReminderTime = async (minutesBefore, label) => {
     if (!reminderTarget) return
     primeAlarmAudio()
@@ -1967,16 +2052,22 @@ function FutaPulseApp() {
       return
     }
     const reminder = { label, notifyAt: new Date(notifyAt).toISOString() }
-    let backgroundDeliveryAvailable = false
+    let backgroundDeliveryAvailable
     try {
-      const notificationConfig = await apiRequest('/api/notifications/config')
-      if (notificationConfig.durableSchedulingAvailable) {
+      const deliveryStatus = await apiRequest('/api/notifications/status?platform=web', {}, session?.token)
+      const permission = 'Notification' in window ? Notification.permission : 'unsupported'
+      if (deliveryStatus.durableSchedulingAvailable) {
         await apiRequest(`/api/events/${encodeURIComponent(String(reminderTarget))}/reminders/schedule`, {
           method: 'POST',
           body: JSON.stringify({ notifyAt: reminder.notifyAt }),
         }, session?.token)
-        backgroundDeliveryAvailable = true
       }
+      backgroundDeliveryAvailable = Boolean(
+        deliveryStatus.durableSchedulingAvailable
+        && deliveryStatus.pushConfigured
+        && deliveryStatus.deviceRegistered
+        && permission === 'granted',
+      )
     } catch (error) {
       notify(error.message || 'Unable to schedule this reminder on the server. No reminder was saved.', 'error')
       return
@@ -1989,10 +2080,10 @@ function FutaPulseApp() {
     }
     setReminderTarget(null)
     notify(!backgroundDeliveryAvailable
-      ? `Saved ${label} reminder for this device. Background delivery is unavailable until the server uses shared MongoDB scheduling.`
+      ? `Saved ${label} reminder on this device. Closed-app alerts are not ready: the server push service, this device’s permission, and device registration must all be active.`
       : notifications.reminders === false
       ? `Saved ${label} reminder. Alerts are currently turned off in notification preferences.`
-      : `Saved ${label} reminder. Enable notifications from your Profile settings to receive alerts when FUTApulse is closed.`, 'success')
+      : `Saved ${label} reminder. Background push is ready on this device.`, 'success')
   }
 
   const autosaveEventDraft = async (eventData, banner) => {
@@ -2037,7 +2128,11 @@ function FutaPulseApp() {
     setEventDeleting(true)
     try {
       const result = await apiRequest(`/api/events/${encodeURIComponent(eventId)}`, { method: 'DELETE' }, session.token)
-      setEvents((current) => current.filter((item) => String(getEventId(item)) !== eventId))
+      setEvents((current) => result.cancelled
+        ? current.map((item) => String(getEventId(item)) === eventId
+          ? { ...item, status: 'Cancelled', cancelledAt: new Date().toISOString() }
+          : item)
+        : current.filter((item) => String(getEventId(item)) !== eventId))
       setGoingIds((current) => {
         const next = current.filter((id) => String(id) !== eventId)
           return next
@@ -2064,7 +2159,7 @@ function FutaPulseApp() {
       } catch { /* The server deletion already succeeded. */ }
       if (String(getEventId(detailEvent || {})) === eventId) setDetailEvent(null)
       setEventDeleteTarget(null)
-      notify(result.message || (event.status === 'Draft' ? 'Draft deleted.' : 'Event deleted.'), 'success')
+      notify(result.message || (result.cancelled ? 'Event cancelled.' : event.status === 'Draft' ? 'Draft deleted.' : 'Event removed.'), 'success')
     } catch (error) {
       notify(error.message || 'Unable to delete this event right now.', 'error')
     } finally {
@@ -2292,7 +2387,7 @@ function FutaPulseApp() {
                     {(hotEvent || loading) && <section className="feed-section hot-section" ref={(node) => { homeSectionRefs.current.hot = node }}>
                       <h2 className="home-row-heading"><button type="button" className="home-row-button home-hot-button" aria-label={`Show all hot events, ${hotEventCount} ${hotEventCount === 1 ? 'event' : 'events'}`} onClick={() => openCategoryFeed('hot')}><span className="home-row-button-title"><span className="pulse-dot" />🔥 HOT EVENT ON CAMPUS</span><span className="home-row-count">{hotEventCount} {hotEventCount === 1 ? 'event' : 'events'}</span><span className="home-row-arrow-area"><ChevronRight size={22} /></span></button></h2>
                       {loading && !hotEvent ? <p className="feed-state">Loading live campus feed…</p>
-                        : hotEvent ? <div ref={hotCarouselRef} {...autoScrollInteractionProps('hot')} className={`home-event-track home-featured-track ${hotEvents.length ? 'has-many' : 'has-one'}`} aria-label="Hot events">{[hotEvent, ...hotEvents].slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-featured-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
+                        : hotEvent ? <div ref={hotCarouselRef} {...autoScrollInteractionProps('hot')} className={`home-event-track home-featured-track ${hotEvents.length ? 'has-many' : 'has-one'}`} aria-label="Hot events">{[hotEvent, ...hotEvents].slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-featured-preview" event={event} onView={recordEventView} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
                           : loadError ? <p className="feed-error" role="alert">{loadError}</p> : <p className="feed-state">No events are available yet.</p>}
                       {loadError && hotEvent && <p className="feed-error" role="status">Showing saved campus events while offline.</p>}
                     </section>}
@@ -2301,7 +2396,7 @@ function FutaPulseApp() {
                       <section className="feed-section home-category-section" ref={(node) => { homeSectionRefs.current[category.id] = node }}>
                         <h2 className="home-row-heading"><button type="button" className={`home-row-button home-category-heading home-category-heading-${category.id}`} aria-label={`Show all ${category.label} events, ${category.events.length} ${category.events.length === 1 ? 'event' : 'events'}`} onClick={() => openCategoryFeed(category.id)}><span className="home-row-button-title">{category.label}</span><span className="home-row-count">{category.events.length} {category.events.length === 1 ? 'event' : 'events'}</span><span className="home-row-arrow-area"><ChevronRight size={22} /></span></button></h2>
                         {category.events.length
-                          ? <div className="home-event-track">{category.events.slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-category-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
+                          ? <div className="home-event-track">{category.events.slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-category-preview" event={event} onView={recordEventView} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
                           : <div className="home-category-empty-track"><div className="home-category-empty-card"><span className="home-category-empty-mark"><Sparkles size={18} aria-hidden="true" /></span><strong>No {category.label} events yet</strong><span>Check back as campus events are added.</span></div></div>}
                       </section>
                       {(categoryIndex + 1) % 2 === 0 && <AdSlot placement="home-category-pairs" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
@@ -2327,7 +2422,7 @@ function FutaPulseApp() {
                         : publishedEvents.filter((event) => (expandedHomeCategory === 'all' || event.category === expandedHomeCategory) && matchesProfileAudience(event, profile))
                       return fullEvents.length ? <>{fullEvents.slice(0, visibleFullFeedCount).map((event, index) => <Fragment key={getEventId(event)}>
                         <div id={`home-full-event-${getEventId(event)}`} className={`home-full-event-anchor ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''}`}>
-                          <LazyEventCard isHot={expandedHomeCategory === 'hot' || event.isHot === true || getHotScore(event) >= 10} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
+                          <LazyEventCard isHot={expandedHomeCategory === 'hot' || event.isHot === true || getHotScore(event) >= 10} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
                         </div>
                         {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <AdSlot placement="category-full-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
                       </Fragment>)}{visibleFullFeedCount < fullEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleFullFeedCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more events</button>}</> : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon">◌</span><strong>No events in this section yet</strong><span>Try another category to explore campus activity.</span></div><AdSlot placement="category-empty-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} /></>
@@ -2400,6 +2495,7 @@ function FutaPulseApp() {
                           key={getEventId(event)}
                           homeVariant="home-category-preview"
                           event={{ ...event, isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))) }}
+                          onView={recordEventView}
                           onOpen={() => { rememberSearch(search); setSearchFocused(false); openCategoryFeed(event.category, getEventId(event)) }}
                         />
                       ))}
@@ -2415,7 +2511,7 @@ function FutaPulseApp() {
                   <button type="button" className="home-row-button home-hot-button" aria-label={`Show all hot events, ${hotEventCount} ${hotEventCount === 1 ? 'event' : 'events'}`} onClick={() => openCategoryFeed('hot')}><span className="home-row-button-title"><span className="pulse-dot" />🔥 HOT EVENT ON CAMPUS</span><span className="home-row-count">{hotEventCount} {hotEventCount === 1 ? 'event' : 'events'}</span><span className="home-row-arrow-area"><ChevronRight size={22} /></span></button>
                 </div>
                 {loading && !hotEvent ? <p className="feed-state">Loading trending events…</p>
-                  : hotEvent ? <div ref={hotCarouselRef} {...autoScrollInteractionProps('hot')} className={`home-event-track home-featured-track ${hotEvents.length ? 'has-many' : 'has-one'}`} aria-label="Hot events">{[hotEvent, ...hotEvents].slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-featured-preview" event={event} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
+                  : hotEvent ? <div ref={hotCarouselRef} {...autoScrollInteractionProps('hot')} className={`home-event-track home-featured-track ${hotEvents.length ? 'has-many' : 'has-one'}`} aria-label="Hot events">{[hotEvent, ...hotEvents].slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-featured-preview" event={event} onView={recordEventView} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
                     : loadError ? <p className="feed-error" role="alert">{loadError}</p> : <p className="feed-state">No events are available yet.</p>}
                 {loadError && hotEvent && <p className="feed-error" role="status">Showing saved campus events while offline.</p>}
               </section>
@@ -2454,6 +2550,7 @@ function FutaPulseApp() {
                             key={getEventId(event)}
                             event={{ ...event, startTime: getStartTime(event), isGoing: true, isReminded: false }}
                             viewerProfile={profile}
+                            onView={recordEventView}
                             onComing={(id) => handleRsvp(id)}
                             onRemind={(id) => setReminderTarget(String(id))}
                             onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }}
@@ -2479,6 +2576,7 @@ function FutaPulseApp() {
                             key={getEventId(event)}
                             event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: true }}
                             viewerProfile={profile}
+                            onView={recordEventView}
                             onComing={(id) => handleRsvp(id)}
                             onRemind={(id) => setReminderTarget(String(id))}
                             onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }}
@@ -2574,20 +2672,75 @@ function FutaPulseApp() {
                   </div>
                   <p className="organizer-swipe-hint">Swipe left or right to switch between Events and Drafts.</p>
                   {organizerEvents.length ? <div className="profile-events-list">
-                    {organizerEvents.slice(0, visibleOrganizerCount).map((event) => <article key={getEventId(event)} className="profile-event-item">
-                      <div className="profile-event-item-left"><span className={`profile-event-accent-bar ${event.category}`} /><div className="profile-event-info"><span className={`profile-item-badge ${event.status === 'Draft' ? 'draft' : 'published'}`}>{event.status}</span><strong>{event.title}</strong><span>{event.venue || 'Venue not set'} · {event.date ? new Date(event.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'Date not set'}</span></div></div>
-                      {organizerTab === 'events' && event.status !== 'Cancelled' && hasEventEnded(event, clockNow) && clockNow - Date.parse(event.endTime || '') <= 7 * 24 * 60 * 60_000 && (
-                        <div className="profile-recap-prompt">
-                          <span>{event.recapPhotos?.length ? `${event.recapPhotos.length}/5 recap photos shared` : 'Your event has ended. Share a few look-back photos?'}</span>
-                          {(event.recapPhotos?.length || 0) < 5 && <button type="button" disabled={recapUploading} onClick={() => { setRecapUploadTarget(event); window.setTimeout(() => recapPhotoInput.current?.click(), 0) }}>{recapUploading ? 'Uploading…' : '＋ Add recap photos'}</button>}
-                        </div>
-                      )}
-                      {String(event.createdByUserId) === String(user.id) && <div className="profile-event-actions">
-                        {['Published', 'Live'].includes(event.status) && <button type="button" className="btn-item-edit" onClick={() => { setOrganizerBroadcastTarget(event); setOrganizerBroadcastText('') }}>Broadcast</button>}
-                        <button type="button" className="btn-item-edit" onClick={() => { setEventDuplicateState({ code: '', matches: [] }); setEventEditor(event) }}>Edit</button>
-                        <button type="button" className="btn-item-delete" onClick={() => setEventDeleteTarget(event)} aria-label={`${['Published', 'Live'].includes(event.status) ? 'Cancel' : 'Delete'} ${event.status === 'Draft' ? 'draft' : 'event'} ${event.title}`}><Trash2 size={17} /><span>{['Published', 'Live'].includes(event.status) ? 'Cancel' : 'Delete'}</span></button>
-                      </div>}
-                    </article>)}
+                    {organizerEvents.slice(0, visibleOrganizerCount).map((event) => {
+                      const startAt = Date.parse(getStartTime(event))
+                      const endAt = Date.parse(event.endTime || '')
+                      const isEnded = Number.isFinite(endAt) && endAt <= clockNow
+                      const isUpcoming = Number.isFinite(startAt) && startAt > clockNow && !isEnded
+                      const isLive = Number.isFinite(startAt) && startAt <= clockNow && Number.isFinite(endAt) && endAt > clockNow
+                      const isCancelled = event.status === 'Cancelled'
+                      const cancelledAt = Date.parse(event.cancelledAt || '')
+                      const recapWindowOpen = event.status !== 'Cancelled' && isEnded && clockNow - endAt <= 7 * 24 * 60 * 60_000
+                      const cancelledArchiveOpen = isCancelled && Number.isFinite(cancelledAt)
+                        && clockNow - cancelledAt <= 7 * 24 * 60 * 60_000
+                      const profileArchiveOpen = recapWindowOpen || cancelledArchiveOpen
+                      const isActiveEvent = ['Published', 'Live'].includes(event.status)
+                      const canUploadRecap = organizerTab === 'events'
+                        && isActiveEvent
+                        && recapWindowOpen
+                        && recapUploadConfigured === true
+                        && (event.recapPhotos?.length || 0) < 5
+                      const ownerEvent = String(event.createdByUserId) === String(user.id)
+                      const isDraft = event.status === 'Draft'
+                      return (
+                        <article id={`profile-event-${getEventId(event)}`} key={getEventId(event)} className={`profile-event-item ${profileArchiveOpen ? 'is-event-ended' : ''}`}>
+                          <div className="profile-event-item-left">
+                            <span className={`profile-event-accent-bar ${event.category}`} />
+                            <div className="profile-event-info">
+                              <span className={`profile-item-badge ${isDraft ? 'draft' : isCancelled || (isEnded && isActiveEvent) ? 'ended' : isLive && isActiveEvent ? 'live' : 'published'}`}>{isCancelled ? 'Cancelled' : isEnded && isActiveEvent ? 'Ended' : isLive && isActiveEvent ? 'Live' : event.status}</span>
+                              <div className="profile-event-title-row">
+                                <strong>{event.title}</strong>
+                                {organizerTab === 'events' && isUpcoming && isActiveEvent && <span className="profile-event-view-count" title="Unique signed-in viewers"><Eye size={13} aria-hidden="true" /> {Number(event.viewCount) || 0} {Number(event.viewCount) === 1 ? 'view' : 'views'}</span>}
+                              </div>
+                              <span>{event.venue || 'Venue not set'} · {event.date ? new Date(event.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'Date not set'}</span>
+                            </div>
+                          </div>
+                          {organizerTab === 'events' && recapWindowOpen && !event.recapPromptDismissed && (
+                            <div className="profile-recap-prompt">
+                              <span>{event.recapPhotos?.length ? `${event.recapPhotos.length}/5 recap photos shared` : 'Your event has ended. Share a few look-back photos?'}</span>
+                              <button type="button" className="profile-recap-dismiss" aria-label={`Dismiss recap prompt for ${event.title}`} onClick={() => { void dismissRecapPrompt(event) }}><X size={15} /><span>Not now</span></button>
+                            </div>
+                          )}
+                          {organizerTab === 'events' && recapWindowOpen && recapUploadConfigured === false && (
+                            <p className="profile-recap-unavailable" role="status">Look-back photo uploads are temporarily unavailable. {recapUploadMissingVariables.length ? `Check these Render variables: ${recapUploadMissingVariables.join(', ')}.` : 'Check the Cloudinary configuration in Render and redeploy the server.'}</p>
+                          )}
+                          {ownerEvent && <div className={`profile-event-actions ${canUploadRecap && recapWindowOpen ? 'profile-ended-actions' : ''}`}>
+                            {isDraft && <>
+                              <button type="button" className="btn-item-edit" onClick={() => { setEventDuplicateState({ code: '', matches: [] }); setEventEditor(event) }}>Edit</button>
+                              <button type="button" className="btn-item-delete" onClick={() => setEventDeleteTarget(event)} aria-label={`Delete draft ${event.title}`}><Trash2 size={17} /><span>Delete</span></button>
+                            </>}
+                            {organizerTab === 'events' && isActiveEvent && isUpcoming && <>
+                              <button type="button" className="btn-item-edit" onClick={() => { setOrganizerBroadcastTarget(event); setOrganizerBroadcastText('') }}>Broadcast</button>
+                              <button type="button" className="btn-item-edit" onClick={() => { setEventDuplicateState({ code: '', matches: [] }); setEventEditor(event) }}>Edit</button>
+                              <button type="button" className="btn-item-delete" onClick={() => setEventDeleteTarget(event)} aria-label={`Cancel event ${event.title}`}><Trash2 size={17} /><span>Cancel</span></button>
+                            </>}
+                            {organizerTab === 'events' && isActiveEvent && isLive && (
+                              <button type="button" className="btn-item-edit" onClick={() => { setOrganizerBroadcastTarget(event); setOrganizerBroadcastText('') }}>Broadcast</button>
+                            )}
+                            {canUploadRecap && (
+                              <button type="button" className="btn-item-edit profile-recap-upload" disabled={recapUploading} onClick={() => { setRecapUploadTarget(event); setRecapPhotoFiles([]); window.setTimeout(() => { if (recapPhotoInput.current) recapPhotoInput.current.value = ''; recapPhotoInput.current?.click() }, 0) }}>
+                                {recapUploading ? 'Uploading…' : 'Upload look-back photos'}
+                              </button>
+                            )}
+                            {organizerTab === 'events' && (isCancelled || (isEnded && isActiveEvent)) && profileArchiveOpen && (
+                              <button type="button" className="btn-item-delete profile-event-remove" onClick={() => setEventDeleteTarget(event)} aria-label={`Remove ${event.title} from your profile`}>
+                                <Trash2 size={16} /><span>Remove</span>
+                              </button>
+                            )}
+                          </div>}
+                        </article>
+                      )
+                    })}
                     {visibleOrganizerCount < organizerEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleOrganizerCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more</button>}
                   </div> : <p className="profile-events-empty">{organizerTab === 'events' ? 'No uploaded events yet. Create your first campus event!' : 'No saved drafts. All your events have been published.'}</p>}
               </section>
@@ -2707,8 +2860,30 @@ function FutaPulseApp() {
         accept="image/jpeg,image/webp"
         multiple
         hidden
-        onChange={(event) => { void uploadEventRecap(Array.from(event.target.files || [])) }}
+        onChange={(event) => { setRecapPhotoFiles(Array.from(event.target.files || [])); event.target.value = '' }}
       />
+
+      {recapUploadTarget && (
+        <div className="modal-backdrop recap-upload-backdrop" role="presentation" onMouseDown={(event) => { if (!recapUploading && event.target === event.currentTarget) { setRecapUploadTarget(null); setRecapPhotoFiles([]) } }}>
+          <section className="recap-upload-modal" role="dialog" aria-modal="true" aria-labelledby="recap-upload-title">
+            <span className="explore-eyebrow">EVENT LOOK-BACK</span>
+            <h2 id="recap-upload-title">Share the recap</h2>
+            <p>Choose up to {Math.max(0, 5 - (recapUploadTarget.recapPhotos?.length || 0))} more JPEG or WebP photos for <strong>{recapUploadTarget.title}</strong>. Photos are posted when you select “Post photos”.</p>
+            {recapPhotoFiles.length > 0 ? (
+              <ul className="recap-upload-file-list">
+                {recapPhotoFiles.map((file, index) => <li key={`${file.name}-${file.lastModified}-${index}`}>{file.name}<span>{(file.size / (1024 * 1024)).toFixed(1)} MB</span></li>)}
+              </ul>
+            ) : <p className="recap-upload-empty">No photos selected yet.</p>}
+            <div className="recap-upload-actions">
+              <button type="button" className="profile-edit-pill" disabled={recapUploading} onClick={chooseRecapPhotos}>Choose photos</button>
+              <button type="button" className="setup-submit" disabled={recapUploading || !recapPhotoFiles.length || recapPhotoFiles.length + (recapUploadTarget.recapPhotos?.length || 0) > 5} onClick={() => { void uploadEventRecap() }}>
+                {recapUploading ? 'Posting photos…' : 'Post photos'} <span>→</span>
+              </button>
+              <button type="button" className="modal-close-btn" disabled={recapUploading} onClick={() => { setRecapUploadTarget(null); setRecapPhotoFiles([]) }}>Cancel</button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {reminderTarget && (
         <div className="modal-backdrop reminder-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setReminderTarget(null) }}>
@@ -2743,6 +2918,7 @@ function FutaPulseApp() {
             <LazyEventCard
               event={{ ...detailEvent, startTime: getStartTime(detailEvent), isGoing: Boolean(detailEvent.isGoing ?? goingIds.includes(String(getEventId(detailEvent)))), isReminded: reminderIds.includes(String(getEventId(detailEvent))) }}
               viewerProfile={profile}
+              onView={recordEventView}
               onComing={(id) => handleRsvp(id)}
               onRemind={(id) => setReminderTarget(String(id))}
               onReport={() => { setReportTarget(detailEvent); setReportReason('inappropriate'); setReportDetails('') }}
@@ -2846,6 +3022,29 @@ function FutaPulseApp() {
                 )}
                 {settingsPage === 'notifications' && <>
                   <span className="explore-eyebrow">YOUR ALERTS</span><h2>Notification preferences</h2>
+                  <section className="notification-delivery-status" aria-live="polite">
+                    <h3>Background alerts on this device</h3>
+                    {notificationDeliveryLoading && <p>Checking server and device readiness…</p>}
+                    {notificationDeliveryError && <p className="notification-delivery-error" role="alert">{notificationDeliveryError}</p>}
+                    {!notificationDeliveryLoading && !notificationDeliveryError && notificationDeliveryStatus && <>
+                      <p>Device permission: <strong>{currentNotificationDeliveryPermission === 'granted' ? 'Granted' : currentNotificationDeliveryPermission === 'denied' ? 'Blocked' : currentNotificationDeliveryPermission === 'unsupported' ? 'Not supported by this browser' : 'Not enabled'}</strong></p>
+                      <p>Server push service: <strong>{notificationDeliveryStatus.pushConfigured ? 'Configured' : 'Not configured'}</strong></p>
+                      <p>Device registration: <strong>{notificationDeliveryStatus.deviceRegistered ? 'Registered' : 'Not registered'}</strong></p>
+                      <p>Shared notification queue: <strong>{notificationDeliveryStatus.durableSchedulingAvailable ? 'Available' : 'Unavailable'}</strong></p>
+                      {!notificationDeliveryStatus.pushConfigured
+                        ? <p>Background alerts require Web Push credentials on the server and notification permission on this device.</p>
+                        : !notificationDeliveryStatus.durableSchedulingAvailable
+                          ? <p>Background reminders and queued alerts also require the shared MongoDB notification queue.</p>
+                        : notificationDeliveryPermission !== 'granted'
+                          ? <p>Allow notifications in your browser or device settings, then enable push on this device.</p>
+                          : !notificationDeliveryStatus.deviceRegistered
+                            ? <p>This device has permission but is not registered with the server yet.</p>
+                            : <p>Background push is configured for this device. Delivery still depends on network and operating-system settings.</p>}
+                    </>}
+                    <button type="button" className="profile-edit-pill" onClick={() => { void enablePushNotifications() }} disabled={notificationDeliveryLoading}>
+                      {currentNotificationDeliveryPermission === 'granted' ? 'Refresh / register this device' : 'Enable push on this device'}
+                    </button>
+                  </section>
                   {CATEGORY_DATA.map(({ id, label }) => (
                     <label key={id} className="preference-toggle">
                       <span>{label} events</span>
@@ -2911,11 +3110,15 @@ function FutaPulseApp() {
         <div className="modal-backdrop event-delete-backdrop" role="presentation" onMouseDown={(event) => { if (!eventDeleting && event.target === event.currentTarget) setEventDeleteTarget(null) }}>
           <section className="event-delete-modal glass-panel" role="dialog" aria-modal="true" aria-labelledby="delete-event-title">
             <span className="event-delete-icon"><Trash2 size={22} /></span>
-            <h2 id="delete-event-title">{eventDeleteTarget.status === 'Draft' ? 'Delete this draft?' : 'Cancel this event?'}</h2>
-            <p><strong>{eventDeleteTarget.title || 'Untitled draft'}</strong>{eventDeleteTarget.status === 'Draft' ? ' will be permanently deleted.' : ' will be marked as cancelled, attendees will be notified, and a temporary cancellation notice will remain visible.'}</p>
+            <h2 id="delete-event-title">{eventDeleteTarget.status === 'Draft' ? 'Delete this draft?' : eventDeleteTarget.status === 'Cancelled' || Date.parse(eventDeleteTarget.endTime || '') <= clockNow ? 'Remove this event?' : 'Cancel this event?'}</h2>
+            <p><strong>{eventDeleteTarget.title || 'Untitled draft'}</strong>{eventDeleteTarget.status === 'Draft'
+              ? ' will be permanently deleted.'
+              : eventDeleteTarget.status === 'Cancelled' || Date.parse(eventDeleteTarget.endTime || '') <= clockNow
+                ? ' will be permanently removed from your profile. This cannot be undone.'
+                : ' will be removed from the public feed immediately. Attendees will be notified, and you can refer to it in your profile for seven days.'}</p>
             <div className="event-delete-actions">
               <button type="button" className="profile-edit-pill" onClick={() => setEventDeleteTarget(null)} disabled={eventDeleting}>Keep it</button>
-              <button type="button" className="delete-account-submit" onClick={() => { void deleteOwnedEvent(eventDeleteTarget) }} disabled={eventDeleting}>{eventDeleting ? 'Saving…' : eventDeleteTarget.status === 'Draft' ? 'Delete permanently' : 'Confirm cancellation'}</button>
+              <button type="button" className="delete-account-submit" onClick={() => { void deleteOwnedEvent(eventDeleteTarget) }} disabled={eventDeleting}>{eventDeleting ? 'Saving…' : eventDeleteTarget.status === 'Draft' || eventDeleteTarget.status === 'Cancelled' || Date.parse(eventDeleteTarget.endTime || '') <= clockNow ? 'Remove permanently' : 'Cancel event'}</button>
             </div>
           </section>
         </div>

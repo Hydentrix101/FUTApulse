@@ -16,7 +16,7 @@ export default function PwaExperience() {
   const [installPrompt, setInstallPrompt] = useState(null)
   const [installed, setInstalled] = useState(isStandalone)
   const [installDismissed, setInstallDismissed] = useState(false)
-  const [showAppleInstructions, setShowAppleInstructions] = useState(false)
+  const [showInstallInstructions, setShowInstallInstructions] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
   const {
     offlineReady: [offlineReady, setOfflineReady],
@@ -52,12 +52,12 @@ export default function PwaExperience() {
     }
   }, [])
 
-  const appleInstallAvailable = isAppleMobileDevice() && !installed
-  const showInstall = !installed && !installDismissed && (installPrompt || appleInstallAvailable)
+  const manualInstallAvailable = !installed && !installPrompt
+  const showInstall = !installed && !installDismissed
 
   async function installApp() {
     if (!installPrompt) {
-      setShowAppleInstructions(true)
+      setShowInstallInstructions(true)
       return
     }
     try {
@@ -70,6 +70,13 @@ export default function PwaExperience() {
       console.error('FUTApulse installation prompt failed.', error)
       setErrorMessage('Installation could not start. Please try again from your browser menu.')
     }
+  }
+
+  function getInstallInstructions() {
+    if (isAppleMobileDevice()) return 'In Safari, tap Share, then choose “Add to Home Screen”.'
+    if (/Android/i.test(navigator.userAgent)) return 'Open your browser menu (⋮), then choose “Install app” or “Add to Home screen”.'
+    if (/Edg|Chrome/i.test(navigator.userAgent)) return 'Use the install icon in the address bar or choose “Install FUTApulse” from your browser menu.'
+    return 'Open your browser menu and choose “Install app” or “Add to Home Screen” if available.'
   }
 
   async function applyUpdate() {
@@ -88,19 +95,19 @@ export default function PwaExperience() {
           <div className="pwa-prompt-icon"><Download size={19} aria-hidden="true" /></div>
           <div className="pwa-prompt-copy">
             <strong>Take FUTApulse with you</strong>
-            <span>{appleInstallAvailable && !installPrompt ? 'Install FUTApulse on your Home Screen for quick access.' : 'Install FUTApulse for a fast, app-like campus experience.'}</span>
+            <span>{manualInstallAvailable ? 'Add FUTApulse to your device for a faster, app-like experience.' : 'Install FUTApulse for a fast, app-like campus experience.'}</span>
           </div>
-          <button className="pwa-action-button" type="button" onClick={installApp}>Install</button>
+          <button className="pwa-action-button" type="button" onClick={installApp}>{manualInstallAvailable ? 'How to install' : 'Install'}</button>
           <button className="pwa-dismiss-button" type="button" aria-label="Dismiss install prompt" onClick={() => setInstallDismissed(true)}><X size={17} /></button>
         </section>
       )}
-      {showAppleInstructions && (
-        <section className="pwa-prompt-card pwa-instructions" aria-label="Add FUTApulse to your Home Screen">
+      {showInstallInstructions && (
+        <section className="pwa-prompt-card pwa-instructions" aria-label="Install FUTApulse instructions">
           <div className="pwa-prompt-copy">
-            <strong>Add to Home Screen</strong>
-            <span>In Safari, tap Share, then choose “Add to Home Screen”.</span>
+            <strong>Install FUTApulse</strong>
+            <span>{getInstallInstructions()}</span>
           </div>
-          <button className="pwa-dismiss-button" type="button" aria-label="Close install instructions" onClick={() => setShowAppleInstructions(false)}><X size={17} /></button>
+          <button className="pwa-dismiss-button" type="button" aria-label="Close install instructions" onClick={() => setShowInstallInstructions(false)}><X size={17} /></button>
         </section>
       )}
       {offlineReady && (

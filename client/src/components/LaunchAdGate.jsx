@@ -1,28 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, SkipForward } from 'lucide-react'
 import HouseSponsorCard from './HouseSponsorCard'
-import { dismissLaunchAd, preloadLaunchAd, showLaunchAd } from '../ads/adProviderAdapter'
-import { mobileAdsConfig } from '../config/mobileAds'
 
-const LOAD_TIMEOUT_MS = 2500
-const MAX_NATIVE_AD_MS = 120000
 const SKIP_AFTER_MS = 5000
-const launchVideoUrl = mobileAdsConfig.isAdsLive
+const launchVideoUrl = String(import.meta.env.VITE_IS_ADS_LIVE || '').toLowerCase() === 'true'
   ? String(import.meta.env.VITE_LAUNCH_AD_VIDEO_URL || '').trim()
   : ''
 
-function withTimeout(promise, timeoutMs) {
-  let timer
-  return Promise.race([
-    promise,
-    new Promise((resolve) => {
-      timer = window.setTimeout(() => resolve(false), timeoutMs)
-    }),
-  ]).finally(() => window.clearTimeout(timer))
-}
-
 function LaunchAdGate({ onComplete, onHouseAction }) {
-  const [mode, setMode] = useState('loading')
+  const [mode, setMode] = useState(launchVideoUrl ? 'video' : 'sponsor')
   const [skipAvailable, setSkipAvailable] = useState(false)
   const [skipCountdown, setSkipCountdown] = useState(5)
   const completedRef = useRef(false)
@@ -33,53 +19,18 @@ function LaunchAdGate({ onComplete, onHouseAction }) {
   }, [onComplete])
 
   useEffect(() => {
-    let cancelled = false
-    const finish = () => {
-      if (completedRef.current) return
-      completedRef.current = true
-      onCompleteRef.current()
-    }
     const skipTimer = window.setTimeout(() => setSkipAvailable(true), SKIP_AFTER_MS)
     const countdownTimer = window.setInterval(() => {
       setSkipCountdown((seconds) => Math.max(0, seconds - 1))
     }, 1000)
-    const start = async () => {
-      try {
-        const prepared = await withTimeout(preloadLaunchAd(), LOAD_TIMEOUT_MS)
-        if (cancelled) return
-        if (prepared) {
-          setMode('native')
-          const shown = await withTimeout(showLaunchAd(), MAX_NATIVE_AD_MS)
-          if (cancelled) return
-          if (shown) {
-            finish()
-            return
-          }
-          await dismissLaunchAd().catch(() => {})
-        }
-      } catch {
-        // A missing ad bridge or a no-fill falls through to the configured
-        // launch video, then to the local sponsor card.
-      }
-      if (!cancelled) setMode(launchVideoUrl ? 'video' : 'sponsor')
-    }
-    start()
     return () => {
-      cancelled = true
       window.clearTimeout(skipTimer)
       window.clearInterval(countdownTimer)
     }
   }, [])
 
-  const handleContinue = async () => {
+  const handleContinue = () => {
     if (!skipAvailable || completedRef.current) return
-    if (mode === 'native') {
-      try {
-        await dismissLaunchAd()
-      } catch {
-        // A native dismissal failure must not trap the user at launch.
-      }
-    }
     if (completedRef.current) return
     completedRef.current = true
     onCompleteRef.current()
@@ -110,8 +61,6 @@ function LaunchAdGate({ onComplete, onHouseAction }) {
             />
           )}
           {mode !== 'video' && <HouseSponsorCard launch onAction={onHouseAction} />}
-          {mode === 'native' && <p className="launch-ad-status" role="status">Your sponsor message is playing.</p>}
-          {mode === 'loading' && <p className="launch-ad-status" role="status">Preparing today’s campus sponsor…</p>}
           {mode === 'sponsor' && <p className="launch-ad-status" role="status">Watch the sponsor message or skip when the button becomes available.</p>}
           {skipAvailable ? (
             <button type="button" className="launch-ad-skip" onClick={handleContinue}>
