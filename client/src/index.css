@@ -1694,32 +1694,40 @@ button {
 .home-full-event-anchor.is-below-sticky-filter { scroll-margin-top: 116px; }
 .home-full-feed-title { margin: 0; color: inherit; font-size: 1.25rem; font-weight: 950; }
 .home-full-feed-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.shared-event-signin-banner {
+.event-card-read-only-actions p { margin: 0; color: #cbd5e1; font-size: 0.72rem; font-weight: 700; line-height: 1.35; }
+
+.public-feed-intro {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid rgba(56, 189, 248, 0.42);
-  border-radius: 14px;
-  color: #e0f2fe;
-  background: linear-gradient(105deg, rgba(8, 47, 73, 0.92), rgba(15, 23, 42, 0.92));
+  gap: 18px;
+  max-width: 920px;
+  margin: 0 auto 18px;
+  padding: 18px 20px;
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  border-radius: 20px;
+  color: #172033;
+  background: linear-gradient(120deg, rgba(255, 255, 255, 0.96), rgba(238, 242, 255, 0.92));
+  box-shadow: 0 10px 28px rgba(30, 41, 59, 0.08);
 }
-.shared-event-signin-banner p { margin: 0; font-size: 0.78rem; font-weight: 700; line-height: 1.35; }
-.shared-event-signin-banner button {
-  flex: 0 0 auto;
-  min-height: 38px;
-  padding: 0 12px;
-  border: 1px solid rgba(125, 211, 252, 0.58);
-  border-radius: 999px;
-  color: #082f49;
-  background: #bae6fd;
-  font-size: 0.72rem;
-  font-weight: 900;
-  cursor: pointer;
+.public-feed-intro > div { min-width: 0; }
+.public-feed-intro > div > span { color: #4338ca; font-size: 0.65rem; font-weight: 900; letter-spacing: 0.14em; }
+.public-feed-intro h1 { margin: 5px 0 7px; color: #111827; font-size: clamp(1.15rem, 3vw, 1.55rem); font-weight: 950; line-height: 1.2; }
+.public-feed-intro p { max-width: 650px; margin: 5px 0 0; color: #334155; font-size: 0.78rem; line-height: 1.55; }
+.public-feed-intro nav { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 8px; }
+.public-feed-intro nav a { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; padding: 0 13px; border: 1px solid #c7d2fe; border-radius: 999px; color: #3730a3; background: #fff; font-size: 0.72rem; font-weight: 850; text-decoration: none; }
+.public-feed-intro nav a:first-child { border-color: #4338ca; color: #fff; background: #4338ca; }
+.public-feed-intro nav a:hover { filter: brightness(0.96); }
+.futa-app.theme-dark .public-feed-intro { border-color: rgba(129, 140, 248, 0.35); color: #f8fafc; background: linear-gradient(120deg, rgba(20, 28, 48, 0.98), rgba(30, 27, 75, 0.94)); }
+.futa-app.theme-dark .public-feed-intro > div > span { color: #c4b5fd; }
+.futa-app.theme-dark .public-feed-intro h1 { color: #f8fafc; }
+.futa-app.theme-dark .public-feed-intro p { color: #dbeafe; }
+.futa-app.theme-dark .public-feed-intro nav a { border-color: #64748b; color: #f8fafc; background: #1e293b; }
+.futa-app.theme-dark .public-feed-intro nav a:first-child { border-color: #a5b4fc; color: #1e1b4b; background: #c7d2fe; }
+@media (max-width: 640px) {
+  .public-feed-intro { align-items: stretch; flex-direction: column; padding: 15px; }
+  .public-feed-intro nav a { flex: 1 1 auto; }
 }
-.shared-event-signin-banner button:hover { background: #e0f2fe; }
-.event-card-read-only-actions p { margin: 0; color: #cbd5e1; font-size: 0.72rem; font-weight: 700; line-height: 1.35; }
 
 .section-label {
   display: flex;

@@ -397,15 +397,16 @@ function App() {
 }
 
 function FutaPulseApp() {
-  const hasSharedEventLink = new URLSearchParams(window.location.search).has('event')
+  const initialSearchParams = new URLSearchParams(window.location.search)
+  const requestedAuthMode = initialSearchParams.get('auth')
   const [launchVisible, setLaunchVisible] = useState(true)
   const [launchSequenceReady, setLaunchSequenceReady] = useState(false)
   const [isLaunchAdActive, setIsLaunchAdActive] = useState(false)
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
   const [user, setUser] = useState(null)
-  const [guestSignInRequested, setGuestSignInRequested] = useState(false)
-  const isGuestSharedView = hasSharedEventLink && (!session?.token || !user) && !guestSignInRequested
+  const [guestSignInRequested] = useState(() => initialSearchParams.has('auth'))
+  const isGuestSharedView = (!session?.token || !user) && !guestSignInRequested
   const [profile, setProfile] = useState(null)
   const [profileOpen, setProfileOpen] = useState(false)
   const [profileSaving, setProfileSaving] = useState(false)
@@ -416,9 +417,12 @@ function FutaPulseApp() {
     const knownAccounts = readStored('futapulse-known-accounts', [])
     return Boolean((Array.isArray(knownAccounts) && knownAccounts.length) || readStoredValue('futapulse-remembered-username'))
   })
-  const [activeTab, setActiveTab] = useState(() => new URLSearchParams(window.location.search).has('event')
-    ? 'home'
-    : window.location.hash.replace('#', '') || 'home')
+  const [activeTab, setActiveTab] = useState(() => {
+    const requestedTab = window.location.hash.replace('#', '') || 'home'
+    if (initialSearchParams.has('event')) return 'home'
+    if (!initialSearchParams.has('auth') && !hasRememberedSession() && !['home', 'search'].includes(requestedTab)) return 'home'
+    return requestedTab
+  })
   const tabHistoryRef = useRef([])
   const lastTrackedTabRef = useRef(activeTab)
   const backGuardIdRef = useRef('')
@@ -788,6 +792,49 @@ function FutaPulseApp() {
   }, [])
 
   useEffect(() => {
+    if (window.location.pathname !== '/' || sessionLoading || session?.token || user || guestSignInRequested
+      || launchVisible || !launchSequenceReady || isLaunchAdActive || loading
+      || !events.some((event) => ['Published', 'Live'].includes(event.status))) return undefined
+    if (document.getElementById('futapulse-adsense-script')) return undefined
+
+    const tcfApi = window.__tcfapi
+    if (typeof tcfApi !== 'function') return undefined
+
+    let active = true
+    let listenerId
+    const onConsentReady = (consentData, success) => {
+      if (!active) return
+      if (!success) {
+        console.error('AdSense remains disabled because the consent platform did not return a valid TCF response.')
+        return
+      }
+      if (!consentData || typeof consentData !== 'object') {
+        console.error('AdSense remains disabled because the consent platform returned invalid TCF data.')
+        return
+      }
+      listenerId = consentData.listenerId || listenerId
+      if (!['tcloaded', 'useractioncomplete'].includes(consentData.eventStatus)) return
+      if (document.getElementById('futapulse-adsense-script')) return
+
+      const script = document.createElement('script')
+      script.async = true
+      script.crossOrigin = 'anonymous'
+      script.id = 'futapulse-adsense-script'
+      script.src = 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3245954947133300'
+      script.addEventListener('error', () => {
+        console.error('The Google AdSense script could not be loaded.')
+      }, { once: true })
+      document.head.append(script)
+      if (listenerId) tcfApi('removeEventListener', 2, () => {}, listenerId)
+    }
+    tcfApi('addEventListener', 2, onConsentReady)
+    return () => {
+      active = false
+      if (listenerId) tcfApi('removeEventListener', 2, () => {}, listenerId)
+    }
+  }, [events, guestSignInRequested, isLaunchAdActive, launchSequenceReady, launchVisible, loading, session?.token, sessionLoading, user])
+
+  useEffect(() => {
     if (settingsPage !== 'notifications' || !session?.token) return undefined
     let active = true
     Promise.all([
@@ -879,11 +926,12 @@ function FutaPulseApp() {
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
+      if (!session?.token) return
       const cachedEvents = readInitialEventCache()
       startTransition(() => setEvents((current) => current.length ? current : cachedEvents))
     }, 0)
     return () => window.clearTimeout(timer)
-  }, [])
+  }, [session?.token])
 
   useEffect(() => {
     if (!facultyLogoOpen) return undefined
@@ -1533,7 +1581,7 @@ function FutaPulseApp() {
     }
   }
   const switchTab = (id) => {
-    if (isGuestSharedView && id !== 'home') {
+    if (isGuestSharedView && !['home', 'search'].includes(id)) {
       notify('Sign in to access personal FUTApulse features.', 'info')
       return
     }
@@ -2558,7 +2606,7 @@ function FutaPulseApp() {
         <div className="auth-app-frame">
           <AuthScreen
             initialUsername={rememberedUsername}
-            initialMode={hasDeviceAccount ? 'login' : 'signup'}
+            initialMode={requestedAuthMode === 'login' ? 'login' : requestedAuthMode === 'signup' || !hasDeviceAccount ? 'signup' : 'login'}
             onAuthenticated={(auth, remember, message) => {
               persistSession(auth, remember)
               notify(message, 'success')
@@ -2575,6 +2623,10 @@ function FutaPulseApp() {
         {toast && <Toast toast={toast} onAction={toast.notification ? () => focusNotificationEvent(toast.notification) : undefined} />}
       </div>
     )
+  }
+
+  if (isGuestSharedView && !['home', 'search'].includes(activeTab)) {
+    return <div className={`app-root theme-${theme} session-restore-screen`} role="status" aria-live="polite"><a href="/">Return to public campus events</a></div>
   }
 
   return (
@@ -2624,6 +2676,20 @@ function FutaPulseApp() {
         </header>
 
         <main className="app-main">
+          {isGuestSharedView && (
+            <section className="public-feed-intro" aria-labelledby="public-feed-title">
+              <div>
+                <span>FUTA CAMPUS EVENT DISCOVERY</span>
+                <h1 id="public-feed-title">Campus events at the Federal University of Technology, Akure</h1>
+                <p>FUTApulse helps the FUTA community discover upcoming campus events, explore event details, and plan what to attend.</p>
+                <p>Browse published technology, academic, social, religious, sports, and seminar events. Sign in to save reminders, mark attendance, or publish an event.</p>
+              </div>
+              <nav aria-label="Account options">
+                <a href="/?auth=login">Sign in</a>
+                <a href="/?auth=signup">Create an account</a>
+              </nav>
+            </section>
+          )}
           {activeTab === 'home' && (
             <>
               {homeAnnouncement && (
@@ -2670,10 +2736,6 @@ function FutaPulseApp() {
                       window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 0)
                     }}><ChevronLeft size={18} /> Back to home</button>
                     <div className="home-full-feed-heading"><h1 className="home-full-feed-title">{expandedHomeCategory === 'hot' ? '🔥 Hot Events on Campus' : CATEGORY_DATA.find((item) => item.id === expandedHomeCategory)?.label || 'Events Happening Today & Next 2 Days'}</h1><span className="home-row-count">{expandedFeedEventCount} {expandedFeedEventCount === 1 ? 'event' : 'events'}</span></div>
-                    {isGuestSharedView && <div className="shared-event-signin-banner">
-                      <p>You’re viewing a shared event. Sign in to mark Coming, set reminders, or report it.</p>
-                      <button type="button" onClick={() => setGuestSignInRequested(true)}>Sign in to interact</button>
-                    </div>}
                     {(() => {
                       const fullEvents = expandedHomeCategory === 'hot'
                         ? rankedHotEvents
@@ -3179,6 +3241,7 @@ function FutaPulseApp() {
             <LazyEventCard
               event={{ ...detailEvent, startTime: getStartTime(detailEvent), isGoing: Boolean(detailEvent.isGoing ?? goingIds.includes(String(getEventId(detailEvent)))), isReminded: reminderIds.includes(String(getEventId(detailEvent))) }}
               viewerProfile={profile}
+              readOnly={isGuestSharedView}
               onView={recordEventView}
               onComing={(id) => handleRsvp(id)}
               onRemind={(id) => setReminderTarget(String(id))}
@@ -3505,7 +3568,8 @@ function LegalPage({ page }) {
             <h2>Notifications and device data</h2>
             <p>If you enable browser or Android push notifications, the relevant push service provides a device token or subscription endpoint so FUTApulse can deliver event alerts and reminders. You can disable notifications through your device or browser settings; removing your FUTApulse account also removes its registered push devices and pending notifications.</p>
             <h2>Advertising and cookies</h2>
-            <p>Advertising is not currently enabled in this app; sponsor placements use FUTApulse house content. If third-party advertising such as Google AdSense or AdMob is enabled later, those vendors may use cookies, mobile advertising identifiers, or similar technologies to measure ads and, where permitted by your settings and applicable law, personalize them. Their processing is governed by their own privacy policies. This policy will be updated before third-party ads are activated.</p>
+            <p>FUTApulse loads Google AdSense only on the public campus-event browsing page when published event listings are available and a consent management platform has reported a completed IAB Transparency and Consent Framework (TCF) signal. Sign-in, privacy, terms, and other account-only screens do not load the AdSense script. Third-party vendors, including Google, may use cookies to serve ads based on your prior visits to this site or other websites. Google’s advertising cookies enable Google and its partners to serve ads based on your visits to this site and/or other sites. Learn more in <a href="https://policies.google.com/technologies/ads" target="_blank" rel="noopener noreferrer">Google’s advertising privacy information</a>. You can opt out of personalized advertising in <a href="https://www.google.com/settings/ads" target="_blank" rel="noopener noreferrer">Google Ads Settings</a>; alternatively, visit <a href="https://www.aboutads.info/choices/" target="_blank" rel="noopener noreferrer">aboutads.info choices</a> to opt out of some third-party vendors’ personalized advertising cookies.</p>
+            <p>For users in the European Economic Area, the United Kingdom, and Switzerland, the publisher must configure an applicable Google-certified consent management platform and disclose its selected ad technology providers in the publisher account before serving ads. If the consent platform is not available or has not completed its signal, FUTApulse does not load the AdSense script.</p>
             <h2>How long information is kept and account deletion</h2>
             <p>Account information is kept while the account is active. You can request account deletion from Account &amp; Security Settings. When deletion completes, the active service removes the account, its profile, events it owns, engagement records, registered push devices, and pending notification jobs. Limited backup copies may remain until they are removed under the database provider’s configured backup-retention cycle; the applicable cycle should be confirmed with the service operator. Information required to address abuse, security, or legal obligations may be retained only where permitted or required.</p>
             <h2>Sharing and service providers</h2>
