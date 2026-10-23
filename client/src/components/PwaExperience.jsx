@@ -24,6 +24,7 @@ export default function PwaExperience() {
   const [installPrompt, setInstallPrompt] = useState(null)
   const [installed, setInstalled] = useState(isStandalone)
   const [installDismissed, setInstallDismissed] = useState(false)
+  const [installHelpMessage, setInstallHelpMessage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
   const {
     offlineReady: [offlineReady, setOfflineReady],
@@ -37,7 +38,10 @@ export default function PwaExperience() {
   })
 
   useEffect(() => {
-    const captureInstallPrompt = (event) => setInstallPrompt(event)
+    const captureInstallPrompt = (event) => {
+      setInstallPrompt(event)
+      setInstallHelpMessage('')
+    }
     const markInstalled = () => {
       setInstalled(true)
       pendingInstallPrompt = null
@@ -64,7 +68,18 @@ export default function PwaExperience() {
   async function installApp() {
     const promptEvent = installPrompt || pendingInstallPrompt
     if (!promptEvent) {
-      setErrorMessage('Your browser has not opened its install prompt yet. Open FUTApulse in your phone’s main browser and try Install again.')
+      const userAgent = window.navigator.userAgent
+      const isIOS = /iPad|iPhone|iPod/.test(userAgent)
+        || (window.navigator.platform === 'MacIntel' && window.navigator.maxTouchPoints > 1)
+      const isAndroid = /Android/i.test(userAgent)
+
+      if (isIOS) {
+        setInstallHelpMessage('On iPhone or iPad, tap Share and choose Add to Home Screen. If that option is not shown, open FUTApulse in Safari and try again.')
+      } else if (isAndroid) {
+        setInstallHelpMessage('Chrome has not offered its install prompt yet. In Chrome, open ⋮ and choose Install app or Add to Home screen. If FUTApulse opened inside another app, open it in Chrome first.')
+      } else {
+        setInstallHelpMessage('This browser has not offered its install prompt yet. Check the browser menu for Install FUTApulse or Add to Home screen.')
+      }
       return
     }
     try {
@@ -121,6 +136,15 @@ export default function PwaExperience() {
           </div>
           <button className="pwa-action-button" type="button" onClick={applyUpdate}>Refresh</button>
           <button className="pwa-dismiss-button" type="button" aria-label="Dismiss update prompt" onClick={() => setNeedRefresh(false)}><X size={17} /></button>
+        </section>
+      )}
+      {installHelpMessage && (
+        <section className="pwa-prompt-card pwa-status-card" role="status">
+          <div className="pwa-prompt-copy">
+            <strong>Install from your browser</strong>
+            <span>{installHelpMessage}</span>
+          </div>
+          <button className="pwa-dismiss-button" type="button" aria-label="Dismiss install instructions" onClick={() => setInstallHelpMessage('')}><X size={17} /></button>
         </section>
       )}
       {errorMessage && (
