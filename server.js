@@ -1,12 +1,17 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const http = require("node:http");
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
+const { Server: SocketServer } = require("socket.io");
+const webPush = require("web-push");
+const cloudinary = require("cloudinary").v2;
+const multer = require("multer");
 
 if (fs.existsSync(path.join(__dirname, ".env"))) process.loadEnvFile(path.join(__dirname, ".env"));
 
@@ -17,6 +22,7 @@ const CLIENT_DIST = path.join(ROOT, "client", "dist");
 const DATA_DIR = path.join(ROOT, "data");
 const DATA_FILE = process.env.FUTAPULSE_DATA_FILE || path.join(DATA_DIR, "futapulse.json");
 const app = express();
+const httpServer = http.createServer(app);
 let databaseBackend = "local";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
@@ -59,6 +65,15 @@ function getGooglePopupRedirectUri(request) {
 }
 
 const ALLOWED_CATEGORIES = new Set(["academic", "tech", "social", "religious", "sports", "seminars"]);
+const NOTIFICATION_CATEGORIES = ["academic", "tech", "social", "religious", "sports", "seminars"];
+const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze(Object.fromEntries(NOTIFICATION_CATEGORIES.map((category) => [category, true])));
+
+function normalizeNotificationPreferences(value) {
+  return Object.fromEntries(NOTIFICATION_CATEGORIES.map((category) => [
+    category,
+    typeof value?.[category] === "boolean" ? value[category] : true
+  ]));
+}
 const USERNAME_PATTERN = /^(?=.*\p{L})[\p{L}\p{M}\p{N}_ .'-]{3,24}$/u;
 
 function normalizeUsername(value) {
@@ -273,8 +288,16 @@ function toPublicEvent(event, viewerId = "") {
     attendeeUserIds = [],
     hypedUserIds = [],
     reminderUserIds = [],
+    viewCount,
+    recapPromptDismissed,
     ...publicEvent
   } = event;
+  const endAt = new Date(event.endTime || "");
+  publicEvent.isEnded = Number.isFinite(endAt.getTime()) && endAt.getTime() <= Date.now();
+  if (viewerId && String(event.createdByUserId || "") === String(viewerId)) {
+    if (Number.isFinite(Number(viewCount))) publicEvent.viewCount = Number(viewCount);
+    if (typeof recapPromptDismissed === "boolean") publicEvent.recapPromptDismissed = recapPromptDismissed;
+  }
   if (viewerId) {
     publicEvent.isGoing = Array.isArray(attendeeUserIds) && attendeeUserIds.includes(String(viewerId));
     publicEvent.isHyped = Array.isArray(hypedUserIds) && hypedUserIds.includes(String(viewerId));
@@ -325,6 +348,7 @@ const eventRecordSchema = new mongoose.Schema({
   category: { type: String, required: true, index: true },
   startsAt: { type: Date, default: null, index: true },
   endsAt: { type: Date, default: null, index: true },
+  lastAnnouncementAt: { type: Date, default: null },
   record: { type: mongoose.Schema.Types.Mixed, required: true }
 }, { timestamps: true, minimize: false });
 eventRecordSchema.index({ status: 1, endsAt: 1 });
@@ -335,12 +359,349 @@ const engagementActionSchema = new mongoose.Schema({
   eventId: { type: String, required: true },
   userId: { type: String, required: true },
   type: { type: String, enum: ["rsvp", "flame", "reminder"], required: true },
-  faculty: { type: String, default: "" }
+  faculty: { type: String, default: "" },
+  department: { type: String, default: "" },
+  customReminderAt: { type: Date, default: null }
 }, { timestamps: true });
 engagementActionSchema.index({ eventId: 1, userId: 1, type: 1 }, { unique: true });
 engagementActionSchema.index({ userId: 1, type: 1, updatedAt: -1 });
 const EngagementAction = mongoose.models.FutapulseEngagementAction
   || mongoose.model("FutapulseEngagementAction", engagementActionSchema, "engagement_actions");
+const eventViewSchema = new mongoose.Schema({
+  eventId: { type: String, required: true },
+  userId: { type: String, required: true }
+}, { timestamps: true });
+eventViewSchema.index({ eventId: 1, userId: 1 }, { unique: true });
+eventViewSchema.index({ eventId: 1, createdAt: -1 });
+const EventView = mongoose.models.FutapulseEventView
+  || mongoose.model("FutapulseEventView", eventViewSchema, "event_views");
+const recapPromptDismissalSchema = new mongoose.Schema({
+  eventId: { type: String, required: true },
+  userId: { type: String, required: true },
+  dismissedAt: { type: Date, required: true }
+}, { timestamps: true });
+recapPromptDismissalSchema.index({ eventId: 1, userId: 1 }, { unique: true });
+const RecapPromptDismissal = mongoose.models.FutapulseRecapPromptDismissal
+  || mongoose.model("FutapulseRecapPromptDismissal", recapPromptDismissalSchema, "recap_prompt_dismissals");
+const pushDeviceSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  deviceKey: { type: String, required: true, unique: true },
+  platform: { type: String, enum: ["web"], required: true },
+  endpoint: { type: String, required: true },
+  subscription: { type: mongoose.Schema.Types.Mixed, required: true },
+  enabled: { type: Boolean, default: true, index: true }
+}, { timestamps: true, minimize: false });
+pushDeviceSchema.index({ userId: 1, enabled: 1 });
+const PushDevice = mongoose.models.FutapulsePushDevice
+  || mongoose.model("FutapulsePushDevice", pushDeviceSchema, "push_devices");
+const notificationJobSchema = new mongoose.Schema({
+  idempotencyKey: { type: String, required: true, unique: true },
+  recipientUserId: { type: String, required: true, index: true },
+  eventId: { type: String, default: "" },
+  kind: { type: String, required: true, index: true },
+  payload: { type: mongoose.Schema.Types.Mixed, required: true },
+  dueAt: { type: Date, required: true, index: true },
+  expiresAt: { type: Date, required: true },
+  status: { type: String, enum: ["pending", "processing", "sent", "failed", "cancelled"], default: "pending", index: true },
+  attempts: { type: Number, default: 0 },
+  nextAttemptAt: { type: Date, default: Date.now, index: true },
+  leaseUntil: { type: Date, default: null, index: true },
+  sentAt: { type: Date, default: null },
+  lastError: { type: String, default: "" }
+}, { timestamps: true, minimize: false });
+notificationJobSchema.index({ status: 1, nextAttemptAt: 1, dueAt: 1 });
+notificationJobSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+const NotificationJob = mongoose.models.FutapulseNotificationJob
+  || mongoose.model("FutapulseNotificationJob", notificationJobSchema, "notification_jobs");
+let realtimeServer = null;
+let notificationWorkerTimer = null;
+
+function notificationEventLink(event) {
+  const link = new URL(FRONTEND_URL);
+  link.searchParams.set("event", String(event.id));
+  link.searchParams.set("category", String(event.category || "all"));
+  link.hash = "home";
+  return link.toString();
+}
+
+async function enqueueNotification({ idempotencyKey, recipientUserId, event, kind, title, message, dueAt = new Date(), universal = false }) {
+  if (!isMongoConnected() || !recipientUserId || !event?.id || !idempotencyKey) return null;
+  const now = new Date();
+  const due = new Date(dueAt);
+  if (!Number.isFinite(due.getTime())) throw new Error("Notification dueAt must be a valid date.");
+  const payload = {
+    notificationId: idempotencyKey,
+    kind,
+    title: String(title).slice(0, 100),
+    message: String(message).slice(0, 240),
+    eventId: String(event.id),
+    eventTitle: String(event.title || ""),
+    category: String(event.category || ""),
+    venue: String(event.venue || ""),
+    url: notificationEventLink(event),
+    universal: universal === true
+  };
+  try {
+    return await NotificationJob.findOneAndUpdate(
+      { idempotencyKey },
+      {
+        $setOnInsert: {
+          idempotencyKey,
+          recipientUserId: String(recipientUserId),
+          eventId: String(event.id),
+          kind,
+          payload,
+          dueAt: due,
+          expiresAt: new Date(Math.max(now.getTime(), due.getTime()) + (8 * 24 * 60 * 60 * 1000)),
+          status: "pending",
+          attempts: 0,
+          nextAttemptAt: due,
+          leaseUntil: null,
+          sentAt: null,
+          lastError: ""
+        }
+      },
+      { upsert: true, new: true }
+    ).exec();
+  } catch (error) {
+    if (error.code === 11000) return null;
+    throw error;
+  }
+}
+
+async function enqueueNotifications(userIds, details) {
+  const uniqueIds = [...new Set((userIds || []).map(String).filter(Boolean))];
+  await Promise.all(uniqueIds.map((recipientUserId) => enqueueNotification({
+    ...details,
+    recipientUserId,
+    idempotencyKey: `${details.idempotencyKey}:${recipientUserId}`
+  })));
+}
+
+async function enqueueCategoryAlert(event, kind = "new-event") {
+  if (!isMongoConnected() || !event?.category) return;
+  const category = String(event.category).toLowerCase();
+  if (!NOTIFICATION_CATEGORIES.includes(category)) return;
+  const users = await User.find({
+    emailVerified: true,
+    [`profile.notificationPreferences.${category}`]: { $ne: false }
+  }).select("_id").lean().exec();
+  const categoryName = ({
+    academic: "Academic",
+    tech: "Tech & Innovation",
+    social: "Social & Vibes",
+    religious: "Religious & Fellowship",
+    sports: "Sports & Athletics",
+    seminars: "Seminars"
+  })[category];
+  await enqueueNotifications(users.map((item) => item._id), {
+    idempotencyKey: `${kind}:${event.id}`,
+    event,
+    kind,
+    title: `New ${categoryName} Event Uploaded!`,
+    message: `A new ${categoryName} event is now on campus. Tap to check it out.`
+  });
+}
+
+async function scheduleEventEndedRecapPrompt(event) {
+  if (!isMongoConnected() || !event?.id) return;
+  const eventId = String(event.id);
+  if (!event.createdByUserId || !["Published", "Live"].includes(event.status)) {
+    await cancelEventEndedRecapPrompts(eventId);
+    return;
+  }
+  const endTime = new Date(event.endTime || "");
+  if (!Number.isFinite(endTime.getTime()) || Date.now() - endTime.getTime() > 7 * 24 * 60 * 60_000) {
+    await cancelEventEndedRecapPrompts(eventId);
+    return;
+  }
+  const recipientUserId = String(event.createdByUserId);
+  const idempotencyKey = `event-ended-recap:${eventId}:${endTime.toISOString()}`;
+  const existing = await NotificationJob.findOne({ idempotencyKey }).exec();
+  if (existing?.status === "sent") return;
+
+  const dueAt = endTime.getTime() > Date.now() ? endTime : new Date();
+  const payload = {
+    notificationId: idempotencyKey,
+    kind: "event-ended-recap-prompt",
+    title: "Your event has ended",
+    message: `${String(event.title || "Your event").slice(0, 100)} has ended. Upload look-back photos to share the recap.`,
+    eventId,
+    eventTitle: String(event.title || ""),
+    category: String(event.category || ""),
+    venue: String(event.venue || ""),
+    url: notificationEventLink(event),
+    universal: false
+  };
+
+  await NotificationJob.updateMany({
+    eventId,
+    kind: "event-ended-recap-prompt",
+    idempotencyKey: { $ne: idempotencyKey },
+    status: { $in: ["pending", "processing"] }
+  }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
+
+  if (existing) {
+    existing.payload = payload;
+    existing.dueAt = dueAt;
+    existing.expiresAt = new Date(Math.max(Date.now(), dueAt.getTime()) + (8 * 24 * 60 * 60_000));
+    existing.nextAttemptAt = dueAt;
+    existing.status = "pending";
+    existing.attempts = 0;
+    existing.leaseUntil = null;
+    existing.lastError = "";
+    await existing.save();
+    return;
+  }
+  await enqueueNotification({
+    idempotencyKey,
+    recipientUserId,
+    event,
+    kind: "event-ended-recap-prompt",
+    title: payload.title,
+    message: payload.message,
+    dueAt
+  });
+}
+
+async function cancelEventEndedRecapPrompts(eventId) {
+  if (!isMongoConnected()) {
+    const database = readDatabase();
+    database.notificationJobs = (database.notificationJobs || []).map((job) => (
+      String(job.eventId) === String(eventId) && job.kind === "event-ended-recap-prompt"
+        && ["pending", "processing"].includes(job.status)
+        ? { ...job, status: "cancelled", leaseUntil: null }
+        : job
+    ));
+    writeDatabase(database);
+    return;
+  }
+  await NotificationJob.updateMany({
+    eventId: String(eventId),
+    kind: "event-ended-recap-prompt",
+    status: { $in: ["pending", "processing"] }
+  }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
+}
+
+function initializePushProviders() {
+  if (process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY) {
+    webPush.setVapidDetails(
+      process.env.WEB_PUSH_SUBJECT || "mailto:notifications@futapulse.app",
+      process.env.WEB_PUSH_PUBLIC_KEY,
+      process.env.WEB_PUSH_PRIVATE_KEY
+    );
+  }
+}
+
+function configureCloudinary() {
+  const { CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET } = process.env;
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) return false;
+  cloudinary.config({
+    cloud_name: CLOUDINARY_CLOUD_NAME,
+    api_key: CLOUDINARY_API_KEY,
+    api_secret: CLOUDINARY_API_SECRET,
+    secure: true
+  });
+  return true;
+}
+
+function getMissingCloudinaryVariables() {
+  return ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
+    .filter((variable) => !process.env[variable]);
+}
+
+const recapImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 5, fileSize: 5 * 1024 * 1024 },
+  fileFilter: (request, file, callback) => {
+    if (!["image/jpeg", "image/webp"].includes(file.mimetype)) {
+      callback(new Error("Recap photos must be JPEG or WebP images."));
+      return;
+    }
+    callback(null, true);
+  }
+});
+
+function uploadRecapImage(buffer, eventId) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream({
+      folder: `futapulse/event-recaps/${String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_")}`,
+      resource_type: "image",
+      format: "webp",
+      quality: "auto",
+      fetch_format: "auto",
+      transformation: [{ width: 1600, height: 1600, crop: "limit" }]
+    }, (error, result) => {
+      if (error) reject(error);
+      else resolve(result);
+    });
+    stream.end(buffer);
+  });
+}
+
+async function dispatchNotificationJob(job) {
+  const payload = { ...job.payload, createdAt: new Date().toISOString() };
+  if (realtimeServer) realtimeServer.to(`user:${job.recipientUserId}`).emit("home-notification", payload);
+  const devices = await PushDevice.find({ userId: job.recipientUserId, platform: "web", enabled: true }).lean().exec();
+  const failures = [];
+  await Promise.all(devices.map(async (device) => {
+    try {
+      if (device.platform === "web") {
+        if (!process.env.WEB_PUSH_PUBLIC_KEY || !process.env.WEB_PUSH_PRIVATE_KEY) {
+          throw new Error("Web Push credentials are not configured.");
+        }
+        await webPush.sendNotification(device.subscription, JSON.stringify(payload), {
+          TTL: 60 * 60 * 24 * 7,
+          urgency: "high",
+          topic: crypto.createHash("sha256").update(job.idempotencyKey).digest("base64url").slice(0, 32)
+        });
+      }
+    } catch (error) {
+      if (device.platform === "web" && [404, 410].includes(error.statusCode)) {
+        await PushDevice.updateOne({ deviceKey: device.deviceKey }, { $set: { enabled: false } }).exec();
+      } else {
+        failures.push(error);
+      }
+    }
+  }));
+  if (failures.length) throw new Error(failures.map((error) => error.message).join("; "));
+}
+
+async function runNotificationWorker() {
+  if (!isMongoConnected()) return;
+  const now = new Date();
+  const job = await NotificationJob.findOneAndUpdate({
+    dueAt: { $lte: now },
+    nextAttemptAt: { $lte: now },
+    $or: [
+      { status: "pending" },
+      { status: "processing", leaseUntil: { $lte: now } }
+    ]
+  }, {
+    $set: { status: "processing", leaseUntil: new Date(now.getTime() + 60_000) },
+    $inc: { attempts: 1 }
+  }, { new: true, sort: { dueAt: 1 } }).exec();
+  if (!job) return;
+  try {
+    await dispatchNotificationJob(job);
+    await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+      $set: { status: "sent", sentAt: new Date(), leaseUntil: null, lastError: "" }
+    }).exec();
+  } catch (error) {
+    const attempts = Number(job.attempts) || 1;
+    const exhausted = attempts >= 8;
+    const retryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
+    console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
+    await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+      $set: {
+        status: exhausted ? "failed" : "pending",
+        nextAttemptAt: new Date(Date.now() + retryDelay),
+        leaseUntil: null,
+        lastError: String(error.message || error).slice(0, 500)
+      }
+    }).exec();
+  }
+}
 
 const eventReportSchema = new mongoose.Schema({
   eventId: { type: String, required: true, unique: true },
@@ -433,6 +794,60 @@ async function listStoredEvents(viewerId = "") {
   });
 }
 
+async function getEventViewCounts(eventIds) {
+  const ids = [...new Set((eventIds || []).map(String).filter(Boolean))];
+  if (!ids.length) return new Map();
+  if (!isMongoConnected()) {
+    const database = readDatabase();
+    const counts = new Map();
+    const requestedIds = new Set(ids);
+    for (const view of database.eventViews || []) {
+      if (requestedIds.has(String(view.eventId))) {
+        counts.set(String(view.eventId), (counts.get(String(view.eventId)) || 0) + 1);
+      }
+    }
+    return counts;
+  }
+  const grouped = await EventView.aggregate([
+    { $match: { eventId: { $in: ids } } },
+    { $group: { _id: "$eventId", count: { $sum: 1 } } }
+  ]).exec();
+  return new Map(grouped.map((item) => [String(item._id), Number(item.count) || 0]));
+}
+
+async function decorateOwnerEventViews(events, viewerId) {
+  if (!viewerId || !events.length) return events;
+  const ownedEvents = events.filter((event) => String(event.createdByUserId || "") === String(viewerId));
+  if (!ownedEvents.length) return events;
+  const counts = await getEventViewCounts(ownedEvents.map((event) => event.id));
+  return events.map((event) => String(event.createdByUserId || "") === String(viewerId)
+    ? { ...event, viewCount: counts.get(String(event.id)) || 0 }
+    : event);
+}
+
+async function decorateOwnerRecapDismissals(events, viewerId) {
+  if (!viewerId || !events.length) return events;
+  const ownedEvents = events.filter((event) => String(event.createdByUserId || "") === String(viewerId));
+  if (!ownedEvents.length) return events;
+  const eventIds = ownedEvents.map((event) => String(event.id));
+  let dismissedIds;
+  if (isMongoConnected()) {
+    const dismissals = await RecapPromptDismissal.find({
+      userId: String(viewerId),
+      eventId: { $in: eventIds }
+    }).select("eventId").lean().exec();
+    dismissedIds = new Set(dismissals.map((item) => String(item.eventId)));
+  } else {
+    const dismissals = readDatabase().recapPromptDismissals || [];
+    dismissedIds = new Set(dismissals
+      .filter((item) => String(item.userId) === String(viewerId) && eventIds.includes(String(item.eventId)))
+      .map((item) => String(item.eventId)));
+  }
+  return events.map((event) => String(event.createdByUserId || "") === String(viewerId)
+    ? { ...event, recapPromptDismissed: dismissedIds.has(String(event.id)) }
+    : event);
+}
+
 async function findStoredEvent(eventId) {
   if (!isMongoConnected()) return readDatabase().events.find((item) => String(item.id) === String(eventId)) || null;
   const record = await EventRecord.findOne({ eventId: String(eventId) }).lean().exec();
@@ -493,17 +908,27 @@ async function deleteStoredEvent(eventId) {
     const database = readDatabase();
     database.events = database.events.filter((item) => String(item.id) !== String(eventId));
     database.eventReports = (database.eventReports || []).filter((item) => String(item.eventId) !== String(eventId));
+    database.eventViews = (database.eventViews || []).filter((item) => String(item.eventId) !== String(eventId));
+    database.recapPromptDismissals = (database.recapPromptDismissals || []).filter((item) => String(item.eventId) !== String(eventId));
     database.engagementActionIds = (database.engagementActionIds || []).filter((actionKey) => {
       const separator = String(actionKey).indexOf(":");
       return separator < 0 || String(actionKey).slice(0, separator) !== String(eventId);
     });
     writeDatabase(database);
+    await cancelEventEndedRecapPrompts(eventId);
     return;
   }
   await Promise.all([
     EventRecord.deleteOne({ eventId: String(eventId) }).exec(),
     EventReport.deleteOne({ eventId: String(eventId) }).exec(),
-    EngagementAction.deleteMany({ eventId: String(eventId) }).exec()
+    EngagementAction.deleteMany({ eventId: String(eventId) }).exec(),
+    EventView.deleteMany({ eventId: String(eventId) }).exec(),
+    RecapPromptDismissal.deleteMany({ eventId: String(eventId) }).exec(),
+    cancelEventEndedRecapPrompts(eventId),
+    NotificationJob.updateMany({
+      eventId: String(eventId),
+      status: { $in: ["pending", "processing"] }
+    }, { $set: { status: "cancelled", leaseUntil: null } }).exec()
   ]);
 }
 
@@ -514,6 +939,9 @@ async function deleteStoredEventsForOwner(ownerUserId) {
     const ownedIds = new Set(database.events.filter((event) => String(event.createdByUserId || "") === ownerId).map((event) => String(event.id)));
     database.events = database.events.filter((event) => !ownedIds.has(String(event.id)));
     database.eventReports = (database.eventReports || []).filter((item) => !ownedIds.has(String(item.eventId)));
+    database.notificationJobs = (database.notificationJobs || []).filter((item) => !ownedIds.has(String(item.eventId)));
+    database.eventViews = (database.eventViews || []).filter((item) => !ownedIds.has(String(item.eventId)) && String(item.userId) !== ownerId);
+    database.recapPromptDismissals = (database.recapPromptDismissals || []).filter((item) => !ownedIds.has(String(item.eventId)) && String(item.userId) !== ownerId);
     database.engagementActionIds = (database.engagementActionIds || []).filter((key) => {
       const separator = String(key).indexOf(":");
       return separator < 0 || !ownedIds.has(String(key).slice(0, separator));
@@ -526,6 +954,15 @@ async function deleteStoredEventsForOwner(ownerUserId) {
   await Promise.all([
     eventIds.length ? EventRecord.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
     eventIds.length ? EventReport.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
+    eventIds.length ? NotificationJob.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
+    EventView.deleteMany({ $or: [
+      { userId: ownerId },
+      ...(eventIds.length ? [{ eventId: { $in: eventIds } }] : [])
+    ] }).exec(),
+    RecapPromptDismissal.deleteMany({ $or: [
+      { userId: ownerId },
+      ...(eventIds.length ? [{ eventId: { $in: eventIds } }] : [])
+    ] }).exec(),
     EngagementAction.deleteMany({ $or: [
       { userId: ownerId },
       ...(eventIds.length ? [{ eventId: { $in: eventIds } }] : [])
@@ -534,6 +971,7 @@ async function deleteStoredEventsForOwner(ownerUserId) {
 }
 
 function normalizeUser(user) {
+  const profile = user.profile || { name: user.username };
   return {
     id: String(user._id || user.id),
     email: user.email,
@@ -545,7 +983,11 @@ function normalizeUser(user) {
       usernameChanges: Number(user.usernameChanges) || 0,
       facultyChanges: Number(user.facultyChanges) || 0
     },
-    profile: user.profile || { name: user.username }
+    profile: {
+      ...profile,
+      notificationPreferences: normalizeNotificationPreferences(profile.notificationPreferences),
+      notificationPreferencesOnboardingComplete: profile.notificationPreferencesOnboardingComplete === true
+    }
   };
 }
 
@@ -673,7 +1115,8 @@ function buildRawEmail({ to, from, subject, text, html, replyTo }) {
 }
 
 function safeProviderError(error) {
-  let message = String(error?.message || "No provider message.")
+  const details = getGmailProviderDetails(error);
+  let message = details.message
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]")
     .replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
   for (const secret of [process.env.GOOGLE_CLIENT_SECRET, process.env.GMAIL_REFRESH_TOKEN]) {
@@ -681,12 +1124,62 @@ function safeProviderError(error) {
   }
   return {
     name: String(error?.name || "Error").slice(0, 80),
-    code: String(error?.code || "").slice(0, 80),
-    statusCode: Number.isInteger(error?.statusCode)
-      ? error.statusCode
-      : Number.isInteger(error?.response?.status) ? error.response.status : null,
+    code: details.code,
+    reason: details.reason,
+    statusCode: details.statusCode,
     message: message.slice(0, 300)
   };
+}
+
+function getGmailProviderDetails(error) {
+  const providerError = error?.response?.data?.error
+    || error?.cause?.response?.data?.error
+    || error?.providerError
+    || null;
+  const providerErrors = Array.isArray(providerError?.errors) ? providerError.errors : [];
+  return {
+    statusCode: Number.isInteger(error?.statusCode)
+      ? error.statusCode
+      : Number.isInteger(error?.response?.status)
+        ? error.response.status
+        : Number.isInteger(error?.cause?.response?.status) ? error.cause.response.status : null,
+    code: String(typeof providerError === "string"
+      ? providerError
+      : providerError?.status || providerError?.code || error?.code || "").slice(0, 80),
+    reason: String(providerErrors[0]?.reason || error?.providerReason || "").slice(0, 80),
+    message: String(providerError?.message
+      || providerError?.error_description
+      || error?.message
+      || "No provider message.").slice(0, 500)
+  };
+}
+
+function gmailDeliveryErrorMessage(error) {
+  const details = getGmailProviderDetails(error);
+  const code = details.code.toLowerCase();
+  const reason = details.reason.toLowerCase();
+  if (code === "invalid_grant" || /invalid_grant/i.test(details.message)) {
+    return "Google rejected GMAIL_REFRESH_TOKEN (invalid_grant). Re-authorize the sender account with the gmail.send scope and replace the refresh token in Render.";
+  }
+  if (reason === "accessnotconfigured" || code === "accessnotconfigured") {
+    return "Gmail API is not enabled for the Google Cloud project used by GOOGLE_CLIENT_ID. Enable Gmail API in that same project and redeploy.";
+  }
+  if (reason === "insufficientpermissions" || code === "insufficientpermissions") {
+    return "The Gmail authorization lacks the gmail.send permission. Create a new refresh token for https://www.googleapis.com/auth/gmail.send and update Render.";
+  }
+  if (reason === "domainpolicy" || code === "domainpolicy") {
+    return "The sender account's Google Workspace policy blocks Gmail API access. Use an allowed sender account or ask its administrator to permit Gmail API.";
+  }
+  if (details.statusCode === 401) {
+    return "Google rejected the Gmail access token. Re-authorize the sender account and update GMAIL_REFRESH_TOKEN in Render.";
+  }
+  if (details.statusCode === 429 || details.statusCode === 403 && /rate|limit/i.test(`${code} ${reason} ${details.message}`)) {
+    return "Gmail has temporarily limited this sender or project. Check Gmail sending limits and Google API quotas before retrying.";
+  }
+  if (details.statusCode) {
+    return `Gmail API rejected the verification email (HTTP ${details.statusCode}). Check Render logs for the sanitized Google error details.`;
+  }
+  return "Gmail API email delivery failed or timed out. Check the OAuth refresh token, Gmail API access, and sender-account configuration.";
 }
 
 function isEmailDeliveryConfigured() {
@@ -741,9 +1234,11 @@ async function deliverEmail({ to, subject, text, replyTo }) {
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const error = new Error(`Gmail API rejected the message (${response.status}).`);
+      const providerError = result.error || {};
+      const error = new Error(providerError.message || `Gmail API rejected the message (${response.status}).`);
       error.code = "EMAIL_DELIVERY_FAILED";
       error.statusCode = response.status;
+      error.providerError = providerError;
       throw error;
     }
     if (!result.id) {
@@ -754,14 +1249,12 @@ async function deliverEmail({ to, subject, text, replyTo }) {
   } catch (cause) {
     console.error("Gmail API email delivery failed.", safeProviderError(cause?.cause || cause));
     if (cause && cause.code === "EMAIL_DELIVERY_FAILED") {
-      const error = new Error(cause.statusCode
-        ? `Gmail API rejected the message (${cause.statusCode}).`
-        : "Gmail API did not confirm that the message was accepted.");
+      const error = new Error(gmailDeliveryErrorMessage(cause));
       error.code = "EMAIL_DELIVERY_FAILED";
       error.statusCode = cause.statusCode;
       throw error;
     }
-    const error = new Error("Gmail API email delivery failed or timed out. Check the OAuth refresh token, Gmail API access, and sender-account configuration.", { cause });
+    const error = new Error(gmailDeliveryErrorMessage(cause), { cause });
     error.code = "EMAIL_DELIVERY_FAILED";
     throw error;
   }
@@ -993,6 +1486,135 @@ app.get("/api/config/google", (request, response) => {
   response.json({ configured: Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET), clientId: GOOGLE_CLIENT_ID || null });
 });
 
+app.get("/api/notifications/config", (request, response) => {
+  const recapUploadMissingVariables = getMissingCloudinaryVariables();
+  response.json({
+    durableSchedulingAvailable: isMongoConnected(),
+    webPushConfigured: Boolean(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY),
+    webPushPublicKey: process.env.WEB_PUSH_PUBLIC_KEY || null,
+    recapUploadConfigured: recapUploadMissingVariables.length === 0,
+    recapUploadMissingVariables
+  });
+});
+
+app.get("/api/notifications/status", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Authentication required." });
+    const requestedPlatform = String(request.query.platform || "");
+    if (requestedPlatform !== "web") {
+      return response.status(400).json({ error: "Notification platform must be web." });
+    }
+    const userId = String(user._id || user.id);
+    const pushConfigured = Boolean(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY);
+    const deviceRegistered = isMongoConnected()
+      ? Boolean(await PushDevice.exists({ userId, platform: requestedPlatform, enabled: true }))
+      : false;
+    return response.json({
+      durableSchedulingAvailable: isMongoConnected(),
+      pushConfigured,
+      deviceRegistered
+    });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Session is no longer valid." });
+    }
+    console.error("Notification delivery status could not be loaded.", error);
+    return response.status(500).json({ error: "Unable to check notification delivery status." });
+  }
+});
+
+app.post("/api/notifications/devices/web", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Authentication required." });
+    const subscription = request.body?.subscription;
+    const endpoint = typeof subscription?.endpoint === "string" ? subscription.endpoint : "";
+    let endpointUrl;
+    try {
+      endpointUrl = new URL(endpoint);
+    } catch {
+      return response.status(400).json({ error: "A valid browser push subscription is required." });
+    }
+    if (endpointUrl.protocol !== "https:" || typeof subscription?.keys?.p256dh !== "string" || typeof subscription?.keys?.auth !== "string") {
+      return response.status(400).json({ error: "The browser push subscription is incomplete or insecure." });
+    }
+    if (!process.env.WEB_PUSH_PUBLIC_KEY || !process.env.WEB_PUSH_PRIVATE_KEY) {
+      return response.status(503).json({ error: "Web Push is not configured on the FUTApulse server yet." });
+    }
+    const deviceKey = crypto.createHash("sha256").update(endpoint).digest("hex");
+    await PushDevice.findOneAndUpdate(
+      { deviceKey, userId: String(user._id || user.id) },
+      { $set: { platform: "web", endpoint, subscription, enabled: true } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    ).exec();
+    return response.status(201).json({ registered: true });
+  } catch (error) {
+    if (error.code === 11000) return response.status(409).json({ error: "That push subscription is already linked to another account." });
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
+    console.error("Web push subscription registration failed.", error);
+    return response.status(500).json({ error: "Unable to register this browser for notifications." });
+  }
+});
+
+app.delete("/api/notifications/devices/:deviceKey", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Authentication required." });
+    await PushDevice.updateOne({
+      deviceKey: String(request.params.deviceKey),
+      userId: String(user._id || user.id)
+    }, { $set: { enabled: false } }).exec();
+    return response.json({ removed: true });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
+    console.error("Push device removal failed.", error);
+    return response.status(500).json({ error: "Unable to remove this notification device." });
+  }
+});
+
+app.patch("/api/notifications/preferences", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Authentication required." });
+    const submitted = request.body?.notificationPreferences;
+    if (!submitted || typeof submitted !== "object" || Array.isArray(submitted)) {
+      return response.status(400).json({ error: "Notification preferences must be an object." });
+    }
+    if (NOTIFICATION_CATEGORIES.some((category) => submitted[category] !== undefined && typeof submitted[category] !== "boolean")) {
+      return response.status(400).json({ error: "Each category preference must be enabled or disabled." });
+    }
+    const notificationPreferences = {
+      ...normalizeNotificationPreferences(user.profile?.notificationPreferences),
+      ...Object.fromEntries(NOTIFICATION_CATEGORIES
+        .filter((category) => typeof submitted[category] === "boolean")
+        .map((category) => [category, submitted[category]]))
+    };
+    const profile = {
+      ...(user.profile || { name: user.username }),
+      notificationPreferences,
+      notificationPreferencesOnboardingComplete: true
+    };
+    if (isMongoConnected()) {
+      user.profile = profile;
+      await user.save();
+    } else {
+      const database = readDatabase();
+      const storedUser = database.users.find((item) => item.id === user.id);
+      if (!storedUser) return response.status(401).json({ error: "Session is no longer valid." });
+      storedUser.profile = profile;
+      writeDatabase(database);
+    }
+    return response.json({ notificationPreferences, notificationPreferencesOnboardingComplete: true });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Session is no longer valid." });
+    }
+    console.error("Notification preferences update failed.", error);
+    return response.status(500).json({ error: "Unable to save notification preferences right now." });
+  }
+});
+
 app.post("/api/auth/username-availability", async (request, response) => {
   const displayName = typeof request.body?.username === "string" ? request.body.username.trim() : "";
   if (!isValidUsername(displayName)) {
@@ -1093,7 +1715,9 @@ app.post("/api/profile/setup", async (request, response) => {
       level,
       role: "explorer",
       picture: typeof body.picture === "string" ? body.picture : "",
-      communityGuidelinesAcceptedAt: user.profile?.communityGuidelinesAcceptedAt || null
+      communityGuidelinesAcceptedAt: user.profile?.communityGuidelinesAcceptedAt || null,
+      notificationPreferences: normalizeNotificationPreferences(user.profile?.notificationPreferences),
+      notificationPreferencesOnboardingComplete: user.profile?.notificationPreferencesOnboardingComplete === true
     };
     if (!validateProfile(profile)) {
       return response.status(400).json({ error: "Complete your faculty, department, level, and role." });
@@ -1183,7 +1807,9 @@ app.patch("/api/auth/profile", async (request, response) => {
       level: profileWithUsername.level.trim(),
       role: "explorer",
       picture: typeof profileWithUsername.picture === "string" ? profileWithUsername.picture : "",
-      communityGuidelinesAcceptedAt: user.profile?.communityGuidelinesAcceptedAt || null
+      communityGuidelinesAcceptedAt: user.profile?.communityGuidelinesAcceptedAt || null,
+      notificationPreferences: normalizeNotificationPreferences(user.profile?.notificationPreferences),
+      notificationPreferencesOnboardingComplete: user.profile?.notificationPreferencesOnboardingComplete === true
     };
     if (isMongoConnected()) {
       user.profile = savedProfile;
@@ -1348,11 +1974,19 @@ app.delete("/api/auth/account", async (request, response) => {
     }
     await deleteStoredEventsForOwner(user._id || user.id);
     if (isMongoConnected()) {
+      const userId = String(user._id || user.id);
+      await Promise.all([
+        PushDevice.deleteMany({ userId }).exec(),
+        NotificationJob.deleteMany({ recipientUserId: userId }).exec()
+      ]);
       await User.deleteOne({ _id: user._id }).exec();
     } else {
       const database = readDatabase();
       database.users = database.users.filter((item) => item.id !== user.id);
       database.profiles = database.profiles.filter((item) => item.userId !== user.id);
+      database.pushDevices = (database.pushDevices || []).filter((item) => String(item.userId) !== String(user.id));
+      database.notificationJobs = (database.notificationJobs || []).filter((item) => String(item.recipientUserId) !== String(user.id));
+      database.engagementActions = (database.engagementActions || []).filter((item) => String(item.userId) !== String(user.id));
       writeDatabase(database);
     }
     clearRefreshCookie(response);
@@ -1759,12 +2393,31 @@ app.get("/api/events", async (request, response) => {
     const category = request.query.category;
     let events = storedEvents.filter((event) => {
       const isOwnerDraft = Boolean(user && event.status === "Draft" && String(event.createdByUserId || "") === String(user._id || user.id));
+      const endedAt = new Date(event.endTime || "").getTime();
+      const isOwnerRecentEndedEvent = Boolean(user
+        && event.status !== "Cancelled"
+        && String(event.createdByUserId || "") === String(user._id || user.id)
+        && Number.isFinite(endedAt)
+        && endedAt <= Date.now()
+        && Date.now() - endedAt <= 7 * 24 * 60 * 60_000);
+      const cancelledAt = new Date(event.cancelledAt || "").getTime();
+      const isOwnerRecentCancellation = Boolean(user
+        && event.status === "Cancelled"
+        && String(event.createdByUserId || "") === String(user._id || user.id)
+        && Number.isFinite(cancelledAt)
+        && Date.now() - cancelledAt <= 7 * 24 * 60 * 60_000);
       return isOwnerDraft
+        || isOwnerRecentEndedEvent
+        || isOwnerRecentCancellation
         || (["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event));
     });
     if (level) events = events.filter((event) => !event.audience || event.audience.includes("all") || event.audience.includes(level));
     if (category && category !== "all") events = events.filter((event) => event.category === category);
+    const hotEligibleUserCount = await getHotEligibleUserCount(database);
+    events = events.map((event) => withHotStatus(event, hotEligibleUserCount));
     events = await decorateEventsWithCurrentOrganizers(events, database);
+    events = await decorateOwnerEventViews(events, viewerId);
+    events = await decorateOwnerRecapDismissals(events, viewerId);
     return response.json({ events: events.map((event) => toPublicEvent(event, viewerId)) });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
@@ -1772,6 +2425,84 @@ app.get("/api/events", async (request, response) => {
     }
     console.error("Event list request failed.", error);
     return response.status(500).json({ error: "Unable to load campus events." });
+  }
+});
+
+app.post("/api/events/:eventId/views", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in to record an event view." });
+    const event = await findStoredEvent(request.params.eventId);
+    if (!event || !["Published", "Live"].includes(event.status) || !isWithinEventDisplayWindow(event)) {
+      return response.status(404).json({ error: "This event is no longer available." });
+    }
+    const userId = String(user._id || user.id);
+    if (String(event.createdByUserId || "") === userId) return response.json({ recorded: false });
+
+    if (!isMongoConnected()) {
+      const database = readDatabase();
+      const eventViews = database.eventViews || [];
+      const exists = eventViews.some((view) => String(view.eventId) === String(event.id) && String(view.userId) === userId);
+      if (!exists) {
+        eventViews.push({ eventId: String(event.id), userId, createdAt: new Date().toISOString() });
+        database.eventViews = eventViews;
+        writeDatabase(database);
+      }
+      return response.json({ recorded: !exists });
+    }
+    try {
+      await EventView.create({ eventId: String(event.id), userId });
+      return response.status(201).json({ recorded: true });
+    } catch (error) {
+      if (error.code === 11000) return response.json({ recorded: false });
+      throw error;
+    }
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Session is no longer valid." });
+    }
+    console.error("Event view could not be recorded.", error);
+    return response.status(500).json({ error: "Unable to record this event view." });
+  }
+});
+
+app.post("/api/events/:eventId/recap-prompt-dismissal", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in before dismissing this recap prompt." });
+    const event = await findStoredEvent(request.params.eventId);
+    const userId = String(user._id || user.id);
+    if (!event || String(event.createdByUserId || "") !== userId) {
+      return response.status(404).json({ error: "This event is not available in your organizer profile." });
+    }
+    const endedAt = new Date(event.endTime || "").getTime();
+    if (!Number.isFinite(endedAt) || endedAt > Date.now() || Date.now() - endedAt > 7 * 24 * 60 * 60_000) {
+      return response.status(409).json({ error: "The recap prompt can only be dismissed during the seven days after an event ends." });
+    }
+    const dismissedAt = new Date();
+    if (!isMongoConnected()) {
+      const database = readDatabase();
+      const dismissals = database.recapPromptDismissals || [];
+      const existingIndex = dismissals.findIndex((item) => String(item.eventId) === String(event.id) && String(item.userId) === userId);
+      const dismissal = { eventId: String(event.id), userId, dismissedAt: dismissedAt.toISOString() };
+      if (existingIndex < 0) dismissals.push(dismissal);
+      else dismissals[existingIndex] = dismissal;
+      database.recapPromptDismissals = dismissals;
+      writeDatabase(database);
+    } else {
+      await RecapPromptDismissal.updateOne(
+        { eventId: String(event.id), userId },
+        { $set: { dismissedAt } },
+        { upsert: true }
+      ).exec();
+    }
+    return response.json({ dismissed: true });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Session is no longer valid." });
+    }
+    console.error("Recap prompt dismissal could not be saved.", error);
+    return response.status(500).json({ error: "Unable to dismiss this recap prompt." });
   }
 });
 
@@ -1784,9 +2515,21 @@ app.get("/api/events/engagement", async (request, response) => {
     if (authorization.startsWith("Bearer ") && !user) return response.status(401).json({ error: "Session is no longer valid." });
     const viewerId = user ? String(user._id || user.id) : "";
     const events = await listStoredEvents(viewerId);
-    const updates = events
-      .filter((event) => ["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event))
-      .map((event) => {
+    const eligibleEvents = events
+      .filter((event) => (["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event))
+        || (viewerId && String(event.createdByUserId || "") === viewerId
+          && (event.status === "Cancelled"
+            ? Number.isFinite(new Date(event.cancelledAt || "").getTime())
+              && Date.now() - new Date(event.cancelledAt).getTime() <= 7 * 24 * 60 * 60_000
+            : Number.isFinite(new Date(event.endTime || "").getTime())
+              && new Date(event.endTime).getTime() <= Date.now()
+              && Date.now() - new Date(event.endTime).getTime() <= 7 * 24 * 60 * 60_000)));
+    const ownerEvents = viewerId
+      ? eligibleEvents.filter((event) => String(event.createdByUserId || "") === viewerId)
+      : [];
+    const ownerViewCounts = await getEventViewCounts(ownerEvents.map((event) => event.id));
+    const hotEligibleUserCount = await getHotEligibleUserCount();
+    const updates = eligibleEvents.map((event) => {
         const hasAction = (field) => viewerId && Array.isArray(event[field]) && event[field].includes(viewerId);
         const flameCount = Number(event.flameCount ?? event.hypeCount) || 0;
         const rsvpCount = Number(event.rsvpCount ?? event.turnoutCount) || 0;
@@ -1803,7 +2546,10 @@ app.get("/api/events/engagement", async (request, response) => {
           isGoing: Boolean(hasAction("attendeeUserIds")),
           isHyped: Boolean(hasAction("hypedUserIds")),
           isReminded: Boolean(hasAction("reminderUserIds")),
-          isHot: (rsvpCount * 2) + (reminderCount * 3) + flameCount >= HOT_EVENT_THRESHOLD
+          isHot: isHotByRsvpCount(rsvpCount, hotEligibleUserCount),
+          ...(viewerId && String(event.createdByUserId || "") === viewerId
+            ? { viewCount: ownerViewCounts.get(String(event.id)) || 0 }
+            : {})
         };
       });
     return response.json({ updates });
@@ -1816,7 +2562,6 @@ app.get("/api/events/engagement", async (request, response) => {
   }
 });
 
-const HOT_EVENT_THRESHOLD = 10;
 const ENGAGEMENT_COUNTERS = {
   flame: "flameCount",
   reminder: "reminderCount",
@@ -1837,11 +2582,176 @@ function updateFacultyTurnoutBreakdown(turnoutBreakdown, faculty, delta) {
   return next.filter((item) => Number(item.count) > 0);
 }
 
-function getEventHotScore(event) {
-  const rsvps = Number(event.rsvpCount ?? event.turnoutCount) || 0;
-  const reminders = Number(event.reminderCount) || 0;
-  const flames = Number(event.flameCount) || 0;
-  return (rsvps * 2) + (reminders * 3) + flames;
+async function getHotEligibleUserCount(database = null) {
+  if (isMongoConnected()) {
+    const completeProfile = Object.fromEntries(
+      ["name", "faculty", "department", "level", "role"].map((field) => [
+        `profile.${field}`,
+        { $type: "string", $regex: /\S/ }
+      ])
+    );
+    return User.countDocuments({ emailVerified: true, ...completeProfile }).exec();
+  }
+  const users = (database || readDatabase()).users || [];
+  return users.filter((user) => user.emailVerified === true && validateProfile(user.profile || {})).length;
+}
+
+function isHotByRsvpCount(rsvpCount, eligibleUserCount) {
+  return eligibleUserCount > 0 && Number(rsvpCount) * 2 > eligibleUserCount;
+}
+
+function withHotStatus(event, eligibleUserCount) {
+  const rsvpCount = Number(event.rsvpCount ?? event.turnoutCount) || 0;
+  return {
+    ...event,
+    hotRsvpPercentage: eligibleUserCount > 0 ? (rsvpCount / eligibleUserCount) * 100 : 0,
+    isHot: isHotByRsvpCount(rsvpCount, eligibleUserCount)
+  };
+}
+
+function eventStartDate(event) {
+  const time = typeof event?.startTime === "string" ? event.startTime.trim() : "";
+  const candidate = /^\d{1,2}:\d{2}(:\d{2})?$/.test(time) && event?.date
+    ? `${String(event.date).slice(0, 10)}T${time.length === 5 ? `${time}:00` : time}`
+    : time || event?.date || "";
+  const parsed = new Date(candidate);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+async function scheduleDefaultRsvpReminders(event, userId, hasCustomReminder = false) {
+  if (!isMongoConnected()) return;
+  const startsAt = eventStartDate(event);
+  if (!startsAt || startsAt.getTime() <= Date.now()) return;
+  const reminders = [
+    ...(!hasCustomReminder ? [
+      { offset: 60 * 60_000, suffix: "1h", message: `${event.title} starts in 1 hour.` },
+      { offset: 30 * 60_000, suffix: "30m", message: `${event.title} is starting in 30 minutes!` }
+    ] : []),
+    { offset: 0, suffix: "start", message: `${event.title} has officially started!` }
+  ];
+  await Promise.all(reminders
+    .map(({ offset, suffix, message }) => ({ suffix, message, dueAt: new Date(startsAt.getTime() - offset) }))
+    .filter((reminder) => reminder.dueAt.getTime() > Date.now())
+    .map((reminder) => enqueueNotification({
+      idempotencyKey: `rsvp-reminder:${event.id}:${userId}:${reminder.suffix}`,
+      recipientUserId: userId,
+      event,
+      kind: `rsvp-reminder-${reminder.suffix}`,
+      title: "Event reminder",
+      message: reminder.message,
+      dueAt: reminder.dueAt
+    })));
+}
+
+async function cancelUserEventNotifications(eventId, userId, kinds) {
+  if (!isMongoConnected()) return;
+  await NotificationJob.updateMany({
+    eventId: String(eventId),
+    recipientUserId: String(userId),
+    kind: { $in: kinds },
+    status: { $in: ["pending", "processing"] }
+  }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
+}
+
+async function scheduleCustomEventReminder(event, userId, dueAt) {
+  const startsAt = eventStartDate(event);
+  const reminderAt = new Date(dueAt);
+  if (!startsAt || !Number.isFinite(reminderAt.getTime()) || reminderAt.getTime() <= Date.now() || reminderAt >= startsAt) {
+    throw new Error("Choose a reminder time in the future and before the event starts.");
+  }
+  await cancelUserEventNotifications(event.id, userId, [
+    "rsvp-reminder-1h", "rsvp-reminder-30m", "custom-reminder"
+  ]);
+  await enqueueNotification({
+    idempotencyKey: `custom-reminder:${event.id}:${userId}:${reminderAt.toISOString()}`,
+    recipientUserId: userId,
+    event,
+    kind: "custom-reminder",
+    title: "Your event reminder",
+    message: `${event.title} is coming up soon.`,
+    dueAt: reminderAt
+  });
+}
+
+async function notifyRsvpSocialProof(event) {
+  if (!isMongoConnected()) return;
+  const rsvps = await EngagementAction.find({ eventId: String(event.id), type: "rsvp" })
+    .select("userId faculty department createdAt updatedAt").lean().exec();
+  const facultyCounts = new Map();
+  const departmentCounts = new Map();
+  const recentRsvpCount = rsvps.filter((action) => new Date(action.updatedAt || action.createdAt).getTime() >= Date.now() - (30 * 60_000)).length;
+  for (const rsvp of rsvps) {
+    const faculty = String(rsvp.faculty || "").trim();
+    const department = String(rsvp.department || "").trim();
+    if (faculty) facultyCounts.set(faculty, [...(facultyCounts.get(faculty) || []), String(rsvp.userId)]);
+    if (department) departmentCounts.set(department, [...(departmentCounts.get(department) || []), String(rsvp.userId)]);
+  }
+  for (const [faculty, userIds] of facultyCounts) {
+    if (userIds.length < 20) continue;
+    const recipients = await User.find({ "profile.faculty": faculty, emailVerified: true }).select("_id").lean().exec();
+    await enqueueNotifications(recipients.map((recipient) => recipient._id), {
+      idempotencyKey: `faculty-milestone:${event.id}:${faculty.toLowerCase()}:20`,
+      event,
+      kind: "faculty-milestone",
+      title: "Your faculty is going",
+      message: `20 people from your faculty (${faculty}) are going to ${event.title}. Tap to check it out.`
+    });
+  }
+  for (const [department, userIds] of departmentCounts) {
+    if (userIds.length < 10) continue;
+    const recipients = await User.find({ "profile.department": department, emailVerified: true }).select("_id").lean().exec();
+    await enqueueNotifications(recipients.map((recipient) => recipient._id), {
+      idempotencyKey: `department-milestone:${event.id}:${department.toLowerCase()}:10`,
+      event,
+      kind: "department-milestone",
+      title: "Your department is going",
+      message: `10 people from your department are coming to ${event.title}. Tap to check it out.`
+    });
+  }
+  if (recentRsvpCount >= 30) {
+    const recipients = await User.find({ emailVerified: true }).select("_id").lean().exec();
+    await enqueueNotifications(recipients.map((recipient) => recipient._id), {
+      idempotencyKey: `trending-spike:${event.id}:30`,
+      event,
+      kind: "trending-spike",
+      title: "Trending on campus",
+      message: `${event.title} is trending! 30+ people are coming. Tap to check it out.`
+    });
+  }
+}
+
+async function getEventNotificationAudience(event, includeCategoryFollowers = true) {
+  if (!isMongoConnected()) return [];
+  const ids = new Set();
+  const [attendees, categoryUsers] = await Promise.all([
+    EngagementAction.find({ eventId: String(event.id), type: "rsvp" }).select("userId").lean().exec(),
+    includeCategoryFollowers && NOTIFICATION_CATEGORIES.includes(String(event.category || "").toLowerCase())
+      ? User.find({
+        emailVerified: true,
+        [`profile.notificationPreferences.${String(event.category).toLowerCase()}`]: { $ne: false }
+      }).select("_id").lean().exec()
+      : Promise.resolve([])
+  ]);
+  attendees.forEach((item) => ids.add(String(item.userId)));
+  categoryUsers.forEach((item) => ids.add(String(item._id)));
+  return [...ids];
+}
+
+async function notifyCriticalEventUpdate(previous, event) {
+  if (!isMongoConnected()) return;
+  const previousStart = eventStartDate(previous)?.getTime();
+  const nextStart = eventStartDate(event)?.getTime();
+  const postponed = Number.isFinite(previousStart) && Number.isFinite(nextStart) && previousStart !== nextStart;
+  const recipients = await getEventNotificationAudience(event, true);
+  await enqueueNotifications(recipients, {
+    idempotencyKey: `critical-update:${event.id}:${event.updatedAt}`,
+    event,
+    kind: postponed ? "event-postponed" : "event-critical-update",
+    title: postponed ? "Event postponed" : "Event details changed",
+    message: postponed
+      ? `⏰ POSTPONED: ${event.title} has been moved to a new date. Tap to check it out.`
+      : `The time/venue for ${event.title} has changed! Tap to check it out.`
+  });
 }
 
 app.get("/api/events/hot", async (request, response) => {
@@ -1856,19 +2766,18 @@ app.get("/api/events/hot", async (request, response) => {
     throw error;
   }
   const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
-  const storedEvents = await listStoredEvents();
+  const storedEvents = await listStoredEvents(viewerId);
+  const hotEligibleUserCount = await getHotEligibleUserCount(database);
   const events = storedEvents
     .filter((event) => {
       if (!["Published", "Live"].includes(event.status)) return false;
       return isWithinEventDisplayWindow(event);
     })
-    .map((event) => {
-      const hotScore = getEventHotScore(event);
-      return { ...event, hotScore, isHot: hotScore >= HOT_EVENT_THRESHOLD };
-    })
-    .filter((event) => event.hotScore >= HOT_EVENT_THRESHOLD)
-    .sort((a, b) => b.hotScore - a.hotScore)
-    .slice(0, 5);
+    .map((event) => withHotStatus(event, hotEligibleUserCount))
+    .filter((event) => event.isHot)
+    .sort((first, second) => second.hotRsvpPercentage - first.hotRsvpPercentage
+      || Number(second.rsvpCount ?? second.turnoutCount) - Number(first.rsvpCount ?? first.turnoutCount)
+      || (eventStartDate(first)?.getTime() || 0) - (eventStartDate(second)?.getTime() || 0));
   return decorateEventsWithCurrentOrganizers(events, database)
     .then((updatedEvents) => response.json({ events: updatedEvents.map((event) => toPublicEvent(event, viewerId)) }))
     .catch((error) => {
@@ -1925,9 +2834,12 @@ app.post("/api/events", async (request, response) => {
         });
       }
       await storeEvent(event);
+      void enqueueCategoryAlert(event).catch((error) => console.error("New-event notifications could not be queued.", error));
+      void scheduleEventEndedRecapPrompt(event).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
       return response.status(201).json({ event: toPublicEvent(event), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
     await storeEvent(event);
+    void cancelEventEndedRecapPrompts(event.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
     return response.status(201).json({ event: toPublicEvent(event), similarEvents: [] });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
@@ -1986,9 +2898,23 @@ app.patch("/api/events/:eventId", async (request, response) => {
         });
       }
       await storeEvent(updated);
+      if (["Published", "Live"].includes(updated.status)) {
+        void scheduleEventEndedRecapPrompt(updated).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
+        if (current.status === "Draft") {
+          void enqueueCategoryAlert(updated).catch((error) => console.error("New-event notifications could not be queued.", error));
+        } else {
+          const changedCriticalField = ["title", "date", "startTime", "venue"].some((key) => String(current[key] || "") !== String(updated[key] || ""));
+          if (changedCriticalField) {
+            void notifyCriticalEventUpdate(current, updated).catch((error) => console.error("Event update notifications could not be queued.", error));
+          }
+        }
+      } else {
+        void cancelEventEndedRecapPrompts(updated.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
+      }
       return response.json({ event: toPublicEvent(updated), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
     await storeEvent(updated);
+    void cancelEventEndedRecapPrompts(updated.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
     return response.json({ event: toPublicEvent(updated), similarEvents: [] });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
@@ -2008,14 +2934,186 @@ app.delete("/api/events/:eventId", async (request, response) => {
     if (String(event.createdByUserId || "") !== String(user._id || user.id)) {
       return response.status(403).json({ error: "Only the account that created this event can delete it." });
     }
+    const eventEnded = Number.isFinite(new Date(event.endTime || "").getTime())
+      && new Date(event.endTime).getTime() <= Date.now();
+    if (["Published", "Live"].includes(event.status) && !eventEnded) {
+      const cancelledAt = new Date();
+      const cancelledEvent = {
+        ...event,
+        status: "Cancelled",
+        cancelledAt: cancelledAt.toISOString(),
+        cancellationExpiresAt: new Date(cancelledAt.getTime() + (7 * 24 * 60 * 60_000)).toISOString(),
+        updatedAt: cancelledAt.toISOString()
+      };
+      await storeEvent(cancelledEvent);
+      void cancelEventEndedRecapPrompts(event.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
+      if (isMongoConnected()) {
+        await NotificationJob.updateMany({
+          eventId: String(event.id),
+          status: { $in: ["pending", "processing"] },
+          kind: { $in: ["rsvp-reminder-1h", "rsvp-reminder-30m", "rsvp-reminder-start", "custom-reminder"] }
+        }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
+      }
+      try {
+        const recipients = await getEventNotificationAudience(cancelledEvent, true);
+        await enqueueNotifications(recipients, {
+          idempotencyKey: `event-cancelled:${event.id}`,
+          event: cancelledEvent,
+          kind: "event-cancellation",
+          title: "Event cancellation notice",
+          message: `⚠️ CANCELLATION NOTICE: ${event.title} has been called off. Tap to view details.`
+        });
+      } catch (error) {
+        console.error("Event cancellation was saved, but audience notifications could not be queued.", error);
+      }
+      return response.json({ message: "Cancellation notice sent. The event is no longer in the public feed and remains in your profile for seven days.", cancelled: true });
+    }
     await deleteStoredEvent(event.id);
-    return response.json({ message: event.status === "Draft" ? "Draft deleted." : "Event deleted." });
+    return response.json({
+      message: event.status === "Draft" ? "Draft deleted." : "Event removed from your profile.",
+      removed: true
+    });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
       return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
     }
     console.error("Event deletion failed.", error);
     return response.status(500).json({ error: "Unable to delete this event right now." });
+  }
+});
+
+app.post("/api/events/:eventId/announcements", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in before sending an event announcement." });
+    if (!isMongoConnected()) return response.status(503).json({ error: "Organizer broadcasts require the shared MongoDB notification queue." });
+    const event = await findStoredEvent(request.params.eventId);
+    if (!event || !["Published", "Live"].includes(event.status)) return response.status(404).json({ error: "This published event is not available." });
+    if (String(event.createdByUserId || "") !== String(user._id || user.id)) {
+      return response.status(403).json({ error: "Only the event organizer can send a broadcast." });
+    }
+    const message = typeof request.body?.message === "string" ? request.body.message.trim() : "";
+    if (!message || message.length > 240) return response.status(400).json({ error: "Enter an announcement of 1–240 characters." });
+    const now = new Date();
+    const cooldownBoundary = new Date(now.getTime() - 60_000);
+    const claimedEvent = await EventRecord.findOneAndUpdate({
+      eventId: String(event.id),
+      ownerUserId: String(user._id || user.id),
+      $or: [
+        { lastAnnouncementAt: null },
+        { lastAnnouncementAt: { $exists: false } },
+        { lastAnnouncementAt: { $lte: cooldownBoundary } }
+      ]
+    }, { $set: { lastAnnouncementAt: now } }, { new: true }).exec();
+    if (!claimedEvent) return response.status(429).json({ error: "Please wait one minute between announcements for this event." });
+    const recipients = await getEventNotificationAudience(event, true);
+    const pushReadyDeviceCount = recipients.length
+      ? await PushDevice.countDocuments({ userId: { $in: recipients }, platform: "web", enabled: true }).exec()
+      : 0;
+    await enqueueNotifications(recipients, {
+      idempotencyKey: `organizer-announcement:${event.id}:${now.toISOString()}`,
+      event,
+      kind: "organizer-announcement",
+      title: `Update: ${event.title}`,
+      message
+    });
+    return response.status(202).json({
+      queued: true,
+      recipientCount: recipients.length,
+      pushReadyDeviceCount,
+      pushConfigured: Boolean(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY)
+    });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
+    console.error("Organizer event announcement failed.", error);
+    return response.status(500).json({ error: "Unable to send the event announcement right now." });
+  }
+});
+
+app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
+  recapImageUpload.array("photos", 5)(request, response, (error) => {
+    if (error) {
+      return response.status(400).json({ error: error.message || "Unable to process recap photos." });
+    }
+    return next();
+  });
+}, async (request, response) => {
+  const uploadedAssets = [];
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in before uploading event recap photos." });
+    if (!isMongoConnected()) return response.status(503).json({ error: "Recap uploads require the shared MongoDB database." });
+    if (!configureCloudinary()) {
+      return response.status(503).json({
+        error: `Cloudinary is not ready. Add the missing Render environment variable${getMissingCloudinaryVariables().length === 1 ? "" : "s"}: ${getMissingCloudinaryVariables().join(", ")}.`
+      });
+    }
+    const event = await findStoredEvent(request.params.eventId);
+    if (!event || !["Published", "Live"].includes(event.status)) return response.status(404).json({ error: "This event cannot accept recap photos." });
+    if (String(event.createdByUserId || "") !== String(user._id || user.id)) {
+      return response.status(403).json({ error: "Only the event organizer can upload recap photos." });
+    }
+    const eventEnd = new Date(event.endTime || "");
+    if (!Number.isFinite(eventEnd.getTime()) || eventEnd.getTime() > Date.now()
+      || Date.now() - eventEnd.getTime() > 7 * 24 * 60 * 60_000) {
+      return response.status(409).json({ error: "Recap photos can be uploaded after the event ends and for up to seven days." });
+    }
+    const files = Array.isArray(request.files) ? request.files : [];
+    if (!files.length) return response.status(400).json({ error: "Choose at least one JPEG or WebP photo." });
+    const currentPhotos = Array.isArray(event.recapPhotos) ? event.recapPhotos : [];
+    if (currentPhotos.length + files.length > 5) return response.status(400).json({ error: "An event recap can contain at most five photos." });
+    for (const file of files) {
+      const isJpeg = file.buffer.length >= 3 && file.buffer[0] === 0xff && file.buffer[1] === 0xd8 && file.buffer[2] === 0xff;
+      const isWebp = file.buffer.length >= 12
+        && file.buffer.toString("ascii", 0, 4) === "RIFF"
+        && file.buffer.toString("ascii", 8, 12) === "WEBP";
+      if (!isJpeg && !isWebp) return response.status(400).json({ error: "A recap photo does not match its declared JPEG or WebP format." });
+      const uploaded = await uploadRecapImage(file.buffer, event.id);
+      uploadedAssets.push(uploaded);
+    }
+    const recapPublishedAt = event.recapPublishedAt || new Date().toISOString();
+    const updated = {
+      ...event,
+      recapPhotos: [
+        ...currentPhotos,
+        ...uploadedAssets.map((asset) => ({
+          url: asset.secure_url,
+          width: asset.width,
+          height: asset.height,
+          format: asset.format
+        }))
+      ],
+      recapPublishedAt,
+      updatedAt: new Date().toISOString()
+    };
+    await storeEvent(updated);
+    if (currentPhotos.length === 0) {
+      try {
+        const recipients = await User.find({ emailVerified: true }).select("_id").lean().exec();
+        await enqueueNotifications(recipients.map((recipient) => recipient._id), {
+          idempotencyKey: `event-recap:${event.id}`,
+          event: updated,
+          kind: "event-recap",
+          title: "Relive the vibe!",
+          message: `Relive the vibe! Photos from ${event.title} are now live. Tap to check out the recap.`,
+          universal: true
+        });
+      } catch (error) {
+        console.error("Recap photos were saved, but the universal recap notification could not be queued.", error);
+      }
+    }
+    return response.status(201).json({ event: toPublicEvent(updated), uploadedCount: uploadedAssets.length });
+  } catch (error) {
+    await Promise.all(uploadedAssets.filter((asset) => asset?.public_id).map(async (asset) => {
+      try {
+        await cloudinary.uploader.destroy(asset.public_id, { resource_type: "image" });
+      } catch (cleanupError) {
+        console.error("Unable to remove an unreferenced recap image after upload failure.", cleanupError);
+      }
+    }));
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
+    console.error("Event recap photo upload failed.", error);
+    return response.status(500).json({ error: "Unable to publish the event recap photos right now." });
   }
 });
 
@@ -2192,20 +3290,52 @@ app.patch("/api/events/:eventId/engagement", async (request, response) => {
     const event = await findStoredEvent(eventId);
     if (!event) return response.status(404).json({ error: "Event not found." });
     const action = { eventId, userId, type };
-    if (enabled) {
+    const wasEnabled = Boolean(await EngagementAction.exists(action));
+    if (enabled && !wasEnabled) {
       try {
-        await EngagementAction.updateOne(action, { $set: { faculty: String(user.profile?.faculty || "").trim().slice(0, 80) } }, { upsert: true }).exec();
+        await EngagementAction.updateOne(action, {
+          $set: {
+            faculty: String(user.profile?.faculty || "").trim().slice(0, 80),
+            department: String(user.profile?.department || "").trim().slice(0, 100)
+          }
+        }, { upsert: true }).exec();
       } catch (error) {
         // The unique compound index makes repeated or racing enables idempotent.
         if (error.code !== 11000) throw error;
       }
-    } else {
+    } else if (!enabled) {
       await EngagementAction.deleteOne(action).exec();
+    }
+    if (type === "rsvp" && enabled && !wasEnabled) {
+      try {
+        const customReminder = await EngagementAction.findOne({ eventId, userId, type: "reminder" })
+          .select("customReminderAt").lean().exec();
+        await scheduleDefaultRsvpReminders(event, userId, Boolean(customReminder?.customReminderAt));
+        await notifyRsvpSocialProof(event);
+      } catch (error) {
+        console.error("RSVP succeeded, but event notifications could not be scheduled.", error);
+      }
+    } else if (type === "rsvp" && !enabled) {
+      try {
+        await cancelUserEventNotifications(eventId, userId, ["rsvp-reminder-1h", "rsvp-reminder-30m", "rsvp-reminder-start"]);
+      } catch (error) {
+        console.error("RSVP was removed, but its scheduled reminders could not be cancelled.", error);
+      }
+    } else if (type === "reminder" && !enabled) {
+      try {
+        await cancelUserEventNotifications(eventId, userId, ["custom-reminder"]);
+        if (await EngagementAction.exists({ eventId, userId, type: "rsvp" })) {
+          await scheduleDefaultRsvpReminders(event, userId);
+        }
+      } catch (error) {
+        console.error("Reminder was removed, but its scheduled notification could not be cancelled.", error);
+      }
     }
     const updatedEvent = (await listStoredEvents(userId)).find((item) => String(item.id) === eventId);
     if (!updatedEvent) return response.status(404).json({ error: "Event not found." });
     const [decoratedEvent] = await decorateEventsWithCurrentOrganizers([updatedEvent], { users: [], events: [] });
-    return response.json({ event: toPublicEvent(decoratedEvent, userId) });
+    const hotEligibleUserCount = await getHotEligibleUserCount();
+    return response.json({ event: toPublicEvent(withHotStatus(decoratedEvent, hotEligibleUserCount), userId) });
   }
 
   const database = readDatabase();
@@ -2239,18 +3369,43 @@ app.patch("/api/events/:eventId/engagement", async (request, response) => {
   }
   if (changed) {
     event.updatedAt = new Date().toISOString();
-    event.hotScore = getEventHotScore(event);
-    event.isHot = event.hotScore >= HOT_EVENT_THRESHOLD;
     writeDatabase(database);
   }
   const [updatedEvent] = await decorateEventsWithCurrentOrganizers([event], database);
-  return response.json({ event: toPublicEvent(updatedEvent, userId) });
+  const hotEligibleUserCount = await getHotEligibleUserCount(database);
+  return response.json({ event: toPublicEvent(withHotStatus(updatedEvent, hotEligibleUserCount), userId) });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
       return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
     }
     console.error("Event engagement update failed.", error);
     return response.status(500).json({ error: "Unable to update this event interaction right now." });
+  }
+});
+
+app.post("/api/events/:eventId/reminders/schedule", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in to schedule an event reminder." });
+    if (!isMongoConnected()) return response.status(503).json({ error: "Durable reminders require the shared MongoDB database. Configure MONGO_URI and retry." });
+    const event = await findStoredEvent(request.params.eventId);
+    if (!event || !["Published", "Live"].includes(event.status)) return response.status(404).json({ error: "This event is no longer available." });
+    const notifyAt = typeof request.body?.notifyAt === "string" ? request.body.notifyAt : "";
+    if (!Number.isFinite(new Date(notifyAt).getTime())) return response.status(400).json({ error: "Choose a valid reminder time." });
+    const userId = String(user._id || user.id);
+    const reminderAt = new Date(notifyAt);
+    await scheduleCustomEventReminder(event, userId, reminderAt);
+    await EngagementAction.updateOne(
+      { eventId: String(event.id), userId, type: "reminder" },
+      { $set: { faculty: String(user.profile?.faculty || "").trim().slice(0, 80), department: String(user.profile?.department || "").trim().slice(0, 100), customReminderAt: reminderAt } },
+      { upsert: true }
+    ).exec();
+    return response.status(201).json({ scheduled: true, notifyAt: reminderAt.toISOString() });
+  } catch (error) {
+    if (error.message?.includes("Choose a reminder time")) return response.status(400).json({ error: error.message });
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
+    console.error("Custom event reminder scheduling failed.", error);
+    return response.status(500).json({ error: "Unable to schedule this reminder right now." });
   }
 });
 
@@ -2290,16 +3445,46 @@ app.post("/api/events/:eventId/hype", async (request, response) => {
       event.hypedUserIds = request.body.enabled ? [...hypedUserIds, userId] : hypedUserIds.filter((id) => id !== userId);
       event.flameCount = Math.max(0, (Number(event.flameCount) || 0) + (request.body.enabled ? 1 : -1));
       event.updatedAt = new Date().toISOString();
-      event.hotScore = getEventHotScore(event);
-      event.isHot = event.hotScore >= HOT_EVENT_THRESHOLD;
       writeDatabase(database);
     }
     const [updatedEvent] = await decorateEventsWithCurrentOrganizers([event], database);
-    return response.json({ event: toPublicEvent(updatedEvent, userId), hypeCount: event.flameCount || 0 });
+    const hotEligibleUserCount = await getHotEligibleUserCount(database);
+    return response.json({ event: toPublicEvent(withHotStatus(updatedEvent, hotEligibleUserCount), userId), hypeCount: event.flameCount || 0 });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
     console.error("Event hype update failed.", error);
     return response.status(500).json({ error: "Unable to update event hype right now." });
+  }
+});
+
+app.get("/api/events/:eventId", async (request, response) => {
+  try {
+    const authorization = request.get("authorization") || "";
+    const user = authorization.startsWith("Bearer ") ? await getAuthenticatedUser(request) : null;
+    if (authorization.startsWith("Bearer ") && !user) return response.status(401).json({ error: "Session is no longer valid." });
+    const viewerId = user ? String(user._id || user.id) : "";
+    const event = await findStoredEvent(request.params.eventId);
+    if (!event) return response.status(404).json({ error: "Event not found." });
+    const isOwner = Boolean(viewerId && String(event.createdByUserId || "") === viewerId);
+    const eventEnd = new Date(event.endTime || "").getTime();
+    const ownerEndedRecently = isOwner && Number.isFinite(eventEnd)
+      && event.status !== "Cancelled"
+      && eventEnd <= Date.now()
+      && Date.now() - eventEnd <= 7 * 24 * 60 * 60_000;
+    const cancellationDate = new Date(event.cancelledAt || "").getTime();
+    const ownerCancelledRecently = isOwner && event.status === "Cancelled"
+      && Number.isFinite(cancellationDate)
+      && Date.now() - cancellationDate <= 7 * 24 * 60 * 60_000;
+    if (!ownerCancelledRecently && !ownerEndedRecently
+      && !(["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event))) {
+      return response.status(404).json({ error: "This event is no longer available." });
+    }
+    const [decoratedEvent] = await decorateEventsWithCurrentOrganizers([event], isMongoConnected() ? { users: [], events: [] } : readDatabase());
+    return response.json({ event: toPublicEvent(decoratedEvent, viewerId) });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
+    console.error("Event link request failed.", error);
+    return response.status(500).json({ error: "Unable to load this event." });
   }
 });
 
@@ -2321,9 +3506,46 @@ app.use((error, request, response, next) => {
 });
 
 async function startServer() {
-  const listen = () => app.listen(PORT, "0.0.0.0", () => {
-    console.log(`FUTApulse API listening on port ${PORT}`);
-  });
+  const listen = () => {
+    initializePushProviders();
+    realtimeServer = new SocketServer(httpServer, {
+      cors: { origin: process.env.CORS_ORIGIN ? CORS_ORIGINS : true, credentials: true },
+      transports: ["websocket", "polling"]
+    });
+    realtimeServer.use(async (socket, next) => {
+      try {
+        const token = typeof socket.handshake.auth?.token === "string" ? socket.handshake.auth.token : "";
+        if (!token) return next(new Error("Authentication required."));
+        const claims = jwt.verify(token, JWT_SECRET);
+        if (claims.tokenUse !== "access") return next(new Error("Session is no longer valid."));
+        const user = isMongoConnected()
+          ? await findMongoUserById(claims.sub)
+          : readDatabase().users.find((storedUser) => storedUser.id === claims.sub) || null;
+        if (!user || (claims.sessionVersion || 0) !== (user.sessionVersion || 0)) return next(new Error("Session is no longer valid."));
+        socket.data.userId = String(user._id || user.id);
+        return next();
+      } catch (error) {
+        return next(new Error(error instanceof jwt.JsonWebTokenError ? "Session is no longer valid." : "Unable to authenticate the live connection."));
+      }
+    });
+    realtimeServer.on("connection", (socket) => {
+      socket.join(`user:${socket.data.userId}`);
+    });
+    httpServer.listen(PORT, "0.0.0.0", () => {
+      console.log(`FUTApulse API listening on port ${PORT}`);
+      if (process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY) console.log("Web Push delivery is configured.");
+      if (!(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY)) {
+        console.warn("Web Push credentials are missing. Browser/OS permission alone cannot enable closed-app delivery. Configure Web Push credentials in Render.");
+      }
+    });
+    if (isMongoConnected()) {
+      notificationWorkerTimer = setInterval(() => {
+        void runNotificationWorker().catch((error) => console.error("Notification worker tick failed.", error));
+      }, 1000);
+      notificationWorkerTimer.unref?.();
+    }
+    return httpServer;
+  };
 
   if (!process.env.MONGO_URI) {
     ensureDatabase();
@@ -2333,7 +3555,11 @@ async function startServer() {
 
   return mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 5000 })
     .then(async () => {
-      await Promise.all([User.init(), EmailChallenge.init(), EventRecord.init(), EngagementAction.init(), EventReport.init()]);
+      await Promise.all([
+        User.init(), EmailChallenge.init(), EventRecord.init(), EngagementAction.init(), EventReport.init(),
+        EventView.init(), RecapPromptDismissal.init(),
+        PushDevice.init(), NotificationJob.init()
+      ]);
       databaseBackend = "mongodb";
       console.log("FUTApulse connected to MongoDB and verified indexes.");
       return listen();
@@ -2353,6 +3579,6 @@ if (require.main === module) {
 module.exports = {
   app,
   startServer,
-  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport },
+  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob },
   buildFacultyTurnoutBreakdown
 };

@@ -106,11 +106,60 @@ test("Phase 2 Mongo models define event lookup and per-account action uniqueness
   const eventIndexes = models.EventRecord.schema.indexes();
   const actionIndexes = models.EngagementAction.schema.indexes();
   const reportIndexes = models.EventReport.schema.indexes();
+  const viewIndexes = models.EventView.schema.indexes();
+  const recapDismissalIndexes = models.RecapPromptDismissal.schema.indexes();
+  const notificationIndexes = models.NotificationJob.schema.indexes();
 
   assert.ok(eventIndexes.some(([fields]) => fields.eventId === 1));
   assert.ok(eventIndexes.some(([fields]) => fields.status === 1 && fields.endsAt === 1));
   assert.ok(actionIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && fields.type === 1 && options.unique));
   assert.ok(reportIndexes.some(([fields]) => fields.eventId === 1));
+  assert.ok(viewIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && options.unique));
+  assert.ok(recapDismissalIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && options.unique));
+  assert.ok(notificationIndexes.some(([fields, options]) => fields.idempotencyKey === 1 && options.unique));
+});
+
+test("notification category preferences default enabled and persist as user-profile metadata", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const account = await createVerifiedAccount(baseUrl, "notification-preferences@futa.edu.ng", "notify_prefs");
+  const categories = ["academic", "tech", "social", "religious", "sports", "seminars"];
+  assert.deepEqual(account.user.profile.notificationPreferences, Object.fromEntries(categories.map((category) => [category, true])));
+  assert.equal(account.user.profile.notificationPreferencesOnboardingComplete, false);
+
+  const saved = await fetch(`${baseUrl}/api/notifications/preferences`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${account.token}` },
+    body: JSON.stringify({ notificationPreferences: { social: false, seminars: false } })
+  });
+  assert.equal(saved.status, 200);
+  const savedBody = await saved.json();
+  assert.deepEqual(savedBody.notificationPreferences, {
+    academic: true, tech: true, social: false, religious: true, sports: true, seminars: false
+  });
+  assert.equal(savedBody.notificationPreferencesOnboardingComplete, true);
+
+  const session = await fetch(`${baseUrl}/api/auth/session`, { headers: { Authorization: `Bearer ${account.token}` } });
+  const sessionBody = await session.json();
+  assert.deepEqual(sessionBody.user.profile.notificationPreferences, savedBody.notificationPreferences);
+  assert.equal(sessionBody.user.profile.notificationPreferencesOnboardingComplete, true);
+});
+
+test("notification delivery status requires authentication and distinguishes server and device readiness", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const account = await createVerifiedAccount(baseUrl, "notification-status@futa.edu.ng", "notify_status");
+  const unauthorized = await fetch(`${baseUrl}/api/notifications/status?platform=web`);
+  assert.equal(unauthorized.status, 401);
+
+  const headers = { Authorization: `Bearer ${account.token}` };
+  const invalidPlatform = await fetch(`${baseUrl}/api/notifications/status?platform=desktop`, { headers });
+  assert.equal(invalidPlatform.status, 400);
+
+  const response = await fetch(`${baseUrl}/api/notifications/status?platform=web`, { headers });
+  assert.equal(response.status, 200);
+  const status = await response.json();
+  assert.equal(typeof status.durableSchedulingAvailable, "boolean");
+  assert.equal(typeof status.pushConfigured, "boolean");
+  assert.equal(status.deviceRegistered, false);
 });
 
 test("faculty turnout groups attendance and recovers faculty from the attendee account when an action has no snapshot", () => {
@@ -145,6 +194,33 @@ test("health and readiness clearly report the local development storage mode", a
   assert.equal(readiness.operationalMongoCutover, false);
 });
 
+test("notification configuration reports recap upload availability without exposing secrets", async () => {
+  const original = {
+    cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+    apiKey: process.env.CLOUDINARY_API_KEY,
+    apiSecret: process.env.CLOUDINARY_API_SECRET
+  };
+  delete process.env.CLOUDINARY_CLOUD_NAME;
+  delete process.env.CLOUDINARY_API_KEY;
+  delete process.env.CLOUDINARY_API_SECRET;
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/notifications/config`);
+    assert.equal(response.status, 200);
+    const config = await response.json();
+    assert.equal(config.recapUploadConfigured, false);
+    assert.deepEqual(config.recapUploadMissingVariables, ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]);
+    assert.equal(Object.hasOwn(config, "CLOUDINARY_API_SECRET"), false);
+    assert.doesNotMatch(JSON.stringify(config), /api_secret\s*:/i);
+  } finally {
+    if (original.cloudName === undefined) delete process.env.CLOUDINARY_CLOUD_NAME;
+    else process.env.CLOUDINARY_CLOUD_NAME = original.cloudName;
+    if (original.apiKey === undefined) delete process.env.CLOUDINARY_API_KEY;
+    else process.env.CLOUDINARY_API_KEY = original.apiKey;
+    if (original.apiSecret === undefined) delete process.env.CLOUDINARY_API_SECRET;
+    else process.env.CLOUDINARY_API_SECRET = original.apiSecret;
+  }
+});
+
 test("signup sends verification through Gmail API and sanitizes provider failures", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const originalEmailSender = app.locals.emailSender;
@@ -154,7 +230,7 @@ test("signup sends verification through Gmail API and sanitizes provider failure
   const apiRequests = [];
   const providerLogs = [];
   let oauthSignal;
-  let shouldFail = false;
+  let failureType = "";
 
   app.locals.emailSender = undefined;
   app.locals.gmailOAuthClientFactory = ({ clientId, clientSecret, transporterOptions }) => {
@@ -165,15 +241,30 @@ test("signup sends verification through Gmail API and sanitizes provider failure
     oauthSignal = transporterOptions.signal;
     return {
       setCredentials: (credentials) => assert.deepEqual(credentials, { refresh_token: "gmail-refresh-token-for-tests" }),
-      getAccessToken: async () => ({ token: "gmail-api-access-token-for-tests" })
+      getAccessToken: async () => {
+        if (failureType === "invalid_grant") {
+          const error = new Error("invalid_grant: sender authorization was revoked.");
+          error.response = { data: { error: "invalid_grant", error_description: "Refresh token expired or revoked." } };
+          throw error;
+        }
+        return { token: "gmail-api-access-token-for-tests" };
+      }
     };
   };
   app.locals.gmailApiFetch = async (url, options) => {
     apiRequests.push({ url, options });
-    if (shouldFail) {
-      const error = new Error("Gmail delivery failed for gmail-failure@futa.edu.ng.");
-      error.response = { status: 403 };
-      throw error;
+    if (failureType === "permission") {
+      return {
+        ok: false,
+        status: 403,
+        json: async () => ({
+          error: {
+            code: 403,
+            message: "Insufficient Permission",
+            errors: [{ reason: "insufficientPermissions" }]
+          }
+        })
+      };
     }
     return {
       ok: true,
@@ -205,22 +296,35 @@ test("signup sends verification through Gmail API and sanitizes provider failure
     const textBody = Buffer.from(encodedTextBody.replace(/\s/g, ""), "base64").toString("utf8");
     assert.match(textBody, /Your FUTApulse verification code is \d{6}/);
 
-    shouldFail = true;
+    failureType = "permission";
     const failure = await fetch(`${baseUrl}/api/auth/signup`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: "gmail-failure@futa.edu.ng", username: "gmail_failure", password: "CorrectPassword1" })
     });
     assert.equal(failure.status, 502);
-    assert.match((await failure.json()).error, /Gmail API email delivery failed or timed out/);
+    assert.match((await failure.json()).error, /lacks the gmail.send permission/);
     assert.equal(providerLogs.length, 1);
     assert.equal(providerLogs[0][0], "Gmail API email delivery failed.");
     assert.equal(providerLogs[0][1].statusCode, 403);
+    assert.equal(providerLogs[0][1].reason, "insufficientPermissions");
     assert.doesNotMatch(JSON.stringify(providerLogs[0]), /gmail-failure@futa\.edu\.ng/);
     const savedDatabase = JSON.parse(fs.readFileSync(dataFile, "utf8"));
     assert.equal(savedDatabase.emailChallenges.some((challenge) => challenge.email === "gmail-failure@futa.edu.ng"), false);
 
-    shouldFail = false;
+    failureType = "invalid_grant";
+    const tokenFailure = await fetch(`${baseUrl}/api/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "gmail-token-failure@futa.edu.ng", username: "gmail_token_failure", password: "CorrectPassword1" })
+    });
+    assert.equal(tokenFailure.status, 502);
+    assert.match((await tokenFailure.json()).error, /GMAIL_REFRESH_TOKEN \(invalid_grant\)/);
+    assert.equal(providerLogs.length, 2);
+    assert.equal(providerLogs[1][1].code, "invalid_grant");
+    assert.doesNotMatch(JSON.stringify(providerLogs[1]), /gmail-token-failure@futa\.edu\.ng/);
+
+    failureType = "";
     const configuredRefreshToken = process.env.GMAIL_REFRESH_TOKEN;
     delete process.env.GMAIL_REFRESH_TOKEN;
     const unconfigured = await fetch(`${baseUrl}/api/auth/signup`, {
@@ -253,14 +357,125 @@ test.after(async () => {
   fs.rmSync(dataDirectory, { recursive: true, force: true });
 });
 
-test("GET /api/events/hot returns only qualifying events, ranked by engagement score", async () => {
-  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/events/hot`);
-  assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.equal(body.events.length, 2);
-  assert.deepEqual(body.events.map((event) => event.id), ["event-high", "event-ended-29m"]);
-  assert.equal(body.events[0].hotScore, 15);
-  assert.equal(body.events[0].isHot, true);
+test("GET /api/events/hot includes every event with RSVPs from over half of profile-complete verified accounts", async () => {
+  const originalDatabase = fs.readFileSync(dataFile, "utf8");
+  const completeProfile = { name: "Test Student", faculty: "SEET", department: "Computer Science", level: "200", role: "explorer" };
+  const users = [
+    ...Array.from({ length: 4 }, (_, index) => ({
+      id: `hot-eligible-${index}`,
+      emailVerified: true,
+      profile: { ...completeProfile }
+    })),
+    { id: "hot-incomplete-profile", emailVerified: true, profile: { name: "Incomplete Student" } },
+    { id: "hot-unverified", emailVerified: false, profile: { ...completeProfile } }
+  ];
+  const hotEvents = [
+    ...eventData.map((event) => ({ ...event })),
+    ...Array.from({ length: 7 }, (_, index) => createEvent({
+      id: `event-extra-hot-${index}`,
+      title: `Extra Hot ${index}`,
+      rsvpCount: 3,
+      reminderCount: 0,
+      flameCount: 0
+    }))
+  ];
+  const exactHalf = hotEvents.find((event) => event.id === "event-low");
+  exactHalf.rsvpCount = 2;
+  exactHalf.reminderCount = 4;
+  const endedHot = hotEvents.find((event) => event.id === "event-ended-29m");
+  endedHot.rsvpCount = 3;
+
+  try {
+    fs.writeFileSync(dataFile, JSON.stringify({ profiles: [], users, events: hotEvents }, null, 2));
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/events/hot`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    const hotIds = body.events.map((event) => event.id);
+    assert.equal(body.events.length, 10, "all qualifying events must be returned, without a top-five cap");
+    assert.ok(hotIds.includes("event-high"));
+    assert.ok(hotIds.includes("event-mid"));
+    assert.ok(hotIds.includes("event-ended-29m"), "events remain eligible during the existing ended grace period");
+    assert.equal(hotIds.includes("event-low"), false, "exactly half is not more than half, even with high reminders");
+    assert.equal(body.events.find((event) => event.id === "event-mid").hotRsvpPercentage, 75);
+    assert.ok(body.events.every((event) => event.isHot));
+  } finally {
+    fs.writeFileSync(dataFile, originalDatabase);
+  }
+});
+
+test("visible event views are unique, exclude the organizer, and are private owner aggregates", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const owner = await createVerifiedAccount(baseUrl, "event-view-owner@futa.edu.ng", "event_view_owner");
+  const viewer = await createVerifiedAccount(baseUrl, "event-viewer@futa.edu.ng", "event_viewer");
+  const activeEvent = createEvent({
+    id: "event-view-count",
+    title: "View-count event",
+    createdByUserId: owner.user.id
+  });
+  const endedEvent = createEvent({
+    id: "event-view-dismissal",
+    title: "Recap reminder event",
+    createdByUserId: owner.user.id,
+    date: new Date(Date.now() - 90 * 60_000).toISOString(),
+    startTime: new Date(Date.now() - 90 * 60_000).toISOString(),
+    endTime: new Date(Date.now() - 5 * 60_000).toISOString()
+  });
+  const expiredPublicEvent = createEvent({
+    id: "event-ended-outside-public-window",
+    title: "Private organizer recap access",
+    createdByUserId: owner.user.id,
+    date: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+    startTime: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+    endTime: new Date(Date.now() - 40 * 60_000).toISOString(),
+    recapPhotos: [{ url: "https://images.example.test/recap.webp" }],
+    recapPublishedAt: new Date().toISOString()
+  });
+  const database = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  database.events.push(activeEvent, endedEvent, expiredPublicEvent);
+  fs.writeFileSync(dataFile, JSON.stringify(database, null, 2));
+
+  const viewerHeaders = { Authorization: `Bearer ${viewer.token}` };
+  const firstView = await fetch(`${baseUrl}/api/events/${activeEvent.id}/views`, { method: "POST", headers: viewerHeaders });
+  const duplicateView = await fetch(`${baseUrl}/api/events/${activeEvent.id}/views`, { method: "POST", headers: viewerHeaders });
+  const ownerView = await fetch(`${baseUrl}/api/events/${activeEvent.id}/views`, { method: "POST", headers: { Authorization: `Bearer ${owner.token}` } });
+  assert.equal(firstView.status, 200);
+  assert.deepEqual(await firstView.json(), { recorded: true });
+  assert.equal(duplicateView.status, 200);
+  assert.deepEqual(await duplicateView.json(), { recorded: false });
+  assert.deepEqual(await ownerView.json(), { recorded: false });
+
+  const ownerEventsResponse = await fetch(`${baseUrl}/api/events`, { headers: { Authorization: `Bearer ${owner.token}` } });
+  const ownerEvents = (await ownerEventsResponse.json()).events;
+  assert.equal(ownerEvents.find((event) => event.id === activeEvent.id).viewCount, 1);
+  const ownerEngagementResponse = await fetch(`${baseUrl}/api/events/engagement`, {
+    headers: { Authorization: `Bearer ${owner.token}` }
+  });
+  const ownerEngagement = (await ownerEngagementResponse.json()).updates.find((event) => event.id === activeEvent.id);
+  assert.equal(ownerEngagement.viewCount, 1);
+  const viewerEventsResponse = await fetch(`${baseUrl}/api/events`, { headers: viewerHeaders });
+  const viewerEvent = (await viewerEventsResponse.json()).events.find((event) => event.id === activeEvent.id);
+  assert.equal(Object.hasOwn(viewerEvent, "viewCount"), false);
+  const viewerEngagementResponse = await fetch(`${baseUrl}/api/events/engagement`, { headers: viewerHeaders });
+  const viewerEngagement = (await viewerEngagementResponse.json()).updates.find((event) => event.id === activeEvent.id);
+  assert.equal(Object.hasOwn(viewerEngagement, "viewCount"), false);
+
+  const dismissalResponse = await fetch(`${baseUrl}/api/events/${endedEvent.id}/recap-prompt-dismissal`, {
+    method: "POST",
+    headers: { ...{ "Content-Type": "application/json" }, Authorization: `Bearer ${owner.token}` }
+  });
+  assert.equal(dismissalResponse.status, 200);
+  const refreshedOwnerEvents = await fetch(`${baseUrl}/api/events`, { headers: { Authorization: `Bearer ${owner.token}` } });
+  const dismissedEvent = (await refreshedOwnerEvents.json()).events.find((event) => event.id === endedEvent.id);
+  assert.equal(dismissedEvent.recapPromptDismissed, true);
+
+  const publicExpiredEventResponse = await fetch(`${baseUrl}/api/events/${expiredPublicEvent.id}`);
+  assert.equal(publicExpiredEventResponse.status, 404);
+  const ownerExpiredEventResponse = await fetch(`${baseUrl}/api/events/${expiredPublicEvent.id}`, {
+    headers: { Authorization: `Bearer ${owner.token}` }
+  });
+  assert.equal(ownerExpiredEventResponse.status, 200);
+  const ownerExpiredEvent = (await ownerExpiredEventResponse.json()).event;
+  assert.equal(ownerExpiredEvent.viewCount, undefined);
 });
 
 test("Google onboarding saves a FUTApulse password that works for username sign-in", async () => {
@@ -346,13 +561,26 @@ test("legacy Google-only accounts can set their first FUTApulse password using a
 });
 
 test("GET /api/events/hot keeps ended events only through the 30-minute grace period", async () => {
-  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/events/hot`);
-  assert.equal(response.status, 200);
-  const { events } = await response.json();
-  assert.ok(events.some((event) => event.id === "event-ended-29m"));
-  assert.ok(!events.some((event) => event.id === "event-ended-31m"));
-  assert.ok(!events.some((event) => event.id === "event-no-end"));
-  assert.ok(!events.some((event) => event.id === "event-invalid-window"));
+  const originalDatabase = fs.readFileSync(dataFile, "utf8");
+  const profile = { name: "Test Student", faculty: "SEET", department: "Computer Science", level: "200", role: "explorer" };
+  const users = Array.from({ length: 4 }, (_, index) => ({
+    id: `hot-grace-eligible-${index}`,
+    emailVerified: true,
+    profile: { ...profile }
+  }));
+  try {
+    const database = JSON.parse(originalDatabase);
+    fs.writeFileSync(dataFile, JSON.stringify({ ...database, users }, null, 2));
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/events/hot`);
+    assert.equal(response.status, 200);
+    const { events } = await response.json();
+    assert.ok(events.some((event) => event.id === "event-ended-29m"));
+    assert.ok(!events.some((event) => event.id === "event-ended-31m"));
+    assert.ok(!events.some((event) => event.id === "event-no-end"));
+    assert.ok(!events.some((event) => event.id === "event-invalid-window"));
+  } finally {
+    fs.writeFileSync(dataFile, originalDatabase);
+  }
 });
 
 test("GET /api/events preserves the shared grace window and omits legacy invalid-time events", async () => {
@@ -496,7 +724,6 @@ test("POST /api/events/:eventId/hype requires sign-in and applies an idempotent 
   const body = await response.json();
   assert.equal(body.hypeCount, 1);
   assert.equal(body.event.flameCount, 1);
-  assert.equal(body.event.hotScore, 1);
   assert.equal(body.event.isHot, false);
   assert.equal(body.event.isHyped, true);
   const repeated = await request(true);
@@ -664,6 +891,57 @@ test("drafts are private and only their owner can permanently delete them", asyn
   assert.ok(!(await ownerEventsAfterDelete.json()).events.some((event) => event.id === draft.id));
 });
 
+test("cancelled events leave the public feed, stay in the owner's seven-day profile archive, and can be removed", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const owner = await createVerifiedAccount(baseUrl, "cancelled-archive@futa.edu.ng", "cancelled_archive");
+  const ownerHeaders = { Authorization: `Bearer ${owner.token}` };
+  const guest = await createVerifiedAccount(baseUrl, "cancelled-viewer@futa.edu.ng", "cancelled_viewer");
+  const event = createEvent({
+    id: "event-cancelled-owner-archive",
+    title: "Cancelled but retained privately",
+    createdByUserId: owner.user.id,
+    date: new Date(Date.now() + 86400000).toISOString(),
+    endTime: new Date(Date.now() + 90000000).toISOString()
+  });
+  const endedEvent = createEvent({
+    id: "event-ended-owner-removal",
+    title: "Ended event can be removed directly",
+    createdByUserId: owner.user.id,
+    date: new Date(Date.now() - 3 * 86400000).toISOString(),
+    endTime: new Date(Date.now() - 2 * 86400000).toISOString()
+  });
+  const database = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  database.events.push(event, endedEvent);
+  fs.writeFileSync(dataFile, JSON.stringify(database, null, 2));
+
+  const cancellation = await fetch(`${baseUrl}/api/events/${event.id}`, { method: "DELETE", headers: ownerHeaders });
+  assert.equal(cancellation.status, 200);
+  assert.equal((await cancellation.json()).cancelled, true);
+
+  const publicEvents = await fetch(`${baseUrl}/api/events`, { headers: { Authorization: `Bearer ${guest.token}` } });
+  assert.ok(!(await publicEvents.json()).events.some((item) => item.id === event.id));
+  const publicDetails = await fetch(`${baseUrl}/api/events/${event.id}`, { headers: { Authorization: `Bearer ${guest.token}` } });
+  assert.equal(publicDetails.status, 404);
+  const ownerEvents = await fetch(`${baseUrl}/api/events`, { headers: ownerHeaders });
+  const archivedEvent = (await ownerEvents.json()).events.find((item) => item.id === event.id);
+  assert.equal(archivedEvent.status, "Cancelled");
+
+  const removal = await fetch(`${baseUrl}/api/events/${event.id}`, { method: "DELETE", headers: ownerHeaders });
+  assert.equal(removal.status, 200);
+  assert.equal((await removal.json()).removed, true);
+  const refreshedOwnerEvents = await fetch(`${baseUrl}/api/events`, { headers: ownerHeaders });
+  const finalEvents = (await refreshedOwnerEvents.json()).events;
+  assert.ok(!finalEvents.some((item) => item.id === event.id));
+  assert.ok(finalEvents.some((item) => item.id === endedEvent.id));
+  const removeEndedEvent = await fetch(`${baseUrl}/api/events/${endedEvent.id}`, { method: "DELETE", headers: ownerHeaders });
+  assert.equal(removeEndedEvent.status, 200);
+  const endedRemoval = await removeEndedEvent.json();
+  assert.equal(endedRemoval.removed, true);
+  assert.equal(endedRemoval.cancelled, undefined);
+  const finalOwnerEvents = await fetch(`${baseUrl}/api/events`, { headers: ownerHeaders });
+  assert.ok(!(await finalOwnerEvents.json()).events.some((item) => item.id === endedEvent.id));
+});
+
 test("account deletion removes events owned by that account", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const owner = await createVerifiedAccount(baseUrl, "delete-owner@futa.edu.ng", "delete_owner");
@@ -692,6 +970,14 @@ test("account deletion removes events owned by that account", async () => {
   });
   assert.equal(createdResponse.status, 201);
   const eventId = (await createdResponse.json()).event.id;
+  const localDatabase = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  localDatabase.pushDevices = [{ userId: owner.user.id, deviceKey: "delete-owner-device" }];
+  localDatabase.notificationJobs = [
+    { recipientUserId: owner.user.id, eventId: "another-event" },
+    { recipientUserId: "another-user", eventId }
+  ];
+  localDatabase.engagementActions = [{ userId: owner.user.id, eventId: "another-event" }];
+  fs.writeFileSync(dataFile, JSON.stringify(localDatabase));
 
   const deletion = await fetch(`${baseUrl}/api/auth/account`, {
     method: "DELETE",
@@ -701,6 +987,10 @@ test("account deletion removes events owned by that account", async () => {
   assert.equal(deletion.status, 200);
   const eventsAfterDeletion = await fetch(`${baseUrl}/api/events`);
   assert.ok(!(await eventsAfterDeletion.json()).events.some((event) => event.id === eventId));
+  const afterDeletion = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  assert.deepEqual(afterDeletion.pushDevices, []);
+  assert.deepEqual(afterDeletion.engagementActions, []);
+  assert.deepEqual(afterDeletion.notificationJobs, []);
 });
 
 test("account security supports email/password changes and confirmed deletion", async () => {
