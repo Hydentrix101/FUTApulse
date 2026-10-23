@@ -56,17 +56,16 @@ FUTApulse is the dedicated campus event discovery and social engagement platform
 ## 4. Commercial Architecture & Revenue
 
 ### Product and rollout scope
-- FUTApulse is being built as a mobile app for phones. The current Vite + React UI is mobile-first, but it does not yet include an Android/iOS native project or mobile ads SDK.
+- FUTApulse is a PWA-only product. The Vite + React application is mobile-first and runs in supported phone browsers; do not add Capacitor, Android/iOS native projects, native plugins, or native SDK integrations.
 - **Current stage:** ad preparation only. Keep live ads disabled and render clearly labeled mock placements. Do not add browser-only Google AdSense tags or assume a website monetization flow.
-- **Initial revenue channel:** mobile app sponsorship inventory through Google AdMob, using native in-feed placements and an app-open placement only after the relevant mobile SDK and platform lifecycle integration exist.
-- **Deferred revenue channel:** native ticket sales through Paystack or Flutterwave are out of scope until FUTApulse is established and adopted at FUTA. Do not add checkout flows, payment credentials, or ticket issuance in the current phase.
+- **Potential revenue channel:** web sponsorship or advertising only after provider setup, disclosures, consent, and web integration are reviewed. Keep current placements as house/mock content until then.
+- **Deferred revenue channel:** ticket sales through Paystack or Flutterwave are out of scope until FUTApulse is established and adopted at FUTA. Do not add checkout flows, payment credentials, or ticket issuance in the current phase.
 
-### Mobile ad configuration and component contract
-- Read only public ad mode and ad-unit identifiers from Vite configuration in `client/.env`; use `client/.env.example` as the template. Vite `VITE_*` values are included in client builds, so they must never contain private keys, payment secrets, SMTP credentials, or OAuth secrets.
-- Keep `VITE_ADS_MODE=mock` as the default. AdMob identifiers are public provider identifiers, separated by platform and placement (Android/iOS native feed and app-open units). Empty identifiers or a missing native adapter must resolve to the mock UI, never to a broken or blank slot.
-- Vite values are not a substitute for native setup: when an Android/iOS project is added, configure each app ID in the native SDK's required manifest or plist as well as the matching ad units in its adapter.
-- `NativeAdCard.jsx` owns the responsive, clearly labeled sponsored-card shell, matching the event-card glass style (`bg-slate-900/60 border border-slate-800 rounded-2xl`) and the 480px feed width. In mock mode, show the FUTApulse partner preview artwork and CTA. In AdMob mode, accept/render a native ad view supplied by the selected mobile SDK adapter; do not render an HTML `<ins class="adsbygoogle">` element or load a web ad script.
-- Keep the launch-ad preview skippable, time-limited to two seconds, and outside authentication/session recovery. Shared-event deep links must bypass it. Actual app-open ads may be introduced only through the native SDK lifecycle adapter and must preserve skip/dismiss behavior.
+### Sponsored content contract
+- Vite `VITE_*` values are included in client builds, so they must never contain private keys, payment secrets, SMTP credentials, or OAuth secrets.
+- Keep sponsored placements clearly labeled and separate from event records, organizer data, and event actions. Mock destinations must never imply a real sponsor offer.
+- Do not add mobile platform ad identifiers or native ad adapters. Any future live ads require a reviewed web integration, approved provider setup, disclosures, and consent behavior.
+- Keep the launch-ad preview skippable, time-limited, and outside authentication/session recovery. Shared-event deep links must bypass it.
 - Preserve clear `Sponsored` labeling and keep sponsored content separate from event records, organizer data, and event actions. Mock destinations must never imply a real sponsor offer.
 
 ### Privacy, support, and platform review

@@ -8,6 +8,4 @@ client/playwright-report/
 .env
 .env.*
 !.env.example
-!client/.env.android
-client/android/app/google-services.json
 **/service-account*.json

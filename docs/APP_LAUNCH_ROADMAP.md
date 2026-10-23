@@ -4,17 +4,17 @@ This roadmap is the working launch path for FUTApulse. It gives us a safe sequen
 
 ## Product boundaries
 
-- FUTApulse is a mobile-first app for FUTA students. The first release may be accessed through a phone browser/PWA and later distributed as an Android APK; app-store publication is not required for the initial campus rollout.
+- FUTApulse is a mobile-first app for FUTA students and is distributed as an installable Progressive Web App (PWA). Android and iOS users access the same hosted web app through their browser and may install it where supported; native app packages are out of scope.
 - Launch scope prioritizes reliable event discovery, account-bound event ownership, server-confirmed attendance, reminders, reporting, and basic account support.
 - Ticket sales are deferred until the app is established on campus.
-- Live advertising is deferred. Keep sponsored placements in mock mode until the mobile platform, provider setup, legal disclosures, and privacy review are ready.
+- Live advertising is deferred. Keep sponsored placements in mock mode until web ad support, provider setup, legal disclosures, and privacy review are ready.
 - Feature changes remain welcome. Before a phase that depends on a feature, confirm whether that feature is still in scope and update this roadmap.
 
 ## Current roadmap position
 
 - **Phases 0–2: Complete.** Product baseline and API/data contracts are recorded; Atlas is the deployed shared database with production readiness guards.
 - **Phase 3: Complete.** The owner reports that the live Vercel/Render signup and Gmail verification flow has been tested successfully in production.
-- **Phase 4: Implementation prepared; beta device verification in progress.** The PWA and Android packaging scaffold are present. Install, offline, update, sign-in persistence, and shared-link checks on supported phones are assigned to the seven-member beta team.
+- **Phase 4: Implementation prepared; beta device verification in progress.** The PWA is the sole delivery target. Install, offline, update, sign-in persistence, and shared-link checks on supported phones are assigned to the seven-member beta team.
 - **Phase 5: Notification implementation complete; beta verification in progress.** Notification persistence, server scheduling, delivery hooks, and regression coverage are implemented. The beta team owns the manual background/closed-app, permission, token renewal, opt-out, duplicate, and notification-tap deep-link checks. Phase 6 preparation can proceed in parallel; the device checks remain a release gate.
 - **Phase 6: In progress — legal, trust and safety, and pilot preparation.** Public privacy/terms/about routes and navigation are implemented, existing reporting and posting controls are retained, and beta feedback will be triaged while Google reviews the public site. Backup/restore and incident runbooks, Google Console branding, legal-content and retention confirmation, and pilot sign-off remain before broad rollout.
 
@@ -24,7 +24,7 @@ This roadmap is the working launch path for FUTApulse. It gives us a safe sequen
 
 - Review current Home, Explore, full event, profile, authentication, reminders, and reporting behavior with Immanuel.
 - Record launch-critical features, deferred features, known bugs, and any data that must be preserved.
-- The first phone delivery targets are both an installable PWA and an Android APK. Build the hosted app foundation once, then package it for Android.
+- The sole phone delivery target is the installable PWA. Build and deploy the hosted web app; do not package it as a native application.
 - Keep Remember me checked by default, with a clear way for a user to uncheck it.
 
 ### Phase 0 findings from Immanuel
@@ -144,7 +144,7 @@ These are accepted product requirements or queued design tasks. They are not all
 
 **Exit condition:** Met, based on the owner's live production verification.
 
-## Phase 4 - Mobile install and app packaging
+## Phase 4 - Mobile PWA installation and delivery
 
 **Purpose:** Deliver FUTApulse as a reliable installable Progressive Web App.
 
@@ -184,9 +184,9 @@ These are accepted product requirements or queued design tasks. They are not all
 - Confirm reporting thresholds, developer-only review access, email delivery, ban/ignore behavior, and account recovery in the deployed environment.
 - Define backup retention, restore steps, incident contact, and a way to pause event publishing if moderation or infrastructure fails.
 - Run an invite-only FUTA pilot, collect feedback, fix high-impact mobile issues, and then expand distribution with a QR/deep-link campaign.
-- Keep ads in mock mode at launch unless and until the selected native ad SDK, disclosures, consent needs, and provider review are complete. Keep ticket payments deferred.
+- Keep ads in mock mode at launch unless and until web ad support, disclosures, consent needs, and provider review are complete. Keep ticket payments deferred.
 - Verify Google OAuth branding, support email, authorized domain, homepage, and policy links in Google Cloud Console; these settings cannot be completed by a repository code change.
-- For AdSense review, keep the public legal pages accessible without sign-in and ensure the published content and contact details are accurate. Do not set `VITE_IS_ADS_LIVE=true` until the advertising provider, approved account, ad placements, and required consent/disclosures are ready. The current React placements are house/mock cards and a provider-neutral native bridge; a publisher ID alone does not implement web AdSense inventory.
+- For AdSense review, keep the public legal pages accessible without sign-in and ensure the published content and contact details are accurate. Do not set `VITE_IS_ADS_LIVE=true` until the advertising provider, approved account, web ad placements, and required consent/disclosures are ready. Current React placements are house/mock cards; a publisher ID alone does not implement web AdSense inventory.
 
 **Exit condition:** Immanuel approves the pilot checklist, legal and retention details match deployed provider settings, essential flows work on phones, support and rollback steps are known, and no launch-critical data/security issue remains. Beta testing and Google site review may proceed concurrently with this preparation.
 
