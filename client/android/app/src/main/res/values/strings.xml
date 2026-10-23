@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">FUTApulse</string>
+    <string name="title_activity_main">FUTApulse</string>
+    <string name="package_name">ng.edu.futa.futapulse</string>
+    <string name="custom_url_scheme">ng.edu.futa.futapulse</string>
+</resources>
