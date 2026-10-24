@@ -162,6 +162,39 @@ test("notification delivery status requires authentication and distinguishes ser
   assert.equal(status.deviceRegistered, false);
 });
 
+test("background notification worker trigger is POST-only and requires its configured secret", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const originalSecret = process.env.CRON_SECRET_KEY;
+  delete process.env.CRON_SECRET_KEY;
+
+  try {
+    const unconfigured = await fetch(`${baseUrl}/api/internal/notifications/worker`, { method: "POST" });
+    assert.equal(unconfigured.status, 503);
+
+    process.env.CRON_SECRET_KEY = "test-cron-secret-with-sufficient-length";
+    const unauthorized = await fetch(`${baseUrl}/api/internal/notifications/worker`, {
+      method: "POST",
+      headers: { "x-cron-secret": "wrong-secret" }
+    });
+    assert.equal(unauthorized.status, 401);
+
+    const wrongMethod = await fetch(`${baseUrl}/api/internal/notifications/worker`, {
+      method: "GET",
+      headers: { "x-cron-secret": process.env.CRON_SECRET_KEY }
+    });
+    assert.equal(wrongMethod.status, 404);
+
+    const validSecretWithoutMongo = await fetch(`${baseUrl}/api/internal/notifications/worker`, {
+      method: "POST",
+      headers: { "x-cron-secret": process.env.CRON_SECRET_KEY }
+    });
+    assert.equal(validSecretWithoutMongo.status, 503);
+  } finally {
+    if (originalSecret === undefined) delete process.env.CRON_SECRET_KEY;
+    else process.env.CRON_SECRET_KEY = originalSecret;
+  }
+});
+
 test("faculty turnout groups attendance and recovers faculty from the attendee account when an action has no snapshot", () => {
   const turnout = buildFacultyTurnoutBreakdown([
     { userId: "attendee-one", faculty: "" },

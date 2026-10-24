@@ -63,6 +63,20 @@ To mint the refresh token with OAuth 2.0 Playground, add `https://developers.goo
 
 For ongoing use, publish the OAuth consent screen instead of leaving an external app in Testing: Google-issued refresh tokens for Gmail scopes expire after seven days while the app remains in Testing. Google may require sensitive-scope verification before the app is broadly available. Gmail API delivery avoids Render Free's blocked SMTP ports 25, 465, and 587 and does not require a custom sender domain, but it is a low-volume launch route, not a bulk transactional-mail guarantee. Consumer Gmail accounts have a sending limit of about 500 messages per rolling 24 hours; account restrictions, OAuth revocation, and deliverability controls can still interrupt mail. The current Gmail API quota documentation says `messages.send` uses 100 units and usage below 80 million quota units per project per day is not billed; at the consumer sending limit this app would use about 50,000 units/day. Google's billing terms and limits may change, so this is not an unlimited or permanent no-cost guarantee. Provider failures are logged with sanitized status/code/message so they can be diagnosed without exposing recipient addresses or credentials.
 
+## Background PWA notifications
+
+The PWA's service worker (`client/public/push-sw.js`) displays Web Push notifications while the site is backgrounded or closed, and forwards them to the open app for in-app display. This is separate from CORS and Socket.IO: those support browser API/live connections, but cannot wake a closed app.
+
+Production delivery requires all of the following:
+
+- MongoDB connected to persist the notification queue and device subscriptions.
+- `WEB_PUSH_PUBLIC_KEY` and `WEB_PUSH_PRIVATE_KEY` configured on the API host; optionally set `WEB_PUSH_SUBJECT` to a valid `mailto:` or HTTPS contact.
+- The user explicitly allows notifications and registers that browser/device from the FUTApulse notification settings.
+- A running server-side worker. The API runs an internal due-job poller while MongoDB is connected. The scheduled GitHub Actions workflow is a backup trigger, not a guaranteed real-time scheduler; GitHub may delay scheduled jobs. It calls **`POST /api/internal/notifications/worker`** with the `x-cron-secret` header and processes up to 50 due jobs per request.
+- Set `CRON_SECRET_KEY` in the Render API environment and set the same value as the GitHub Actions repository secret named `CRON_SECRET_KEY`. The endpoint returns 503 when the secret or MongoDB-backed queue is unavailable and rejects requests without the secret. Do not use `/api/ready` as a notification trigger; it is only a health/readiness check.
+
+For reliable production timing, keep the Render API/worker continuously running or move the poller to a dedicated always-on Render Background Worker. The five-minute GitHub schedule is only a recovery/fallback path and should not be used to keep a sleeping free web service alive. On iPhone/iPad, Web Push generally requires FUTApulse to be added to the Home Screen and notification permission granted; browser and operating-system settings can still suppress or delay alerts. Capacitor/FCM Android delivery is a separate future phase and is not part of the current PWA implementation.
+
 References: [Gmail API quota and billing threshold](https://developers.google.com/workspace/gmail/api/reference/quota), [Google OAuth refresh-token expiration](https://developers.google.com/identity/protocols/oauth2#expiration), and [Gmail sending limits](https://support.google.com/mail/answer/22839?hl=en).
 
 ## API foundation

@@ -2,14 +2,30 @@ name: FUTApulse Cloud Cron
 
 on:
   schedule:
-    # Runs every 5 minutes, 24/7, completely free on GitHub
+    # GitHub scheduled jobs can be delayed; the Render worker remains the
+    # primary low-latency scheduler when it is enabled.
     - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
-  run-cron:
+  notification-worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
+    concurrency:
+      group: futapulse-notification-worker
+      cancel-in-progress: false
+    env:
+      CRON_SECRET_KEY: ${{ secrets.CRON_SECRET_KEY }}
     steps:
-      - name: Hit Backend Notification Worker
+      - name: Process due notification jobs
         run: |
-          curl -s -X GET https://futapulse.onrender.com/api/ready \
-            -H "x-cron-secret: ${{ secrets.CRON_SECRET_KEY }}"
+          if [ -z "$CRON_SECRET_KEY" ]; then
+            echo "CRON_SECRET_KEY is not configured in GitHub Actions secrets." >&2
+            exit 1
+          fi
+          curl --fail-with-body --silent --show-error --max-time 90 \
+            --request POST \
+            --header "x-cron-secret: ${CRON_SECRET_KEY}" \
+            --header "Content-Type: application/json" \
+            --data '{"limit":20}' \
+            https://futapulse.onrender.com/api/internal/notifications/worker

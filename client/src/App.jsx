@@ -792,49 +792,6 @@ function FutaPulseApp() {
   }, [])
 
   useEffect(() => {
-    if (window.location.pathname !== '/' || sessionLoading || session?.token || user || guestSignInRequested
-      || launchVisible || !launchSequenceReady || isLaunchAdActive || loading
-      || !events.some((event) => ['Published', 'Live'].includes(event.status))) return undefined
-    if (document.getElementById('futapulse-adsense-script')) return undefined
-
-    const tcfApi = window.__tcfapi
-    if (typeof tcfApi !== 'function') return undefined
-
-    let active = true
-    let listenerId
-    const onConsentReady = (consentData, success) => {
-      if (!active) return
-      if (!success) {
-        console.error('AdSense remains disabled because the consent platform did not return a valid TCF response.')
-        return
-      }
-      if (!consentData || typeof consentData !== 'object') {
-        console.error('AdSense remains disabled because the consent platform returned invalid TCF data.')
-        return
-      }
-      listenerId = consentData.listenerId || listenerId
-      if (!['tcloaded', 'useractioncomplete'].includes(consentData.eventStatus)) return
-      if (document.getElementById('futapulse-adsense-script')) return
-
-      const script = document.createElement('script')
-      script.async = true
-      script.crossOrigin = 'anonymous'
-      script.id = 'futapulse-adsense-script'
-      script.src = 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3245954947133300'
-      script.addEventListener('error', () => {
-        console.error('The Google AdSense script could not be loaded.')
-      }, { once: true })
-      document.head.append(script)
-      if (listenerId) tcfApi('removeEventListener', 2, () => {}, listenerId)
-    }
-    tcfApi('addEventListener', 2, onConsentReady)
-    return () => {
-      active = false
-      if (listenerId) tcfApi('removeEventListener', 2, () => {}, listenerId)
-    }
-  }, [events, guestSignInRequested, isLaunchAdActive, launchSequenceReady, launchVisible, loading, session?.token, sessionLoading, user])
-
-  useEffect(() => {
     if (settingsPage !== 'notifications' || !session?.token) return undefined
     let active = true
     Promise.all([
@@ -3380,7 +3337,11 @@ function FutaPulseApp() {
                             : <p>This device is ready. Alerts can still be delayed by a weak connection, battery saver, or phone notification settings.</p>}
                     </>}
                     <button type="button" className="profile-edit-pill" onClick={() => { void enablePushNotifications() }} disabled={notificationDeliveryLoading || notificationDeliveryPermission === 'unsupported' || notificationDeliveryStatus?.pushConfigured === false}>
-                      {currentNotificationDeliveryPermission === 'granted' ? 'Connect this device' : 'Allow alerts on this device'}
+                      {currentNotificationDeliveryPermission !== 'granted'
+                        ? 'Allow alerts on this device'
+                        : notificationDeliveryStatus?.deviceRegistered
+                          ? 'Refresh device connection'
+                          : 'Connect this device'}
                     </button>
                   </section>
                   {CATEGORY_DATA.map(({ id, label }) => (
@@ -3559,7 +3520,7 @@ function LegalPage({ page }) {
         <h1>{title}</h1>
         {page === 'privacy' && (
           <>
-            <p className="legal-updated">Last updated: October 21, 2026</p>
+            <p className="legal-updated">Last updated: October 23, 2026</p>
             <p>FUTApulse helps students discover campus events, publish event information, and plan to attend. This policy explains what information the service uses and how to request its deletion.</p>
             <h2>Information we use</h2>
             <p>We use account details such as your email address, username, and the profile information you choose to provide (including name, faculty, department, and level). We also process events you publish, attendance and reminder actions, category notification preferences, reports you submit, and push-device subscription data when you enable notifications.</p>
@@ -3568,8 +3529,8 @@ function LegalPage({ page }) {
             <h2>Notifications and device data</h2>
             <p>If you enable browser or Android push notifications, the relevant push service provides a device token or subscription endpoint so FUTApulse can deliver event alerts and reminders. You can disable notifications through your device or browser settings; removing your FUTApulse account also removes its registered push devices and pending notifications.</p>
             <h2>Advertising and cookies</h2>
-            <p>FUTApulse loads Google AdSense only on the public campus-event browsing page when published event listings are available and a consent management platform has reported a completed IAB Transparency and Consent Framework (TCF) signal. Sign-in, privacy, terms, and other account-only screens do not load the AdSense script. Third-party vendors, including Google, may use cookies to serve ads based on your prior visits to this site or other websites. Google’s advertising cookies enable Google and its partners to serve ads based on your visits to this site and/or other sites. Learn more in <a href="https://policies.google.com/technologies/ads" target="_blank" rel="noopener noreferrer">Google’s advertising privacy information</a>. You can opt out of personalized advertising in <a href="https://www.google.com/settings/ads" target="_blank" rel="noopener noreferrer">Google Ads Settings</a>; alternatively, visit <a href="https://www.aboutads.info/choices/" target="_blank" rel="noopener noreferrer">aboutads.info choices</a> to opt out of some third-party vendors’ personalized advertising cookies.</p>
-            <p>For users in the European Economic Area, the United Kingdom, and Switzerland, the publisher must configure an applicable Google-certified consent management platform and disclose its selected ad technology providers in the publisher account before serving ads. If the consent platform is not available or has not completed its signal, FUTApulse does not load the AdSense script.</p>
+            <p>FUTApulse does not currently load Google AdSense or serve Google ads. Promotional cards shown in the app are FUTApulse house content. If third-party advertising is introduced, this policy and the app's consent flow will be updated before it is enabled. Google and other ad vendors may use cookies to serve ads based on visits to this site or other websites. Users can opt out of personalized advertising in <a href="https://www.google.com/settings/ads" target="_blank" rel="noopener noreferrer">Google Ads Settings</a> or visit <a href="https://www.aboutads.info/choices/" target="_blank" rel="noopener noreferrer">aboutads.info choices</a> to opt out of some third-party vendors' personalized advertising cookies.</p>
+            <p>Before serving Google ads to users in the European Economic Area, the United Kingdom, or Switzerland, the publisher must configure an applicable Google-certified consent management platform and disclose its selected ad technology providers in the publisher account.</p>
             <h2>How long information is kept and account deletion</h2>
             <p>Account information is kept while the account is active. You can request account deletion from Account &amp; Security Settings. When deletion completes, the active service removes the account, its profile, events it owns, engagement records, registered push devices, and pending notification jobs. Limited backup copies may remain until they are removed under the database provider’s configured backup-retention cycle; the applicable cycle should be confirmed with the service operator. Information required to address abuse, security, or legal obligations may be retained only where permitted or required.</p>
             <h2>Sharing and service providers</h2>

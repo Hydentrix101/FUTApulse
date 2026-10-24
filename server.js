@@ -667,40 +667,58 @@ async function dispatchNotificationJob(job) {
   if (failures.length) throw new Error(failures.map((error) => error.message).join("; "));
 }
 
-async function runNotificationWorker() {
-  if (!isMongoConnected()) return;
+async function runNotificationWorker({ limit = 1 } = {}) {
+  if (!isMongoConnected()) return { processed: 0, hasMore: false, unavailable: true };
+  const batchLimit = Math.min(50, Math.max(1, Number.isInteger(limit) ? limit : 1));
+  let processed = 0;
+
+  while (processed < batchLimit) {
+    const now = new Date();
+    const job = await NotificationJob.findOneAndUpdate({
+      dueAt: { $lte: now },
+      nextAttemptAt: { $lte: now },
+      $or: [
+        { status: "pending" },
+        { status: "processing", leaseUntil: { $lte: now } }
+      ]
+    }, {
+      $set: { status: "processing", leaseUntil: new Date(now.getTime() + 60_000) },
+      $inc: { attempts: 1 }
+    }, { new: true, sort: { dueAt: 1 } }).exec();
+    if (!job) break;
+
+    try {
+      await dispatchNotificationJob(job);
+      await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+        $set: { status: "sent", sentAt: new Date(), leaseUntil: null, lastError: "" }
+      }).exec();
+    } catch (error) {
+      const attempts = Number(job.attempts) || 1;
+      const exhausted = attempts >= 8;
+      const retryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
+      console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
+      await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+        $set: {
+          status: exhausted ? "failed" : "pending",
+          nextAttemptAt: new Date(Date.now() + retryDelay),
+          leaseUntil: null,
+          lastError: String(error.message || error).slice(0, 500)
+        }
+      }).exec();
+    }
+    processed += 1;
+  }
+
   const now = new Date();
-  const job = await NotificationJob.findOneAndUpdate({
+  const hasMore = Boolean(await NotificationJob.exists({
     dueAt: { $lte: now },
     nextAttemptAt: { $lte: now },
     $or: [
       { status: "pending" },
       { status: "processing", leaseUntil: { $lte: now } }
     ]
-  }, {
-    $set: { status: "processing", leaseUntil: new Date(now.getTime() + 60_000) },
-    $inc: { attempts: 1 }
-  }, { new: true, sort: { dueAt: 1 } }).exec();
-  if (!job) return;
-  try {
-    await dispatchNotificationJob(job);
-    await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
-      $set: { status: "sent", sentAt: new Date(), leaseUntil: null, lastError: "" }
-    }).exec();
-  } catch (error) {
-    const attempts = Number(job.attempts) || 1;
-    const exhausted = attempts >= 8;
-    const retryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
-    console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
-    await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
-      $set: {
-        status: exhausted ? "failed" : "pending",
-        nextAttemptAt: new Date(Date.now() + retryDelay),
-        leaseUntil: null,
-        lastError: String(error.message || error).slice(0, 500)
-      }
-    }).exec();
-  }
+  }).exec());
+  return { processed, hasMore, unavailable: false };
 }
 
 const eventReportSchema = new mongoose.Schema({
@@ -1495,6 +1513,34 @@ app.get("/api/notifications/config", (request, response) => {
     recapUploadConfigured: recapUploadMissingVariables.length === 0,
     recapUploadMissingVariables
   });
+});
+
+app.post("/api/internal/notifications/worker", async (request, response) => {
+  const expectedSecret = process.env.CRON_SECRET_KEY || "";
+  const providedSecret = request.get("x-cron-secret") || "";
+  if (!expectedSecret) {
+    return response.status(503).json({ error: "Background notification trigger is not configured." });
+  }
+  const expectedBuffer = Buffer.from(expectedSecret);
+  const providedBuffer = Buffer.from(providedSecret);
+  if (expectedBuffer.length !== providedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, providedBuffer)) {
+    return response.status(401).json({ error: "Background notification trigger is unauthorized." });
+  }
+  if (!isMongoConnected()) {
+    return response.status(503).json({ error: "Durable notification scheduling requires the MongoDB queue." });
+  }
+
+  const requestedLimit = Number(request.body?.limit);
+  const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+    ? Math.min(requestedLimit, 50)
+    : 20;
+  try {
+    const result = await runNotificationWorker({ limit });
+    return response.json({ ok: true, ...result });
+  } catch (error) {
+    console.error("Background notification trigger failed.", error);
+    return response.status(500).json({ error: "Unable to process due notifications." });
+  }
 });
 
 app.get("/api/notifications/status", async (request, response) => {
