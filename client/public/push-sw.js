@@ -8,10 +8,27 @@ self.addEventListener('push', (event) => {
 
   event.waitUntil((async () => {
     const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
-    const visibleClient = clients.find((client) => client.visibilityState === 'visible')
-    if (visibleClient) {
-      visibleClient.postMessage({ type: 'FUTAPULSE_NOTIFICATION', payload })
-      return
+    for (const client of clients.filter((item) => item.visibilityState === 'visible')) {
+      const accepted = await new Promise((resolve) => {
+        const channel = new MessageChannel()
+        const timeout = setTimeout(() => {
+          channel.port1.close()
+          resolve(false)
+        }, 800)
+        channel.port1.onmessage = (messageEvent) => {
+          clearTimeout(timeout)
+          channel.port1.close()
+          resolve(messageEvent.data?.accepted === true)
+        }
+        try {
+          client.postMessage({ type: 'FUTAPULSE_NOTIFICATION_CHECK', payload }, [channel.port2])
+        } catch {
+          clearTimeout(timeout)
+          channel.port1.close()
+          resolve(false)
+        }
+      })
+      if (accepted) return
     }
     await self.registration.showNotification(payload.title || 'FUTApulse event update', {
       body: payload.message || 'Tap to view the latest campus event update.',

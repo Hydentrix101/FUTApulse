@@ -365,6 +365,7 @@ const engagementActionSchema = new mongoose.Schema({
 }, { timestamps: true });
 engagementActionSchema.index({ eventId: 1, userId: 1, type: 1 }, { unique: true });
 engagementActionSchema.index({ userId: 1, type: 1, updatedAt: -1 });
+engagementActionSchema.index({ eventId: 1, type: 1, updatedAt: 1 });
 const EngagementAction = mongoose.models.FutapulseEngagementAction
   || mongoose.model("FutapulseEngagementAction", engagementActionSchema, "engagement_actions");
 const eventViewSchema = new mongoose.Schema({
@@ -402,7 +403,7 @@ const notificationJobSchema = new mongoose.Schema({
   payload: { type: mongoose.Schema.Types.Mixed, required: true },
   dueAt: { type: Date, required: true, index: true },
   expiresAt: { type: Date, required: true },
-  status: { type: String, enum: ["pending", "processing", "sent", "failed", "cancelled"], default: "pending", index: true },
+  status: { type: String, enum: ["pending", "processing", "sent", "failed", "cancelled", "undeliverable"], default: "pending", index: true },
   attempts: { type: Number, default: 0 },
   nextAttemptAt: { type: Date, default: Date.now, index: true },
   leaseUntil: { type: Date, default: null, index: true },
@@ -420,11 +421,22 @@ function notificationEventLink(event) {
   const link = new URL(FRONTEND_URL);
   link.searchParams.set("event", String(event.id));
   link.searchParams.set("category", String(event.category || "all"));
+  link.searchParams.set("notification", "1");
   link.hash = "home";
   return link.toString();
 }
 
-async function enqueueNotification({ idempotencyKey, recipientUserId, event, kind, title, message, dueAt = new Date(), universal = false }) {
+async function enqueueNotification({
+  idempotencyKey,
+  recipientUserId,
+  event,
+  kind,
+  title,
+  message,
+  dueAt = new Date(),
+  universal = false,
+  reactivateCancelled = false
+}) {
   if (!isMongoConnected() || !recipientUserId || !event?.id || !idempotencyKey) return null;
   const now = new Date();
   const due = new Date(dueAt);
@@ -442,25 +454,32 @@ async function enqueueNotification({ idempotencyKey, recipientUserId, event, kin
     universal: universal === true
   };
   try {
+    const insertFields = {
+      idempotencyKey,
+      recipientUserId: String(recipientUserId),
+      eventId: String(event.id),
+      kind,
+      payload,
+      dueAt: due,
+      expiresAt: new Date(Math.max(now.getTime(), due.getTime()) + (8 * 24 * 60 * 60 * 1000)),
+      status: "pending",
+      attempts: 0,
+      nextAttemptAt: due,
+      leaseUntil: null,
+      sentAt: null,
+      lastError: ""
+    };
+    if (reactivateCancelled) {
+      const reactivated = await NotificationJob.findOneAndUpdate(
+        { idempotencyKey, status: { $in: ["cancelled", "failed", "undeliverable"] } },
+        { $set: insertFields },
+        { new: true }
+      ).exec();
+      if (reactivated) return reactivated;
+    }
     return await NotificationJob.findOneAndUpdate(
       { idempotencyKey },
-      {
-        $setOnInsert: {
-          idempotencyKey,
-          recipientUserId: String(recipientUserId),
-          eventId: String(event.id),
-          kind,
-          payload,
-          dueAt: due,
-          expiresAt: new Date(Math.max(now.getTime(), due.getTime()) + (8 * 24 * 60 * 60 * 1000)),
-          status: "pending",
-          attempts: 0,
-          nextAttemptAt: due,
-          leaseUntil: null,
-          sentAt: null,
-          lastError: ""
-        }
-      },
+      { $setOnInsert: insertFields },
       { upsert: true, new: true }
     ).exec();
   } catch (error) {
@@ -471,11 +490,14 @@ async function enqueueNotification({ idempotencyKey, recipientUserId, event, kin
 
 async function enqueueNotifications(userIds, details) {
   const uniqueIds = [...new Set((userIds || []).map(String).filter(Boolean))];
-  await Promise.all(uniqueIds.map((recipientUserId) => enqueueNotification({
-    ...details,
-    recipientUserId,
-    idempotencyKey: `${details.idempotencyKey}:${recipientUserId}`
-  })));
+  const batchSize = 50;
+  for (let index = 0; index < uniqueIds.length; index += batchSize) {
+    await Promise.all(uniqueIds.slice(index, index + batchSize).map((recipientUserId) => enqueueNotification({
+      ...details,
+      recipientUserId,
+      idempotencyKey: `${details.idempotencyKey}:${recipientUserId}`
+    })));
+  }
 }
 
 async function enqueueCategoryAlert(event, kind = "new-event") {
@@ -640,10 +662,20 @@ function uploadRecapImage(buffer, eventId) {
 }
 
 async function dispatchNotificationJob(job) {
-  const payload = { ...job.payload, createdAt: new Date().toISOString() };
-  if (realtimeServer) realtimeServer.to(`user:${job.recipientUserId}`).emit("home-notification", payload);
+  const payload = {
+    ...job.payload,
+    recipientUserId: String(job.recipientUserId),
+    createdAt: new Date().toISOString()
+  };
+  const recipientRoom = `user:${job.recipientUserId}`;
+  const recipientSockets = realtimeServer
+    ? await realtimeServer.in(recipientRoom).fetchSockets()
+    : [];
+  const activeSocketCount = recipientSockets.filter((socket) => socket.data.notificationForeground === true).length;
+  if (realtimeServer) realtimeServer.to(recipientRoom).emit("home-notification", payload);
   const devices = await PushDevice.find({ userId: job.recipientUserId, platform: "web", enabled: true }).lean().exec();
   const failures = [];
+  let deliveredToDeviceCount = 0;
   await Promise.all(devices.map(async (device) => {
     try {
       if (device.platform === "web") {
@@ -655,6 +687,7 @@ async function dispatchNotificationJob(job) {
           urgency: "high",
           topic: crypto.createHash("sha256").update(job.idempotencyKey).digest("base64url").slice(0, 32)
         });
+        deliveredToDeviceCount += 1;
       }
     } catch (error) {
       if (device.platform === "web" && [404, 410].includes(error.statusCode)) {
@@ -665,12 +698,21 @@ async function dispatchNotificationJob(job) {
     }
   }));
   if (failures.length) throw new Error(failures.map((error) => error.message).join("; "));
+  if (activeSocketCount === 0 && deliveredToDeviceCount === 0) {
+    const error = new Error("Recipient has no active FUTApulse session or registered Web Push device.");
+    error.code = "NO_NOTIFICATION_DELIVERY_CHANNEL";
+    throw error;
+  }
 }
 
 async function runNotificationWorker({ limit = 1 } = {}) {
-  if (!isMongoConnected()) return { processed: 0, hasMore: false, unavailable: true };
+  if (!isMongoConnected()) return { processed: 0, sent: 0, retried: 0, failed: 0, undeliverable: 0, hasMore: false, unavailable: true };
   const batchLimit = Math.min(50, Math.max(1, Number.isInteger(limit) ? limit : 1));
   let processed = 0;
+  let sent = 0;
+  let retried = 0;
+  let failed = 0;
+  let undeliverable = 0;
 
   while (processed < batchLimit) {
     const now = new Date();
@@ -692,19 +734,33 @@ async function runNotificationWorker({ limit = 1 } = {}) {
       await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
         $set: { status: "sent", sentAt: new Date(), leaseUntil: null, lastError: "" }
       }).exec();
+      sent += 1;
     } catch (error) {
       const attempts = Number(job.attempts) || 1;
       const exhausted = attempts >= 8;
       const retryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
       console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
-      await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
-        $set: {
-          status: exhausted ? "failed" : "pending",
-          nextAttemptAt: new Date(Date.now() + retryDelay),
-          leaseUntil: null,
-          lastError: String(error.message || error).slice(0, 500)
-        }
-      }).exec();
+      if (error.code === "NO_NOTIFICATION_DELIVERY_CHANNEL") {
+        await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+          $set: {
+            status: "undeliverable",
+            leaseUntil: null,
+            lastError: String(error.message || error).slice(0, 500)
+          }
+        }).exec();
+        undeliverable += 1;
+      } else {
+        await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+          $set: {
+            status: exhausted ? "failed" : "pending",
+            nextAttemptAt: new Date(Date.now() + retryDelay),
+            leaseUntil: null,
+            lastError: String(error.message || error).slice(0, 500)
+          }
+        }).exec();
+        if (exhausted) failed += 1;
+        else retried += 1;
+      }
     }
     processed += 1;
   }
@@ -718,7 +774,7 @@ async function runNotificationWorker({ limit = 1 } = {}) {
       { status: "processing", leaseUntil: { $lte: now } }
     ]
   }).exec());
-  return { processed, hasMore, unavailable: false };
+  return { processed, sent, retried, failed, undeliverable, hasMore, unavailable: false };
 }
 
 const eventReportSchema = new mongoose.Schema({
@@ -1536,6 +1592,9 @@ app.post("/api/internal/notifications/worker", async (request, response) => {
     : 20;
   try {
     const result = await runNotificationWorker({ limit });
+    if (result.failed > 0) {
+      return response.status(502).json({ ok: false, ...result, error: "One or more notification jobs exhausted their delivery retries." });
+    }
     return response.json({ ok: true, ...result });
   } catch (error) {
     console.error("Background notification trigger failed.", error);
@@ -2664,28 +2723,35 @@ function eventStartDate(event) {
   return Number.isFinite(parsed.getTime()) ? parsed : null;
 }
 
-async function scheduleDefaultRsvpReminders(event, userId, hasCustomReminder = false) {
-  if (!isMongoConnected()) return;
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildRsvpReminderSchedule(event, { hasCustomReminder = false, now = Date.now() } = {}) {
   const startsAt = eventStartDate(event);
-  if (!startsAt || startsAt.getTime() <= Date.now()) return;
-  const reminders = [
+  if (!startsAt || startsAt.getTime() <= now) return [];
+  return [
     ...(!hasCustomReminder ? [
       { offset: 60 * 60_000, suffix: "1h", message: `${event.title} starts in 1 hour.` },
       { offset: 30 * 60_000, suffix: "30m", message: `${event.title} is starting in 30 minutes!` }
     ] : []),
     { offset: 0, suffix: "start", message: `${event.title} has officially started!` }
-  ];
-  await Promise.all(reminders
+  ]
     .map(({ offset, suffix, message }) => ({ suffix, message, dueAt: new Date(startsAt.getTime() - offset) }))
-    .filter((reminder) => reminder.dueAt.getTime() > Date.now())
-    .map((reminder) => enqueueNotification({
+    .filter((reminder) => reminder.dueAt.getTime() > now);
+}
+
+async function scheduleDefaultRsvpReminders(event, userId, hasCustomReminder = false) {
+  if (!isMongoConnected()) return;
+  await Promise.all(buildRsvpReminderSchedule(event, { hasCustomReminder }).map((reminder) => enqueueNotification({
       idempotencyKey: `rsvp-reminder:${event.id}:${userId}:${reminder.suffix}`,
       recipientUserId: userId,
       event,
       kind: `rsvp-reminder-${reminder.suffix}`,
       title: "Event reminder",
       message: reminder.message,
-      dueAt: reminder.dueAt
+      dueAt: reminder.dueAt,
+      reactivateCancelled: true
     })));
 }
 
@@ -2697,6 +2763,52 @@ async function cancelUserEventNotifications(eventId, userId, kinds) {
     kind: { $in: kinds },
     status: { $in: ["pending", "processing"] }
   }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
+}
+
+async function rescheduleEventRsvpReminders(event) {
+  if (!isMongoConnected()) return;
+  const eventId = String(event.id);
+  const [attendees, customReminders] = await Promise.all([
+    EngagementAction.find({ eventId, type: "rsvp" }).select("userId").lean().exec(),
+    EngagementAction.find({
+      eventId,
+      type: "reminder",
+      customReminderAt: { $ne: null }
+    }).select("userId customReminderAt").lean().exec()
+  ]);
+  const attendeeIds = new Set(attendees.map((attendee) => String(attendee.userId)).filter(Boolean));
+  const customReminderByUserId = new Map(customReminders.map((reminder) => [
+    String(reminder.userId),
+    new Date(reminder.customReminderAt)
+  ]));
+  const userIds = [...new Set([...attendeeIds, ...customReminderByUserId.keys()])];
+  if (!userIds.length) return;
+
+  const reminderKinds = ["rsvp-reminder-1h", "rsvp-reminder-30m", "rsvp-reminder-start", "custom-reminder"];
+  await NotificationJob.updateMany({
+    eventId,
+    recipientUserId: { $in: userIds },
+    kind: { $in: reminderKinds },
+    status: { $in: ["pending", "processing", "failed", "undeliverable"] }
+  }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
+
+  const startsAt = eventStartDate(event);
+  const now = Date.now();
+  await Promise.all(userIds.map(async (userId) => {
+    const customReminderAt = customReminderByUserId.get(userId);
+    const hasCustomReminder = Boolean(customReminderAt);
+    const hasValidCustomReminder = Boolean(
+      customReminderAt
+      && Number.isFinite(customReminderAt.getTime())
+      && customReminderAt.getTime() > now
+      && startsAt
+      && customReminderAt < startsAt
+    );
+    await scheduleDefaultRsvpReminders(event, userId, hasCustomReminder);
+    if (hasValidCustomReminder) {
+      await scheduleCustomEventReminder(event, userId, customReminderAt);
+    }
+  }));
 }
 
 async function scheduleCustomEventReminder(event, userId, dueAt) {
@@ -2715,39 +2827,56 @@ async function scheduleCustomEventReminder(event, userId, dueAt) {
     kind: "custom-reminder",
     title: "Your event reminder",
     message: `${event.title} is coming up soon.`,
-    dueAt: reminderAt
+    dueAt: reminderAt,
+    reactivateCancelled: true
   });
 }
 
 async function notifyRsvpSocialProof(event) {
   if (!isMongoConnected()) return;
-  const rsvps = await EngagementAction.find({ eventId: String(event.id), type: "rsvp" })
-    .select("userId faculty department createdAt updatedAt").lean().exec();
+  const eventRsvpFilter = { eventId: String(event.id), type: "rsvp" };
+  const recentRsvpBoundary = new Date(Date.now() - (30 * 60_000));
+  const [rsvps, recentRsvpCount] = await Promise.all([
+    EngagementAction.find(eventRsvpFilter)
+      .select("userId faculty department").lean().exec(),
+    EngagementAction.countDocuments({ ...eventRsvpFilter, updatedAt: { $gte: recentRsvpBoundary } }).exec()
+  ]);
   const facultyCounts = new Map();
   const departmentCounts = new Map();
-  const recentRsvpCount = rsvps.filter((action) => new Date(action.updatedAt || action.createdAt).getTime() >= Date.now() - (30 * 60_000)).length;
+  const addCohortRsvp = (counts, label, userId) => {
+    const normalized = String(label || "").trim();
+    if (!normalized) return;
+    const key = normalized.toLowerCase();
+    const cohort = counts.get(key) || { label: normalized, userIds: new Set() };
+    cohort.userIds.add(String(userId));
+    counts.set(key, cohort);
+  };
   for (const rsvp of rsvps) {
-    const faculty = String(rsvp.faculty || "").trim();
-    const department = String(rsvp.department || "").trim();
-    if (faculty) facultyCounts.set(faculty, [...(facultyCounts.get(faculty) || []), String(rsvp.userId)]);
-    if (department) departmentCounts.set(department, [...(departmentCounts.get(department) || []), String(rsvp.userId)]);
+    addCohortRsvp(facultyCounts, rsvp.faculty, rsvp.userId);
+    addCohortRsvp(departmentCounts, rsvp.department, rsvp.userId);
   }
-  for (const [faculty, userIds] of facultyCounts) {
-    if (userIds.length < 20) continue;
-    const recipients = await User.find({ "profile.faculty": faculty, emailVerified: true }).select("_id").lean().exec();
+  for (const [facultyKey, cohort] of facultyCounts) {
+    if (cohort.userIds.size < 20) continue;
+    const recipients = await User.find({
+      "profile.faculty": { $regex: `^${escapeRegex(cohort.label)}$`, $options: "i" },
+      emailVerified: true
+    }).select("_id").lean().exec();
     await enqueueNotifications(recipients.map((recipient) => recipient._id), {
-      idempotencyKey: `faculty-milestone:${event.id}:${faculty.toLowerCase()}:20`,
+      idempotencyKey: `faculty-milestone:${event.id}:${facultyKey}:20`,
       event,
       kind: "faculty-milestone",
       title: "Your faculty is going",
-      message: `20 people from your faculty (${faculty}) are going to ${event.title}. Tap to check it out.`
+      message: `20 people from your faculty (${cohort.label}) are going to ${event.title}. Tap to check it out.`
     });
   }
-  for (const [department, userIds] of departmentCounts) {
-    if (userIds.length < 10) continue;
-    const recipients = await User.find({ "profile.department": department, emailVerified: true }).select("_id").lean().exec();
+  for (const [departmentKey, cohort] of departmentCounts) {
+    if (cohort.userIds.size < 10) continue;
+    const recipients = await User.find({
+      "profile.department": { $regex: `^${escapeRegex(cohort.label)}$`, $options: "i" },
+      emailVerified: true
+    }).select("_id").lean().exec();
     await enqueueNotifications(recipients.map((recipient) => recipient._id), {
-      idempotencyKey: `department-milestone:${event.id}:${department.toLowerCase()}:10`,
+      idempotencyKey: `department-milestone:${event.id}:${departmentKey}:10`,
       event,
       kind: "department-milestone",
       title: "Your department is going",
@@ -2783,21 +2912,44 @@ async function getEventNotificationAudience(event, includeCategoryFollowers = tr
   return [...ids];
 }
 
+function buildCriticalEventUpdateDetails(previous, event) {
+  const scheduleChanged = ["date", "startTime"].some((key) => String(previous[key] || "") !== String(event[key] || ""));
+  const changedFields = [
+    ["title", "title"],
+    ["venue", "venue"]
+  ].filter(([key]) => String(previous[key] || "") !== String(event[key] || "")).map(([, label]) => label);
+  if (scheduleChanged) changedFields.unshift("start time");
+  if (!changedFields.length) return null;
+  return {
+    postponed: scheduleChanged,
+    message: scheduleChanged
+      ? `⏰ POSTPONED: ${event.title} has been moved to a new date. Tap to check it out.`
+      : changedFields.length === 1
+        ? `The ${changedFields[0]} for ${event.title} has changed. Tap to check it out.`
+        : `The ${changedFields.join(", ")} for ${event.title} have changed. Tap to check it out.`
+  };
+}
+
 async function notifyCriticalEventUpdate(previous, event) {
   if (!isMongoConnected()) return;
-  const previousStart = eventStartDate(previous)?.getTime();
-  const nextStart = eventStartDate(event)?.getTime();
-  const postponed = Number.isFinite(previousStart) && Number.isFinite(nextStart) && previousStart !== nextStart;
+  const updateDetails = buildCriticalEventUpdateDetails(previous, event);
+  if (!updateDetails) return;
   const recipients = await getEventNotificationAudience(event, true);
-  await enqueueNotifications(recipients, {
-    idempotencyKey: `critical-update:${event.id}:${event.updatedAt}`,
-    event,
-    kind: postponed ? "event-postponed" : "event-critical-update",
-    title: postponed ? "Event postponed" : "Event details changed",
-    message: postponed
-      ? `⏰ POSTPONED: ${event.title} has been moved to a new date. Tap to check it out.`
-      : `The time/venue for ${event.title} has changed! Tap to check it out.`
-  });
+  const results = await Promise.allSettled([
+    enqueueNotifications(recipients, {
+      idempotencyKey: `critical-update:${event.id}:${event.updatedAt}`,
+      event,
+      kind: updateDetails.postponed ? "event-postponed" : "event-critical-update",
+      title: updateDetails.postponed ? "Event postponed" : "Event details changed",
+      message: updateDetails.message
+    }),
+    rescheduleEventRsvpReminders(event)
+  ]);
+  for (const result of results) {
+    if (result.status === "rejected") {
+      console.error("Event update notification processing failed.", result.reason);
+    }
+  }
 }
 
 app.get("/api/events/hot", async (request, response) => {
@@ -3369,7 +3521,7 @@ app.patch("/api/events/:eventId/engagement", async (request, response) => {
       }
     } else if (type === "reminder" && !enabled) {
       try {
-        await cancelUserEventNotifications(eventId, userId, ["custom-reminder"]);
+        await cancelUserEventNotifications(eventId, userId, ["custom-reminder", "rsvp-reminder-start"]);
         if (await EngagementAction.exists({ eventId, userId, type: "rsvp" })) {
           await scheduleDefaultRsvpReminders(event, userId);
         }
@@ -3446,6 +3598,7 @@ app.post("/api/events/:eventId/reminders/schedule", async (request, response) =>
       { $set: { faculty: String(user.profile?.faculty || "").trim().slice(0, 80), department: String(user.profile?.department || "").trim().slice(0, 100), customReminderAt: reminderAt } },
       { upsert: true }
     ).exec();
+    await scheduleDefaultRsvpReminders(event, userId, true);
     return response.status(201).json({ scheduled: true, notifyAt: reminderAt.toISOString() });
   } catch (error) {
     if (error.message?.includes("Choose a reminder time")) return response.status(400).json({ error: error.message });
@@ -3517,11 +3670,17 @@ app.get("/api/events/:eventId", async (request, response) => {
       && event.status !== "Cancelled"
       && eventEnd <= Date.now()
       && Date.now() - eventEnd <= 7 * 24 * 60 * 60_000;
+    const recapPublishedAt = new Date(event.recapPublishedAt || "").getTime();
+    const publicRecapVisible = Array.isArray(event.recapPhotos)
+      && event.recapPhotos.length > 0
+      && Number.isFinite(recapPublishedAt)
+      && recapPublishedAt <= Date.now()
+      && Date.now() - recapPublishedAt <= 7 * 24 * 60 * 60_000;
     const cancellationDate = new Date(event.cancelledAt || "").getTime();
-    const ownerCancelledRecently = isOwner && event.status === "Cancelled"
+    const cancellationVisible = event.status === "Cancelled"
       && Number.isFinite(cancellationDate)
       && Date.now() - cancellationDate <= 7 * 24 * 60 * 60_000;
-    if (!ownerCancelledRecently && !ownerEndedRecently
+    if (!cancellationVisible && !publicRecapVisible && !ownerEndedRecently
       && !(["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event))) {
       return response.status(404).json({ error: "This event is no longer available." });
     }
@@ -3576,6 +3735,10 @@ async function startServer() {
     });
     realtimeServer.on("connection", (socket) => {
       socket.join(`user:${socket.data.userId}`);
+      socket.data.notificationForeground = false;
+      socket.on("notification-visibility", (visible) => {
+        socket.data.notificationForeground = visible === true;
+      });
     });
     httpServer.listen(PORT, "0.0.0.0", () => {
       console.log(`FUTApulse API listening on port ${PORT}`);
@@ -3626,5 +3789,7 @@ module.exports = {
   app,
   startServer,
   models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob },
-  buildFacultyTurnoutBreakdown
+  buildFacultyTurnoutBreakdown,
+  buildRsvpReminderSchedule,
+  buildCriticalEventUpdateDetails
 };

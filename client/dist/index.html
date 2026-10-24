@@ -14,10 +14,37 @@
     <link rel="manifest" href="/manifest.json" />
     <meta name="description" content="Discover, save, and share campus events at FUTA." />
     <title>FUTApulse — Campus Events</title>
-    <script type="module" crossorigin src="/assets/index-CPllSvMj.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CT5P10nS.css">
+    <script>
+      window.addEventListener('beforeinstallprompt', (event) => {
+        event.preventDefault()
+        window.__futapulseInstallPrompt = event
+        window.dispatchEvent(new Event('futapulse-install-prompt'))
+      })
+    </script>
+    <script type="module" crossorigin src="/assets/index-DYzaaMZ7.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-BFGrcqQO.css">
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <main aria-labelledby="public-feed-title">
+        <header>
+          <p>FUTA CAMPUS EVENT DISCOVERY</p>
+          <h1 id="public-feed-title">Campus events at the Federal University of Technology, Akure</h1>
+          <p>FUTApulse helps the FUTA community discover upcoming campus events, explore event details, and plan what to attend.</p>
+        </header>
+        <section aria-labelledby="public-feed-discovery-title">
+          <h2 id="public-feed-discovery-title">Discover events across campus</h2>
+          <p>Browse published technology, academic, social, religious, sports, and seminar events. Event listings include details such as schedule, venue, organizer, and intended audience when provided.</p>
+          <p>Visitors can explore public listings. Sign in to save reminders, mark attendance, or publish an event.</p>
+        </section>
+        <nav aria-label="FUTApulse information">
+          <a href="/?auth=login">Sign in</a>
+          <a href="/?auth=signup">Create an account</a>
+          <a href="/about">About &amp; Contact</a>
+          <a href="/privacy">Privacy Policy</a>
+          <a href="/terms">Terms of Service</a>
+        </nav>
+      </main>
+    </div>
   </body>
 </html>

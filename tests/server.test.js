@@ -14,7 +14,13 @@ process.env.GOOGLE_CLIENT_SECRET = "google-client-secret-for-tests";
 process.env.GMAIL_REFRESH_TOKEN = "gmail-refresh-token-for-tests";
 process.env.GMAIL_SENDER_EMAIL = "sender@example.test";
 
-const { app, models, buildFacultyTurnoutBreakdown } = require("../server");
+const {
+  app,
+  models,
+  buildFacultyTurnoutBreakdown,
+  buildRsvpReminderSchedule,
+  buildCriticalEventUpdateDetails
+} = require("../server");
 const { buildApprovedMigrationPlan } = require("../server/dataMigration");
 const jwt = require("jsonwebtoken");
 const deliveredEmails = [];
@@ -113,6 +119,7 @@ test("Phase 2 Mongo models define event lookup and per-account action uniqueness
   assert.ok(eventIndexes.some(([fields]) => fields.eventId === 1));
   assert.ok(eventIndexes.some(([fields]) => fields.status === 1 && fields.endsAt === 1));
   assert.ok(actionIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && fields.type === 1 && options.unique));
+  assert.ok(actionIndexes.some(([fields]) => fields.eventId === 1 && fields.type === 1 && fields.updatedAt === 1));
   assert.ok(reportIndexes.some(([fields]) => fields.eventId === 1));
   assert.ok(viewIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && options.unique));
   assert.ok(recapDismissalIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && options.unique));
@@ -210,6 +217,38 @@ test("faculty turnout groups attendance and recovers faculty from the attendee a
     { faculty: "SEET", count: 2 },
     { faculty: "SPS", count: 1 }
   ]);
+});
+
+test("RSVP reminders use default intervals or the custom override while retaining the start-time reminder", () => {
+  const startsAt = Date.UTC(2026, 9, 25, 10, 0);
+  const event = { id: "reminder-plan", title: "Campus meetup", date: new Date(startsAt).toISOString() };
+  const defaults = buildRsvpReminderSchedule(event, { now: startsAt - 2 * 60 * 60_000 });
+  assert.deepEqual(defaults.map(({ suffix, dueAt }) => [suffix, dueAt.getTime()]), [
+    ["1h", startsAt - 60 * 60_000],
+    ["30m", startsAt - 30 * 60_000],
+    ["start", startsAt]
+  ]);
+
+  const custom = buildRsvpReminderSchedule(event, { hasCustomReminder: true, now: startsAt - 2 * 60 * 60_000 });
+  assert.deepEqual(custom.map(({ suffix, dueAt }) => [suffix, dueAt.getTime()]), [["start", startsAt]]);
+  assert.deepEqual(buildRsvpReminderSchedule(event, { now: startsAt }), []);
+});
+
+test("critical event update details identify title, venue, and postponement changes accurately", () => {
+  const original = { title: "Campus meetup", venue: "Old hall", date: "2026-10-25T10:00:00.000Z" };
+  assert.deepEqual(buildCriticalEventUpdateDetails(original, { ...original, title: "Campus social" }), {
+    postponed: false,
+    message: "The title for Campus social has changed. Tap to check it out."
+  });
+  assert.deepEqual(buildCriticalEventUpdateDetails(original, { ...original, venue: "New hall" }), {
+    postponed: false,
+    message: "The venue for Campus meetup has changed. Tap to check it out."
+  });
+  assert.deepEqual(buildCriticalEventUpdateDetails(original, { ...original, date: "2026-10-26T10:00:00.000Z" }), {
+    postponed: true,
+    message: "⏰ POSTPONED: Campus meetup has been moved to a new date. Tap to check it out."
+  });
+  assert.equal(buildCriticalEventUpdateDetails(original, original), null);
 });
 
 test("health and readiness clearly report the local development storage mode", async () => {
@@ -501,8 +540,11 @@ test("visible event views are unique, exclude the organizer, and are private own
   const dismissedEvent = (await refreshedOwnerEvents.json()).events.find((event) => event.id === endedEvent.id);
   assert.equal(dismissedEvent.recapPromptDismissed, true);
 
-  const publicExpiredEventResponse = await fetch(`${baseUrl}/api/events/${expiredPublicEvent.id}`);
-  assert.equal(publicExpiredEventResponse.status, 404);
+  const publicRecapResponse = await fetch(`${baseUrl}/api/events/${expiredPublicEvent.id}`);
+  assert.equal(publicRecapResponse.status, 200);
+  const publicRecapEvent = (await publicRecapResponse.json()).event;
+  assert.equal(publicRecapEvent.recapPhotos.length, 1);
+  assert.equal(publicRecapEvent.viewCount, undefined);
   const ownerExpiredEventResponse = await fetch(`${baseUrl}/api/events/${expiredPublicEvent.id}`, {
     headers: { Authorization: `Bearer ${owner.token}` }
   });
@@ -954,7 +996,8 @@ test("cancelled events leave the public feed, stay in the owner's seven-day prof
   const publicEvents = await fetch(`${baseUrl}/api/events`, { headers: { Authorization: `Bearer ${guest.token}` } });
   assert.ok(!(await publicEvents.json()).events.some((item) => item.id === event.id));
   const publicDetails = await fetch(`${baseUrl}/api/events/${event.id}`, { headers: { Authorization: `Bearer ${guest.token}` } });
-  assert.equal(publicDetails.status, 404);
+  assert.equal(publicDetails.status, 200);
+  assert.equal((await publicDetails.json()).event.status, "Cancelled");
   const ownerEvents = await fetch(`${baseUrl}/api/events`, { headers: ownerHeaders });
   const archivedEvent = (await ownerEvents.json()).events.find((item) => item.id === event.id);
   assert.equal(archivedEvent.status, "Cancelled");

@@ -67,6 +67,10 @@ For ongoing use, publish the OAuth consent screen instead of leaving an external
 
 The PWA's service worker (`client/public/push-sw.js`) displays Web Push notifications while the site is backgrounded or closed, and forwards them to the open app for in-app display. This is separate from CORS and Socket.IO: those support browser API/live connections, but cannot wake a closed app.
 
+Each notification is queued once per eligible account. Socket.IO displays an actionable in-app toast for connected users; Web Push is also sent to every enabled browser subscription for that account. The service worker forwards a push to a visible FUTApulse session only when that session is signed into the intended recipient account; otherwise it displays the operating-system notification. Notification actions deep-link to the event in the home feed. The server-side rules cover category-matched event publications, critical event changes, RSVP/custom reminders, privacy-preserving faculty/department milestones, RSVP trend spikes, organizer announcements/cancellations, and event recaps.
+
+Background delivery requires that the recipient has enabled notifications on that browser/device. If a queued job is processed when the recipient has neither an active FUTApulse session nor an enabled Web Push subscription, it is recorded as `undeliverable` rather than reported as sent; check the worker response and Render logs when diagnosing audience delivery.
+
 Production delivery requires all of the following:
 
 - MongoDB connected to persist the notification queue and device subscriptions.

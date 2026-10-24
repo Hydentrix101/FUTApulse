@@ -1692,6 +1692,11 @@ button {
 .theme-dark .home-back-button { border-color: rgba(148,163,184,.4); color: #f8fafc; background: rgba(9,14,22,.96); }
 .home-full-event-anchor { scroll-margin-top: 58px; }
 .home-full-event-anchor.is-below-sticky-filter { scroll-margin-top: 116px; }
+.home-full-event-anchor.is-notification-highlighted { border-radius: 22px; animation: notification-event-highlight 2.8s ease-out; }
+@keyframes notification-event-highlight {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
+  18%, 55% { box-shadow: 0 0 0 4px rgba(37, 99, 235, .72), 0 0 28px rgba(37, 99, 235, .34); }
+}
 .home-full-feed-title { margin: 0; color: inherit; font-size: 1.25rem; font-weight: 950; }
 .home-full-feed-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .event-card-read-only-actions p { margin: 0; color: #cbd5e1; font-size: 0.72rem; font-weight: 700; line-height: 1.35; }

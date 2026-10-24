@@ -433,6 +433,7 @@ function FutaPulseApp() {
   const [homeCategory, setHomeCategory] = useState('all')
   const [expandedHomeCategory, setExpandedHomeCategory] = useState('')
   const [pendingFullEventId, setPendingFullEventId] = useState('')
+  const [notificationFeedEventId, setNotificationFeedEventId] = useState('')
   const [pendingOrganizerEventId, setPendingOrganizerEventId] = useState('')
   const homeSectionRefs = useRef({})
   const categoryFilterBarRef = useRef(null)
@@ -485,6 +486,7 @@ function FutaPulseApp() {
   const [reportReviewBusyId, setReportReviewBusyId] = useState('')
   const [activeEventAlert, setActiveEventAlert] = useState(null)
   const [homeAnnouncement, setHomeAnnouncement] = useState(null)
+  const [highlightedNotificationEventId, setHighlightedNotificationEventId] = useState('')
   const handledNotificationIds = useRef(new Set())
   const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [settingsPage, setSettingsPage] = useState('menu')
@@ -545,6 +547,7 @@ function FutaPulseApp() {
     || (!sessionLoading && Boolean(session?.token && user && profile?.faculty && profile?.department && profile?.level)
       && profile?.notificationPreferencesOnboardingComplete !== true)
   const toastTimer = useRef(null)
+  const notificationHighlightTimer = useRef(null)
   const notificationPromptAttemptedForUserRef = useRef('')
   const alarmAudioContextRef = useRef(null)
   const alarmSoundTimerRef = useRef(null)
@@ -586,15 +589,26 @@ function FutaPulseApp() {
   }, [session, user])
 
   const receiveNotification = useCallback((payload) => {
+    if (payload?.recipientUserId && String(payload.recipientUserId) !== String(user?.id || '')) return
     if (!payload?.notificationId || handledNotificationIds.current.has(payload.notificationId)) return
     window.clearTimeout(toastTimer.current)
     handledNotificationIds.current.add(payload.notificationId)
     if (handledNotificationIds.current.size > 250) {
       handledNotificationIds.current = new Set([...handledNotificationIds.current].slice(-150))
     }
-    setToast({ message: payload.message || payload.title || 'There is a new event update.', type: 'info', notification: payload })
+    if (payload.kind === 'new-event') setToast({ message: payload.title || payload.message || 'A new campus event is available.', type: 'info', notification: payload })
+    else setToast({ message: payload.message || payload.title || 'There is a new event update.', type: 'info', notification: payload })
+    if (payload.kind === 'trending-spike') setHomeAnnouncement(payload)
     toastTimer.current = window.setTimeout(() => setToast(null), 8000)
-  }, [])
+  }, [user?.id])
+
+  const highlightNotificationEvent = (eventId) => {
+    window.clearTimeout(notificationHighlightTimer.current)
+    setHighlightedNotificationEventId(String(eventId))
+    notificationHighlightTimer.current = window.setTimeout(() => {
+      setHighlightedNotificationEventId('')
+    }, 3200)
+  }
 
   const pauseAutoScroll = useCallback((trackId) => {
     window.clearTimeout(autoScrollResumeTimersRef.current[trackId])
@@ -645,6 +659,12 @@ function FutaPulseApp() {
       reconnection: true,
       reconnectionAttempts: Infinity,
     })
+    const updateNotificationVisibility = () => {
+      socket.emit('notification-visibility', !document.hidden)
+    }
+    socket.on('connect', updateNotificationVisibility)
+    document.addEventListener('visibilitychange', updateNotificationVisibility)
+    updateNotificationVisibility()
     socket.on('home-notification', receiveNotification)
     socket.on('connect_error', (error) => {
       if (error.message !== 'Authentication required.' && error.message !== 'Session is no longer valid.') {
@@ -652,15 +672,27 @@ function FutaPulseApp() {
       }
     })
     const handleServiceWorkerMessage = (event) => {
-      if (event.data?.type === 'FUTAPULSE_NOTIFICATION') receiveNotification(event.data.payload)
+      if (event.data?.type === 'FUTAPULSE_NOTIFICATION_CHECK') {
+        const accepted = !document.hidden
+          && String(event.data.payload?.recipientUserId || '') === String(user.id)
+        event.ports[0]?.postMessage({ accepted })
+        if (accepted) receiveNotification(event.data.payload)
+      } else if (event.data?.type === 'FUTAPULSE_NOTIFICATION') {
+        receiveNotification(event.data.payload)
+      }
     }
     navigator.serviceWorker?.addEventListener('message', handleServiceWorkerMessage)
     return () => {
+      document.removeEventListener('visibilitychange', updateNotificationVisibility)
       socket.removeAllListeners()
       socket.disconnect()
       navigator.serviceWorker?.removeEventListener('message', handleServiceWorkerMessage)
     }
   }, [receiveNotification, session?.token, user?.id])
+
+  useEffect(() => () => {
+    window.clearTimeout(notificationHighlightTimer.current)
+  }, [])
 
   const primeAlarmAudio = useCallback(() => {
     const AudioContextConstructor = window.AudioContext || window.webkitAudioContext
@@ -1222,6 +1254,17 @@ function FutaPulseApp() {
       setExpandedHomeCategory(selectedCategory)
       setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
       setPendingFullEventId(requestedEventId)
+      if (linkParams.get('notification') === '1') {
+        setNotificationFeedEventId(requestedEventId)
+        setHomeAnnouncement({
+          notificationId: `notification-link:${requestedEventId}`,
+          eventId: requestedEventId,
+          category: sharedEvent.category,
+          title: `Event update: ${sharedEvent.title}`,
+          message: 'You opened a FUTApulse event notification.',
+        })
+        highlightNotificationEvent(requestedEventId)
+      }
     })
     return () => window.cancelAnimationFrame(frame)
   }, [events, activeTab, session?.token])
@@ -2265,7 +2308,21 @@ function FutaPulseApp() {
     setHomeCategory(category)
     setExpandedHomeCategory(category)
     setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
-    setPendingFullEventId(String(notification.eventId))
+    setNotificationFeedEventId(String(notification.eventId))
+    highlightNotificationEvent(notification.eventId)
+    if (events.some((event) => String(getEventId(event)) === String(notification.eventId))) {
+      setPendingFullEventId(String(notification.eventId))
+    } else {
+      void apiRequest(`/api/events/${encodeURIComponent(String(notification.eventId))}`, {}, session?.token)
+        .then(({ event }) => {
+          if (!event) throw new Error('The event could not be found.')
+          setEvents((current) => current.some((item) => String(getEventId(item)) === String(notification.eventId))
+            ? current
+            : [...current, event])
+          setPendingFullEventId(String(notification.eventId))
+        })
+        .catch((error) => notify(error.message || 'Unable to load this event from the notification.', 'error'))
+    }
     setActiveTab('home')
     window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 0)
     window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 100)
@@ -2690,15 +2747,20 @@ function FutaPulseApp() {
                       setExpandedHomeCategory('')
                       setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
                       setPendingFullEventId('')
+                      setNotificationFeedEventId('')
                       window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 0)
                     }}><ChevronLeft size={18} /> Back to home</button>
                     <div className="home-full-feed-heading"><h1 className="home-full-feed-title">{expandedHomeCategory === 'hot' ? '🔥 Hot Events on Campus' : CATEGORY_DATA.find((item) => item.id === expandedHomeCategory)?.label || 'Events Happening Today & Next 2 Days'}</h1><span className="home-row-count">{expandedFeedEventCount} {expandedFeedEventCount === 1 ? 'event' : 'events'}</span></div>
                     {(() => {
-                      const fullEvents = expandedHomeCategory === 'hot'
+                      const listedEvents = expandedHomeCategory === 'hot'
                         ? rankedHotEvents
                         : publishedEvents.filter((event) => (expandedHomeCategory === 'all' || event.category === expandedHomeCategory) && matchesProfileAudience(event, profile))
+                      const notificationEvent = events.find((event) => String(getEventId(event)) === notificationFeedEventId)
+                      const fullEvents = notificationEvent && !listedEvents.some((event) => String(getEventId(event)) === notificationFeedEventId)
+                        ? [notificationEvent, ...listedEvents]
+                        : listedEvents
                       return fullEvents.length ? <>{fullEvents.slice(0, visibleFullFeedCount).map((event, index) => <Fragment key={getEventId(event)}>
-                        <div id={`home-full-event-${getEventId(event)}`} className={`home-full-event-anchor ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''}`}>
+                        <div id={`home-full-event-${getEventId(event)}`} className={`home-full-event-anchor ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''} ${String(getEventId(event)) === highlightedNotificationEventId ? 'is-notification-highlighted' : ''}`}>
                           <LazyEventCard isHot={event.isHot === true} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
                         </div>
                         {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <AdSlot placement="category-full-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}

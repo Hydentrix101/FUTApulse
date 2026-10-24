@@ -165,15 +165,16 @@ These are accepted product requirements or queued design tasks. They are not all
 
 ## Phase 5 - Notifications and event updates
 
-**Purpose:** Deliver reminders and important event changes through a real mobile delivery path.
+**Purpose:** Deliver every qualifying Phase 5 event alert as one durable notification: an actionable in-app toast when the recipient is active, and an operating-system Web Push notification when they are away. Keep event focus and announcement pills in the home feed; do not add a notification inbox.
 
 - Decide notification requirements separately for event reminders, event going-live alerts, and organizer changes to time/venue.
 - Use browser push for the PWA. Store web-push subscriptions on the server and let users manage them.
 - Schedule reminders on the server and make delivery idempotent; local timers may supplement an open app but must not be presented as dependable background delivery.
-- Send important event-change notices only when meaningful fields change; include the event deep link and changed details.
+- Apply the home-feed notification rules for category-matched publication, RSVP-inclusive critical changes, default/custom reminder tracks, private faculty/department milestones, rolling RSVP spikes, organizer broadcasts/cancellations, and universal recap alerts.
+- Send important event-change notices only when meaningful fields change; include the event deep link and changed details. Rebuild pending reminder jobs after schedule changes and preserve custom reminder plus event-start safety behavior.
 - Respect OS permission, quiet/sound settings, battery restrictions, and user preferences. A push can alert and deep-link to the full event; the OS controls whether it can play a sound or open the app automatically.
 
-**Implementation status:** Server persistence, scheduling/delivery hooks, preference controls, deduplication keys, and automated regression tests are implemented. The Node API polls MongoDB while connected; `.github/workflows/cron.yml` is a five-minute best-effort fallback that calls the secret-protected `POST /api/internal/notifications/worker` endpoint. This schedule is not a real-time guarantee and must not be used to keep a sleeping host alive. Per the owner’s rollout plan, manual checks for closed-app push banners, PWA background alerts, permission behavior, token renewal, opt-out, and notification deep links are assigned to the seven-member beta team and will run against the deployed app in parallel with Phase 6 and Google site review.
+**Implementation status:** Server persistence, event/reminder triggers, audience selection, category preferences, deduplication keys, socket/Web Push dispatch, account-aware service-worker routing, and regression coverage are implemented. The Node API polls MongoDB while connected; `.github/workflows/cron.yml` is a five-minute best-effort fallback that calls the secret-protected `POST /api/internal/notifications/worker` endpoint. This schedule is not a real-time guarantee and must not be used to keep a sleeping host alive. Real-device verification remains required for each trigger/audience path, background/closed-app delivery, permission behavior, token renewal, opt-out, duplicate prevention, and notification deep links.
 
 **Exit condition:** Beta results confirm push delivery, opt-out, token renewal, duplicate prevention, and deep-link behavior on supported devices with the app backgrounded and closed. Until those results are recorded, Phase 5 implementation is complete but device verification remains open.
 
