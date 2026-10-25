@@ -155,9 +155,12 @@ test('mobile signup, sign-in, publishing, browsing, and cross-device interaction
     const firstPage = await firstContext.newPage()
     collectPageFailures(firstPage, failures)
     captureSession(firstPage)
-    await firstPage.goto(stagingUrl.toString(), { waitUntil: 'domcontentloaded' })
+    const signupUrl = new URL(stagingUrl)
+    signupUrl.searchParams.set('auth', 'signup')
+    await firstPage.goto(signupUrl.toString(), { waitUntil: 'domcontentloaded' })
 
     await firstPage.getByLabel('Email').waitFor({ state: 'visible' })
+    await expect(firstPage.getByRole('region', { name: 'FUTApulse launch sponsor' })).toHaveCount(0)
     const username = `phase3${Date.now().toString(36)}`
     const signupRememberMe = firstPage.getByLabel('Remember me on this device')
     await expect(signupRememberMe).toBeChecked()

@@ -441,8 +441,9 @@ function App() {
 function FutaPulseApp() {
   const initialSearchParams = new URLSearchParams(window.location.search)
   const requestedAuthMode = initialSearchParams.get('auth')
-  const [launchVisible, setLaunchVisible] = useState(true)
-  const [launchSequenceReady, setLaunchSequenceReady] = useState(false)
+  const bypassLaunchSequence = initialSearchParams.has('auth') || initialSearchParams.has('event')
+  const [launchVisible, setLaunchVisible] = useState(!bypassLaunchSequence)
+  const [launchSequenceReady, setLaunchSequenceReady] = useState(bypassLaunchSequence)
   const [isLaunchAdActive, setIsLaunchAdActive] = useState(false)
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
@@ -987,6 +988,7 @@ function FutaPulseApp() {
   ])
 
   useEffect(() => {
+    if (bypassLaunchSequence) return undefined
     let splashFrame = 0
     let adFrame = 0
     const timer = window.setTimeout(() => {
@@ -1001,7 +1003,7 @@ function FutaPulseApp() {
       if (splashFrame) window.cancelAnimationFrame(splashFrame)
       if (adFrame) window.cancelAnimationFrame(adFrame)
     }
-  }, [])
+  }, [bypassLaunchSequence])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {

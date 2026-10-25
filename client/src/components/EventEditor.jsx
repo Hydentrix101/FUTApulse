@@ -281,12 +281,18 @@ function EventEditor({
     const serialized = JSON.stringify(snapshot)
     if (serialized.length > MAX_LOCAL_DRAFT_CHARACTERS) {
       setDraftSaved(false)
+      setDraftSyncError('')
       setError('This draft is too large to save on this device. Use a smaller banner image.')
       return false
     }
     const saved = safeSetStored(draftKey, serialized)
     setDraftSaved(saved)
-    if (!saved) setError('This draft could not be autosaved on this device. Check available browser storage.')
+    if (saved) {
+      setDraftSyncError('')
+    } else {
+      setDraftSyncError('')
+      setError('This draft could not be autosaved on this device. Check available browser storage.')
+    }
     return saved
   }, [draftKey, publishedAtOpen])
   const update = (field, value) => {
@@ -348,6 +354,7 @@ function EventEditor({
         setBanner(serverImages[0] || '')
       }
       setDraftSaved(true)
+      setError('')
       setForm((current) => ({
         ...current,
         id: current.id || saved.id,
@@ -355,7 +362,8 @@ function EventEditor({
       }))
       setDraftSyncError('')
     }).catch((saveError) => {
-      setDraftSyncError(saveError.message || 'Draft sync failed. It is saved on this device.')
+      setError('')
+      setDraftSyncError(saveError.message || 'Draft saved on this device; server sync will retry.')
     }).finally(() => {
       draftSyncCountRef.current = Math.max(0, draftSyncCountRef.current - 1)
       if (!draftSyncCountRef.current) setDraftSyncing(false)
@@ -381,10 +389,17 @@ function EventEditor({
         }
         const saved = safeSetStored(draftKey, serialized)
         setDraftSaved(saved)
-        if (!saved) setError('This draft could not be autosaved on this device. Check available browser storage.')
+        if (saved) {
+          setDraftSyncError('')
+          setError('')
+        } else {
+          setDraftSyncError('')
+          setError('This draft could not be autosaved on this device. Check available browser storage.')
+        }
       } catch (saveError) {
         console.error('Unable to autosave this event draft locally.', saveError)
         setDraftSaved(false)
+        setDraftSyncError('')
         setError('This draft could not be autosaved on this device. Check available browser storage.')
       }
     }
@@ -428,7 +443,7 @@ function EventEditor({
           safeSetStored(draftKey, JSON.stringify(syncedDraft))
         }
       } catch (saveError) {
-        setDraftSyncError(saveError.message || 'Draft sync failed. It is saved on this device.')
+        setDraftSyncError(saveError.message || 'Draft saved on this device; server sync will retry.')
       }
     }
     onClose()
