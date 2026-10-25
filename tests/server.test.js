@@ -19,7 +19,8 @@ const {
   models,
   buildFacultyTurnoutBreakdown,
   buildRsvpReminderSchedule,
-  buildCriticalEventUpdateDetails
+  buildCriticalEventUpdateDetails,
+  describeWebPushFailure
 } = require("../server");
 const { buildApprovedMigrationPlan } = require("../server/dataMigration");
 const jwt = require("jsonwebtoken");
@@ -249,6 +250,18 @@ test("critical event update details identify title, venue, and postponement chan
     message: "⏰ POSTPONED: Campus meetup has been moved to a new date. Tap to check it out."
   });
   assert.equal(buildCriticalEventUpdateDetails(original, original), null);
+});
+
+test("Web Push diagnostics include provider status without exposing subscription endpoints", () => {
+  const endpoint = "https://push.example.test/subscription/private-token?secret=value";
+  const message = describeWebPushFailure({
+    statusCode: 403,
+    body: "VAPID key does not match subscription"
+  }, endpoint);
+
+  assert.equal(message, "push.example.test returned HTTP 403: VAPID key does not match subscription");
+  assert.equal(message.includes("private-token"), false);
+  assert.equal(message.includes("secret=value"), false);
 });
 
 test("health and readiness clearly report the local development storage mode", async () => {

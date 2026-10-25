@@ -661,6 +661,20 @@ function uploadRecapImage(buffer, eventId) {
   });
 }
 
+function describeWebPushFailure(error, endpoint) {
+  let endpointHost = "unknown push service";
+  try {
+    endpointHost = new URL(endpoint).host;
+  } catch {
+    // Keep the diagnostic useful without ever logging the subscription endpoint.
+  }
+  const statusCode = Number.isInteger(error?.statusCode) ? ` HTTP ${error.statusCode}` : "";
+  const providerMessage = String(error?.body || error?.message || "Unknown push service error")
+    .replace(/[\r\n\t]+/g, " ")
+    .slice(0, 300);
+  return `${endpointHost} returned${statusCode}: ${providerMessage}`;
+}
+
 async function dispatchNotificationJob(job) {
   const payload = {
     ...job.payload,
@@ -676,6 +690,7 @@ async function dispatchNotificationJob(job) {
   const devices = await PushDevice.find({ userId: job.recipientUserId, platform: "web", enabled: true }).lean().exec();
   const failures = [];
   let deliveredToDeviceCount = 0;
+  let expiredDeviceCount = 0;
   await Promise.all(devices.map(async (device) => {
     try {
       if (device.platform === "web") {
@@ -692,14 +707,35 @@ async function dispatchNotificationJob(job) {
     } catch (error) {
       if (device.platform === "web" && [404, 410].includes(error.statusCode)) {
         await PushDevice.updateOne({ deviceKey: device.deviceKey }, { $set: { enabled: false } }).exec();
+        expiredDeviceCount += 1;
       } else {
-        failures.push(error);
+        failures.push({
+          statusCode: Number.isInteger(error?.statusCode) ? error.statusCode : null,
+          message: describeWebPushFailure(error, device.endpoint)
+        });
       }
     }
   }));
-  if (failures.length) throw new Error(failures.map((error) => error.message).join("; "));
+  if (activeSocketCount > 0 || deliveredToDeviceCount > 0) {
+    if (failures.length) {
+      console.warn(`Notification ${job.idempotencyKey} reached at least one recipient channel, but ${failures.length} Web Push device(s) failed.`, failures);
+    }
+    return;
+  }
+  if (failures.length) {
+    const error = new Error(failures.map((failure) => failure.message).join("; "));
+    error.code = failures.every((failure) => failure.statusCode !== null
+      && failure.statusCode >= 400 && failure.statusCode < 500
+      && ![408, 425, 429].includes(failure.statusCode))
+      ? "WEB_PUSH_PERMANENT_FAILURE"
+      : "WEB_PUSH_RETRYABLE_FAILURE";
+    throw error;
+  }
   if (activeSocketCount === 0 && deliveredToDeviceCount === 0) {
-    const error = new Error("Recipient has no active FUTApulse session or registered Web Push device.");
+    const reason = expiredDeviceCount
+      ? `${expiredDeviceCount} expired Web Push subscription(s) were disabled.`
+      : "Recipient has no active FUTApulse session or registered Web Push device.";
+    const error = new Error(reason);
     error.code = "NO_NOTIFICATION_DELIVERY_CHANNEL";
     throw error;
   }
@@ -737,7 +773,8 @@ async function runNotificationWorker({ limit = 1 } = {}) {
       sent += 1;
     } catch (error) {
       const attempts = Number(job.attempts) || 1;
-      const exhausted = attempts >= 8;
+      const permanentFailure = error.code === "WEB_PUSH_PERMANENT_FAILURE";
+      const exhausted = permanentFailure || attempts >= 8;
       const retryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
       console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
       if (error.code === "NO_NOTIFICATION_DELIVERY_CHANNEL") {
@@ -3791,5 +3828,6 @@ module.exports = {
   models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob },
   buildFacultyTurnoutBreakdown,
   buildRsvpReminderSchedule,
-  buildCriticalEventUpdateDetails
+  buildCriticalEventUpdateDetails,
+  describeWebPushFailure
 };

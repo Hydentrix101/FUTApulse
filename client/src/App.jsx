@@ -1844,10 +1844,22 @@ function FutaPulseApp() {
       }
       const registration = await navigator.serviceWorker.ready
       let subscription = await registration.pushManager.getSubscription()
+      const applicationServerKey = decodeVapidKey(config.webPushPublicKey)
+      const currentApplicationServerKey = subscription?.options?.applicationServerKey
+      const currentApplicationServerKeyBytes = currentApplicationServerKey
+        ? new Uint8Array(currentApplicationServerKey)
+        : null
+      const hasMatchingApplicationServerKey = currentApplicationServerKey
+        && applicationServerKey.length === currentApplicationServerKeyBytes.length
+        && applicationServerKey.every((byte, index) => byte === currentApplicationServerKeyBytes[index])
+      if (subscription && !hasMatchingApplicationServerKey) {
+        await subscription.unsubscribe()
+        subscription = null
+      }
       if (!subscription) {
         subscription = await registration.pushManager.subscribe({
           userVisibleOnly: true,
-          applicationServerKey: decodeVapidKey(config.webPushPublicKey),
+          applicationServerKey,
         })
       }
       await apiRequest('/api/notifications/devices/web', {
