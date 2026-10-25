@@ -20,9 +20,11 @@ const {
   buildFacultyTurnoutBreakdown,
   buildRsvpReminderSchedule,
   buildCriticalEventUpdateDetails,
-  describeWebPushFailure
+  describeWebPushFailure,
+  validateVapidCredentials
 } = require("../server");
 const { buildApprovedMigrationPlan } = require("../server/dataMigration");
+const webPush = require("web-push");
 const jwt = require("jsonwebtoken");
 const deliveredEmails = [];
 app.locals.emailSender = async ({ text }) => deliveredEmails.push(text);
@@ -262,6 +264,25 @@ test("Web Push diagnostics include provider status without exposing subscription
   assert.equal(message, "push.example.test returned HTTP 403: VAPID key does not match subscription");
   assert.equal(message.includes("private-token"), false);
   assert.equal(message.includes("secret=value"), false);
+});
+
+test("VAPID configuration validates P-256 key points and matching key pairs", () => {
+  const validPair = webPush.generateVAPIDKeys();
+  const otherPair = webPush.generateVAPIDKeys();
+  assert.deepEqual(validateVapidCredentials(validPair.publicKey, validPair.privateKey), { valid: true, error: "" });
+
+  const mismatch = validateVapidCredentials(validPair.publicKey, otherPair.privateKey);
+  assert.equal(mismatch.valid, false);
+  assert.match(mismatch.error, /do not match/);
+
+  const invalidCurvePoint = Buffer.concat([Buffer.from([0x04]), Buffer.alloc(64)]).toString("base64url");
+  const invalidPoint = validateVapidCredentials(invalidCurvePoint, validPair.privateKey);
+  assert.equal(invalidPoint.valid, false);
+  assert.match(invalidPoint.error, /P-256 curve/);
+
+  const malformed = validateVapidCredentials("not+a+base64url+key", validPair.privateKey);
+  assert.equal(malformed.valid, false);
+  assert.match(malformed.error, /base64url/);
 });
 
 test("health and readiness clearly report the local development storage mode", async () => {

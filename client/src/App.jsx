@@ -1893,7 +1893,7 @@ function FutaPulseApp() {
 
       const config = await apiRequest('/api/notifications/config')
       if (!config.webPushConfigured || !config.webPushPublicKey) {
-        throw new Error('Web Push is not configured on the FUTApulse server yet.')
+        throw new Error(config.webPushConfigurationError || 'Web Push is not configured correctly on the FUTApulse server yet.')
       }
       const registration = await navigator.serviceWorker.ready
       const subscription = await getCurrentPushSubscription(registration, config.webPushPublicKey)
@@ -3432,7 +3432,7 @@ function FutaPulseApp() {
                       <p>This device is connected: <strong>{notificationDeliveryStatus.deviceRegistered ? 'Yes' : 'Not yet'}</strong></p>
                       <p>Reminder service: <strong>{notificationDeliveryStatus.durableSchedulingAvailable ? 'Ready' : 'Temporarily unavailable'}</strong></p>
                       {!notificationDeliveryStatus.pushConfigured
-                        ? <p>The FUTApulse alert service is not set up yet. Please try again later or contact support; this is not a setting you can fix on your phone.</p>
+                        ? <p>The FUTApulse alert service is not configured correctly: {notificationDeliveryStatus.pushConfigurationError || 'Please try again later or contact support.'} This is a server setting, not a setting you can fix on your phone.</p>
                         : !notificationDeliveryStatus.durableSchedulingAvailable
                           ? <p>The reminder service is temporarily unavailable. Please try again later.</p>
                         : notificationDeliveryPermission === 'unsupported'

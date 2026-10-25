@@ -605,14 +605,60 @@ async function cancelEventEndedRecapPrompts(eventId) {
   }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
 }
 
-function initializePushProviders() {
-  if (process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY) {
-    webPush.setVapidDetails(
-      process.env.WEB_PUSH_SUBJECT || "mailto:notifications@futapulse.app",
-      process.env.WEB_PUSH_PUBLIC_KEY,
-      process.env.WEB_PUSH_PRIVATE_KEY
-    );
+function validateVapidCredentials(publicKeyValue, privateKeyValue) {
+  if (typeof publicKeyValue !== "string" || typeof privateKeyValue !== "string"
+    || !publicKeyValue.trim() || !privateKeyValue.trim()) {
+    return { valid: false, error: "Both Web Push VAPID keys must be configured." };
   }
+
+  const publicKey = publicKeyValue.trim();
+  const privateKey = privateKeyValue.trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(publicKey) || !/^[A-Za-z0-9_-]+$/.test(privateKey)) {
+    return { valid: false, error: "Web Push VAPID keys must be unpadded base64url values." };
+  }
+
+  const decodedPublicKey = Buffer.from(publicKey, "base64url");
+  const decodedPrivateKey = Buffer.from(privateKey, "base64url");
+  if (decodedPublicKey.toString("base64url") !== publicKey || decodedPrivateKey.toString("base64url") !== privateKey) {
+    return { valid: false, error: "Web Push VAPID keys are not valid canonical base64url values." };
+  }
+  if (decodedPublicKey.length !== 65 || decodedPublicKey[0] !== 0x04 || decodedPrivateKey.length !== 32) {
+    return { valid: false, error: "The VAPID public key must be a 65-byte uncompressed P-256 point and the private key must be 32 bytes." };
+  }
+
+  try {
+    const ecdh = crypto.createECDH("prime256v1");
+    ecdh.setPrivateKey(decodedPrivateKey);
+    const derivedPublicKey = ecdh.getPublicKey(undefined, "uncompressed");
+    crypto.ECDH.convertKey(decodedPublicKey, "prime256v1", undefined, undefined, "uncompressed");
+    if (!crypto.timingSafeEqual(derivedPublicKey, decodedPublicKey)) {
+      return { valid: false, error: "The Web Push VAPID public and private keys do not match." };
+    }
+  } catch {
+    return { valid: false, error: "The Web Push VAPID public key is not a valid point on the P-256 curve, or the private key is invalid." };
+  }
+
+  return { valid: true, error: "" };
+}
+
+function getVapidConfiguration() {
+  return validateVapidCredentials(process.env.WEB_PUSH_PUBLIC_KEY, process.env.WEB_PUSH_PRIVATE_KEY);
+}
+
+function initializePushProviders() {
+  const configuration = getVapidConfiguration();
+  if (!configuration.valid) {
+    if (process.env.WEB_PUSH_PUBLIC_KEY || process.env.WEB_PUSH_PRIVATE_KEY) {
+      console.error(`Web Push configuration is invalid: ${configuration.error}`);
+    }
+    return configuration;
+  }
+  webPush.setVapidDetails(
+    process.env.WEB_PUSH_SUBJECT || "mailto:notifications@futapulse.app",
+    process.env.WEB_PUSH_PUBLIC_KEY.trim(),
+    process.env.WEB_PUSH_PRIVATE_KEY.trim()
+  );
+  return configuration;
 }
 
 function configureCloudinary() {
@@ -694,8 +740,11 @@ async function dispatchNotificationJob(job) {
   await Promise.all(devices.map(async (device) => {
     try {
       if (device.platform === "web") {
-        if (!process.env.WEB_PUSH_PUBLIC_KEY || !process.env.WEB_PUSH_PRIVATE_KEY) {
-          throw new Error("Web Push credentials are not configured.");
+        const vapidConfiguration = getVapidConfiguration();
+        if (!vapidConfiguration.valid) {
+          const configurationError = new Error(vapidConfiguration.error);
+          configurationError.code = "WEB_PUSH_CONFIGURATION_ERROR";
+          throw configurationError;
         }
         await webPush.sendNotification(device.subscription, JSON.stringify(payload), {
           TTL: 60 * 60 * 24 * 7,
@@ -711,6 +760,7 @@ async function dispatchNotificationJob(job) {
       } else {
         failures.push({
           statusCode: Number.isInteger(error?.statusCode) ? error.statusCode : null,
+          code: error?.code || "",
           message: describeWebPushFailure(error, device.endpoint)
         });
       }
@@ -724,7 +774,9 @@ async function dispatchNotificationJob(job) {
   }
   if (failures.length) {
     const error = new Error(failures.map((failure) => failure.message).join("; "));
-    error.code = failures.every((failure) => failure.statusCode !== null
+    error.code = failures.every((failure) => failure.code === "WEB_PUSH_CONFIGURATION_ERROR")
+      ? "WEB_PUSH_CONFIGURATION_ERROR"
+      : failures.every((failure) => failure.statusCode !== null
       && failure.statusCode >= 400 && failure.statusCode < 500
       && ![408, 425, 429].includes(failure.statusCode))
       ? "WEB_PUSH_PERMANENT_FAILURE"
@@ -773,7 +825,7 @@ async function runNotificationWorker({ limit = 1 } = {}) {
       sent += 1;
     } catch (error) {
       const attempts = Number(job.attempts) || 1;
-      const permanentFailure = error.code === "WEB_PUSH_PERMANENT_FAILURE";
+      const permanentFailure = ["WEB_PUSH_PERMANENT_FAILURE", "WEB_PUSH_CONFIGURATION_ERROR"].includes(error.code);
       const exhausted = permanentFailure || attempts >= 8;
       const retryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
       console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
@@ -1625,10 +1677,12 @@ app.get("/api/config/google", (request, response) => {
 
 app.get("/api/notifications/config", (request, response) => {
   const recapUploadMissingVariables = getMissingCloudinaryVariables();
+  const vapidConfiguration = getVapidConfiguration();
   response.json({
     durableSchedulingAvailable: isMongoConnected(),
-    webPushConfigured: Boolean(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY),
-    webPushPublicKey: process.env.WEB_PUSH_PUBLIC_KEY || null,
+    webPushConfigured: vapidConfiguration.valid,
+    webPushPublicKey: vapidConfiguration.valid ? process.env.WEB_PUSH_PUBLIC_KEY.trim() : null,
+    webPushConfigurationError: vapidConfiguration.valid ? "" : vapidConfiguration.error,
     recapUploadConfigured: recapUploadMissingVariables.length === 0,
     recapUploadMissingVariables
   });
@@ -1674,13 +1728,15 @@ app.get("/api/notifications/status", async (request, response) => {
       return response.status(400).json({ error: "Notification platform must be web." });
     }
     const userId = String(user._id || user.id);
-    const pushConfigured = Boolean(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY);
+    const vapidConfiguration = getVapidConfiguration();
+    const pushConfigured = vapidConfiguration.valid;
     const deviceRegistered = isMongoConnected()
       ? Boolean(await PushDevice.exists({ userId, platform: requestedPlatform, enabled: true }))
       : false;
     return response.json({
       durableSchedulingAvailable: isMongoConnected(),
       pushConfigured,
+      pushConfigurationError: pushConfigured ? "" : vapidConfiguration.error,
       deviceRegistered
     });
   } catch (error) {
@@ -1709,8 +1765,9 @@ app.post("/api/notifications/devices/web", async (request, response) => {
     if (endpointUrl.protocol !== "https:" || typeof subscription?.keys?.p256dh !== "string" || typeof subscription?.keys?.auth !== "string") {
       return response.status(400).json({ error: "The browser push subscription is incomplete or insecure." });
     }
-    if (!process.env.WEB_PUSH_PUBLIC_KEY || !process.env.WEB_PUSH_PRIVATE_KEY) {
-      return response.status(503).json({ error: "Web Push is not configured on the FUTApulse server yet." });
+    const vapidConfiguration = getVapidConfiguration();
+    if (!vapidConfiguration.valid) {
+      return response.status(503).json({ error: `Web Push is not configured correctly: ${vapidConfiguration.error}` });
     }
     const deviceKey = crypto.createHash("sha256").update(endpoint).digest("hex");
     await PushDevice.findOneAndUpdate(
@@ -3308,7 +3365,7 @@ app.post("/api/events/:eventId/announcements", async (request, response) => {
       queued: true,
       recipientCount: recipients.length,
       pushReadyDeviceCount,
-      pushConfigured: Boolean(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY)
+      pushConfigured: getVapidConfiguration().valid
     });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
@@ -3832,8 +3889,12 @@ async function startServer() {
     });
     httpServer.listen(PORT, "0.0.0.0", () => {
       console.log(`FUTApulse API listening on port ${PORT}`);
-      if (process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY) console.log("Web Push delivery is configured.");
-      if (!(process.env.WEB_PUSH_PUBLIC_KEY && process.env.WEB_PUSH_PRIVATE_KEY)) {
+      const vapidConfiguration = initializePushProviders();
+      if (vapidConfiguration.valid) console.log("Web Push VAPID credentials are valid.");
+      if (!vapidConfiguration.valid) {
+        console.warn(`Web Push is unavailable: ${vapidConfiguration.error}`);
+      }
+      if (!process.env.WEB_PUSH_PUBLIC_KEY && !process.env.WEB_PUSH_PRIVATE_KEY) {
         console.warn("Web Push credentials are missing. Browser/OS permission alone cannot enable closed-app delivery. Configure Web Push credentials in Render.");
       }
     });
@@ -3882,5 +3943,6 @@ module.exports = {
   buildFacultyTurnoutBreakdown,
   buildRsvpReminderSchedule,
   buildCriticalEventUpdateDetails,
-  describeWebPushFailure
+  describeWebPushFailure,
+  validateVapidCredentials
 };
