@@ -12,14 +12,17 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
     "bcryptjs": "^2.4.3",
     "cloudinary": "^2.11.0",
+    "compression": "^1.8.2",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "google-auth-library": "^9.15.1",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.9.5",
     "multer": "^2.4.0",
+    "redis": "^6.3.0",
     "socket.io": "^4.8.4",
     "web-push": "^3.6.7"
   }

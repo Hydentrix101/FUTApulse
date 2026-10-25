@@ -279,6 +279,11 @@ test("RSVP reminders use default intervals or the custom override while retainin
 
   const custom = buildRsvpReminderSchedule(event, { hasCustomReminder: true, now: startsAt - 2 * 60 * 60_000 });
   assert.deepEqual(custom.map(({ suffix, dueAt }) => [suffix, dueAt.getTime()]), [["start", startsAt]]);
+  assert.equal(custom[0].message, "Campus meetup is live now.");
+  assert.deepEqual(
+    buildRsvpReminderSchedule(event, { hasCustomReminder: true, now: startsAt - 30 * 60_000 }).map(({ suffix, dueAt }) => [suffix, dueAt.getTime()]),
+    [["start", startsAt]]
+  );
   assert.deepEqual(buildRsvpReminderSchedule(event, { now: startsAt }), []);
 });
 
@@ -340,6 +345,9 @@ test("health and readiness clearly report the local development storage mode", a
   assert.equal(healthResponse.status, 200);
   assert.equal(health.database, "local-fallback");
   assert.equal(health.databaseConnected, false);
+  assert.equal(typeof health.eventImageStorageConfigured, "boolean");
+  assert.equal(health.socketRedisConfigured, false);
+  assert.equal(health.socketRedisConnected, false);
   assert.equal(readinessResponse.status, 200);
   assert.equal(readiness.ready, true);
   assert.equal(readiness.operationalMongoCutover, false);
@@ -1008,7 +1016,6 @@ test("event organizer details follow the account's current profile", async () =>
       startTime: start.toISOString(),
       endTime: new Date(start.getTime() + 3600000).toISOString(),
       venue: "Sports Complex",
-      banner: "data:image/png;base64,dGVzdA==",
       audience: ["all"],
       status: "Published"
     })
@@ -1079,6 +1086,50 @@ test("drafts are private and only their owner can permanently delete them", asyn
   assert.equal(removed.status, 200);
   const ownerEventsAfterDelete = await fetch(`${baseUrl}/api/events`, { headers: ownerHeaders });
   assert.ok(!(await ownerEventsAfterDelete.json()).events.some((event) => event.id === draft.id));
+});
+
+test("event image data is rejected explicitly when Cloudinary storage is not configured", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const owner = await createVerifiedAccount(baseUrl, "banner-storage@futa.edu.ng", "banner_storage");
+  const headers = { "Content-Type": "application/json", Authorization: "Bearer " + owner.token };
+  const setup = await fetch(`${baseUrl}/api/profile/setup`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ username: "banner_storage", displayName: "Banner Storage", faculty: "SEET", department: "EEE", level: "300", role: "explorer" })
+  });
+  assert.equal(setup.status, 200);
+
+  const previousVariables = {
+    CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME,
+    CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY,
+    CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET
+  };
+  process.env.CLOUDINARY_CLOUD_NAME = "";
+  process.env.CLOUDINARY_API_KEY = "";
+  process.env.CLOUDINARY_API_SECRET = "";
+  try {
+    const response = await fetch(`${baseUrl}/api/events`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        title: "Banner storage draft",
+        category: "academic",
+        activity: "Draft details",
+        status: "Draft",
+        bannerImages: ["data:image/png;base64,iVBORw0KGgo="]
+      })
+    });
+    assert.equal(response.status, 503);
+    const result = await response.json();
+    assert.match(result.error, /CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET/);
+    const eventsResponse = await fetch(`${baseUrl}/api/events`, { headers });
+    assert.ok(!(await eventsResponse.json()).events.some((event) => event.title === "Banner storage draft"));
+  } finally {
+    for (const [key, value] of Object.entries(previousVariables)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test("cancelled events leave the public feed, stay in the owner's seven-day profile archive, and can be removed", async () => {

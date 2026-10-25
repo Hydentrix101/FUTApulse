@@ -4,11 +4,14 @@ const crypto = require("node:crypto");
 const http = require("node:http");
 const express = require("express");
 const cors = require("cors");
+const compression = require("compression");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
 const { Server: SocketServer } = require("socket.io");
+const { createAdapter: createSocketRedisAdapter } = require("@socket.io/redis-adapter");
+const { createClient: createRedisClient } = require("redis");
 const webPush = require("web-push");
 const cloudinary = require("cloudinary").v2;
 const multer = require("multer");
@@ -416,6 +419,8 @@ const NotificationJob = mongoose.models.FutapulseNotificationJob
   || mongoose.model("FutapulseNotificationJob", notificationJobSchema, "notification_jobs");
 let realtimeServer = null;
 let notificationWorkerTimer = null;
+let notificationWorkerInFlight = false;
+let socketRedisClients = [];
 
 function notificationEventLink(event) {
   const link = new URL(FRONTEND_URL);
@@ -682,8 +687,8 @@ const recapImageUpload = multer({
   storage: multer.memoryStorage(),
   limits: { files: 5, fileSize: 5 * 1024 * 1024 },
   fileFilter: (request, file, callback) => {
-    if (!["image/jpeg", "image/webp"].includes(file.mimetype)) {
-      callback(new Error("Recap photos must be JPEG or WebP images."));
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.mimetype)) {
+      callback(new Error("Recap photos must be JPEG, PNG, or WebP images."));
       return;
     }
     callback(null, true);
@@ -705,6 +710,89 @@ function uploadRecapImage(buffer, eventId) {
     });
     stream.end(buffer);
   });
+}
+
+function uploadEventBannerImage(buffer, eventId) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream({
+      folder: `futapulse/event-banners/${String(eventId).replace(/[^a-zA-Z0-9_-]/g, "_")}`,
+      resource_type: "image",
+      format: "webp",
+      quality: "auto",
+      fetch_format: "auto",
+      transformation: [{ width: 1280, height: 1280, crop: "limit" }]
+    }, (error, result) => {
+      if (error) reject(error);
+      else resolve(result);
+    });
+    stream.end(buffer);
+  });
+}
+
+function decodeEventBannerDataUrl(dataUrl) {
+  const match = /^data:(image\/(?:jpeg|png|webp));base64,([a-zA-Z0-9+/]+={0,2})$/.exec(dataUrl);
+  if (!match) throw new Error("An event banner must be a JPEG, PNG, or WebP image.");
+  const buffer = Buffer.from(match[2], "base64");
+  const isJpeg = buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  const isPng = buffer.length >= 8
+    && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const isWebp = buffer.length >= 12
+    && buffer.toString("ascii", 0, 4) === "RIFF"
+    && buffer.toString("ascii", 8, 12) === "WEBP";
+  if (!isJpeg && !isPng && !isWebp) throw new Error("An event banner does not match its declared image format.");
+  return buffer;
+}
+
+async function externalizeEventBanners(event) {
+  const sourceImages = Array.isArray(event.bannerImages) && event.bannerImages.length
+    ? event.bannerImages
+    : event.banner ? [event.banner] : [];
+  if (sourceImages.length > 5) throw new Error("An event can contain at most five banner images.");
+  if (sourceImages.some((image) => typeof image !== "string")) throw new Error("An event banner image is invalid.");
+  if (!sourceImages.some((image) => typeof image === "string" && image.startsWith("data:image/"))) {
+    if (sourceImages.some((image) => image && !image.startsWith("/") && !/^https?:\/\//i.test(image))) {
+      throw new Error("Event banner URLs must use HTTP or HTTPS.");
+    }
+    return { ...event, bannerImages: sourceImages, banner: sourceImages[0] || "" };
+  }
+  if (!configureCloudinary()) {
+    const error = new Error(`Event banner storage is not configured. Add ${getMissingCloudinaryVariables().join(", ")} to the server environment.`);
+    error.code = "EVENT_BANNER_STORAGE_UNAVAILABLE";
+    throw error;
+  }
+
+  const uploads = await Promise.allSettled(sourceImages.map(async (image) => {
+    if (typeof image !== "string") throw new Error("An event banner image is invalid.");
+    if (!image.startsWith("data:image/")) return { url: image, publicId: "" };
+    const uploaded = await uploadEventBannerImage(decodeEventBannerDataUrl(image), event.id);
+    return { url: uploaded.secure_url, publicId: uploaded.public_id };
+  }));
+  const failedUpload = uploads.find((result) => result.status === "rejected");
+  if (failedUpload) {
+    await Promise.all(uploads.filter((result) => result.status === "fulfilled" && result.value.publicId).map(async (result) => {
+      try {
+        await cloudinary.uploader.destroy(result.value.publicId, { resource_type: "image" });
+      } catch (cleanupError) {
+        console.error("Unable to remove an unreferenced event banner after upload failure.", cleanupError);
+      }
+    }));
+    const error = failedUpload.reason;
+    error.code = "EVENT_BANNER_UPLOAD_FAILED";
+    throw error;
+  }
+  const bannerImages = uploads.map((result) => result.value.url);
+  return { ...event, bannerImages, banner: bannerImages[0] || "" };
+}
+
+function eventBannerUploadErrorMessage(error) {
+  const status = Number(error?.http_code || error?.statusCode);
+  if (error?.code === "ETIMEDOUT" || error?.code === "ECONNRESET") {
+    return "Event image storage timed out. Check your internet connection and try again.";
+  }
+  if (status === 401 || status === 403) {
+    return "Event image storage rejected the upload. Check the server's Cloudinary credentials.";
+  }
+  return "The event images could not be saved to image storage. Please try again.";
 }
 
 function describeWebPushFailure(error, endpoint) {
@@ -793,67 +881,71 @@ async function dispatchNotificationJob(job) {
   }
 }
 
-async function runNotificationWorker({ limit = 1 } = {}) {
+async function claimDueNotificationJob(now = new Date()) {
+  return NotificationJob.findOneAndUpdate({
+    dueAt: { $lte: now },
+    nextAttemptAt: { $lte: now },
+    $or: [
+      { status: "pending" },
+      { status: "processing", leaseUntil: { $lte: now } }
+    ]
+  }, {
+    $set: { status: "processing", leaseUntil: new Date(now.getTime() + 60_000) },
+    $inc: { attempts: 1 }
+  }, { new: true, sort: { dueAt: 1, createdAt: 1 } }).exec();
+}
+
+async function processClaimedNotificationJob(job) {
+  try {
+    await dispatchNotificationJob(job);
+    await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+      $set: { status: "sent", sentAt: new Date(), leaseUntil: null, lastError: "" }
+    }).exec();
+    return "sent";
+  } catch (error) {
+    const attempts = Number(job.attempts) || 1;
+    const permanentFailure = ["WEB_PUSH_PERMANENT_FAILURE", "WEB_PUSH_CONFIGURATION_ERROR"].includes(error.code);
+    const exhausted = permanentFailure || attempts >= 8;
+    const retryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
+    console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
+    if (error.code === "NO_NOTIFICATION_DELIVERY_CHANNEL") {
+      await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+        $set: {
+          status: "undeliverable",
+          leaseUntil: null,
+          lastError: String(error.message || error).slice(0, 500)
+        }
+      }).exec();
+      return "undeliverable";
+    }
+
+    await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+      $set: {
+        status: exhausted ? "failed" : "pending",
+        nextAttemptAt: new Date(Date.now() + retryDelay),
+        leaseUntil: null,
+        lastError: String(error.message || error).slice(0, 500)
+      }
+    }).exec();
+    return exhausted ? "failed" : "retried";
+  }
+}
+
+async function runNotificationWorker({ limit = 20 } = {}) {
   if (!isMongoConnected()) return { processed: 0, sent: 0, retried: 0, failed: 0, undeliverable: 0, hasMore: false, unavailable: true };
   const batchLimit = Math.min(50, Math.max(1, Number.isInteger(limit) ? limit : 1));
-  let processed = 0;
-  let sent = 0;
-  let retried = 0;
-  let failed = 0;
-  let undeliverable = 0;
-
-  while (processed < batchLimit) {
-    const now = new Date();
-    const job = await NotificationJob.findOneAndUpdate({
-      dueAt: { $lte: now },
-      nextAttemptAt: { $lte: now },
-      $or: [
-        { status: "pending" },
-        { status: "processing", leaseUntil: { $lte: now } }
-      ]
-    }, {
-      $set: { status: "processing", leaseUntil: new Date(now.getTime() + 60_000) },
-      $inc: { attempts: 1 }
-    }, { new: true, sort: { dueAt: 1 } }).exec();
+  const claimedJobs = [];
+  while (claimedJobs.length < batchLimit) {
+    const job = await claimDueNotificationJob();
     if (!job) break;
-
-    try {
-      await dispatchNotificationJob(job);
-      await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
-        $set: { status: "sent", sentAt: new Date(), leaseUntil: null, lastError: "" }
-      }).exec();
-      sent += 1;
-    } catch (error) {
-      const attempts = Number(job.attempts) || 1;
-      const permanentFailure = ["WEB_PUSH_PERMANENT_FAILURE", "WEB_PUSH_CONFIGURATION_ERROR"].includes(error.code);
-      const exhausted = permanentFailure || attempts >= 8;
-      const retryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
-      console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
-      if (error.code === "NO_NOTIFICATION_DELIVERY_CHANNEL") {
-        await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
-          $set: {
-            status: "undeliverable",
-            leaseUntil: null,
-            lastError: String(error.message || error).slice(0, 500)
-          }
-        }).exec();
-        undeliverable += 1;
-      } else {
-        await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
-          $set: {
-            status: exhausted ? "failed" : "pending",
-            nextAttemptAt: new Date(Date.now() + retryDelay),
-            leaseUntil: null,
-            lastError: String(error.message || error).slice(0, 500)
-          }
-        }).exec();
-        if (exhausted) failed += 1;
-        else retried += 1;
-      }
-    }
-    processed += 1;
+    claimedJobs.push(job);
   }
 
+  const outcomes = await Promise.all(claimedJobs.map(processClaimedNotificationJob));
+  const sent = outcomes.filter((outcome) => outcome === "sent").length;
+  const retried = outcomes.filter((outcome) => outcome === "retried").length;
+  const failed = outcomes.filter((outcome) => outcome === "failed").length;
+  const undeliverable = outcomes.filter((outcome) => outcome === "undeliverable").length;
   const now = new Date();
   const hasMore = Boolean(await NotificationJob.exists({
     dueAt: { $lte: now },
@@ -863,7 +955,7 @@ async function runNotificationWorker({ limit = 1 } = {}) {
       { status: "processing", leaseUntil: { $lte: now } }
     ]
   }).exec());
-  return { processed, sent, retried, failed, undeliverable, hasMore, unavailable: false };
+  return { processed: claimedJobs.length, sent, retried, failed, undeliverable, hasMore, unavailable: false };
 }
 
 const eventReportSchema = new mongoose.Schema({
@@ -910,13 +1002,33 @@ function eventDocumentFromRecord(event) {
   };
 }
 
-async function listStoredEvents(viewerId = "") {
+async function listStoredEvents(viewerId = "", onlyVisible = false) {
   if (!isMongoConnected()) return readDatabase().events;
-  const records = await EventRecord.find({}).lean().exec();
+  let filter = {};
+  if (onlyVisible) {
+    const now = Date.now();
+    const visibleEventStart = new Date(now - (30 * 60_000));
+    const recentOwnerHistoryStart = new Date(now - (7 * 24 * 60 * 60_000));
+    const visibilityFilters = [
+      { status: { $in: ["Published", "Live"] }, endsAt: { $gt: visibleEventStart } }
+    ];
+    if (viewerId) {
+      visibilityFilters.push(
+        { ownerUserId: String(viewerId), status: "Draft" },
+        { ownerUserId: String(viewerId), status: { $ne: "Cancelled" }, endsAt: { $gt: recentOwnerHistoryStart, $lte: new Date(now) } },
+        { ownerUserId: String(viewerId), status: "Cancelled", "record.cancelledAt": { $gte: recentOwnerHistoryStart.toISOString() } }
+      );
+    }
+    filter = { $or: visibilityFilters };
+  }
+  const records = await EventRecord.find(filter).lean().exec();
   const events = records.map((item) => item.record).filter(Boolean);
   if (!events.length) return events;
   const eventIds = events.map((event) => String(event.id));
-  const actions = await EngagementAction.find({ eventId: { $in: eventIds } }).select("eventId userId type faculty").lean().exec();
+  const actions = await EngagementAction.find({ eventId: { $in: eventIds } })
+    .select("eventId userId type faculty department")
+    .lean()
+    .exec();
   const actionsByEvent = new Map();
   for (const action of actions) {
     if (!actionsByEvent.has(action.eventId)) actionsByEvent.set(action.eventId, []);
@@ -1634,6 +1746,7 @@ async function createUser(user) {
 const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo";
 
 app.disable("x-powered-by");
+app.use(compression());
 app.use(cors({
   origin: process.env.CORS_ORIGIN ? CORS_ORIGINS : true,
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
@@ -1643,11 +1756,15 @@ app.use(cors({
 app.use(express.json({ limit: "4mb" }));
 
 app.get("/api/health", (request, response) => {
+  const missingCloudinaryVariables = getMissingCloudinaryVariables();
   response.json({
     ok: true,
     service: "futapulse-api",
     database: databaseBackend === "mongodb" ? "mongodb" : "local-fallback",
     databaseConnected: isMongoConnected(),
+    eventImageStorageConfigured: missingCloudinaryVariables.length === 0,
+    socketRedisConfigured: Boolean(process.env.SOCKET_REDIS_URL),
+    socketRedisConnected: socketRedisClients.length === 2 && socketRedisClients.every((client) => client.isReady),
     timestamp: new Date().toISOString()
   });
 });
@@ -1683,6 +1800,8 @@ app.get("/api/notifications/config", (request, response) => {
     webPushConfigured: vapidConfiguration.valid,
     webPushPublicKey: vapidConfiguration.valid ? process.env.WEB_PUSH_PUBLIC_KEY.trim() : null,
     webPushConfigurationError: vapidConfiguration.valid ? "" : vapidConfiguration.error,
+    eventImageStorageConfigured: recapUploadMissingVariables.length === 0,
+    eventImageStorageMissingVariables: recapUploadMissingVariables,
     recapUploadConfigured: recapUploadMissingVariables.length === 0,
     recapUploadMissingVariables
   });
@@ -2675,7 +2794,7 @@ app.get("/api/events", async (request, response) => {
     if (authorization.startsWith("Bearer ") && !user) return response.status(401).json({ error: "Session is no longer valid." });
     const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
     const viewerId = user ? String(user._id || user.id) : "";
-    const storedEvents = await listStoredEvents(viewerId);
+    const storedEvents = await listStoredEvents(viewerId, true);
     const level = request.query.level;
     const category = request.query.category;
     let events = storedEvents.filter((event) => {
@@ -2801,7 +2920,7 @@ app.get("/api/events/engagement", async (request, response) => {
     const user = authorization.startsWith("Bearer ") ? await getAuthenticatedUser(request) : null;
     if (authorization.startsWith("Bearer ") && !user) return response.status(401).json({ error: "Session is no longer valid." });
     const viewerId = user ? String(user._id || user.id) : "";
-    const events = await listStoredEvents(viewerId);
+    const events = await listStoredEvents(viewerId, true);
     const eligibleEvents = events
       .filter((event) => (["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event))
         || (viewerId && String(event.createdByUserId || "") === viewerId
@@ -2871,17 +2990,31 @@ function updateFacultyTurnoutBreakdown(turnoutBreakdown, faculty, delta) {
 
 async function getHotEligibleUserCount(database = null) {
   if (isMongoConnected()) {
+    if (hotEligibleUserCountCache.value !== null && hotEligibleUserCountCache.expiresAt > Date.now()) {
+      return hotEligibleUserCountCache.value;
+    }
+    if (hotEligibleUserCountCache.pending) return hotEligibleUserCountCache.pending;
     const completeProfile = Object.fromEntries(
       ["name", "faculty", "department", "level", "role"].map((field) => [
         `profile.${field}`,
         { $type: "string", $regex: /\S/ }
       ])
     );
-    return User.countDocuments({ emailVerified: true, ...completeProfile }).exec();
+    hotEligibleUserCountCache.pending = User.countDocuments({ emailVerified: true, ...completeProfile }).exec();
+    try {
+      const count = await hotEligibleUserCountCache.pending;
+      hotEligibleUserCountCache.value = count;
+      hotEligibleUserCountCache.expiresAt = Date.now() + 60_000;
+      return count;
+    } finally {
+      hotEligibleUserCountCache.pending = null;
+    }
   }
   const users = (database || readDatabase()).users || [];
   return users.filter((user) => user.emailVerified === true && validateProfile(user.profile || {})).length;
 }
+
+let hotEligibleUserCountCache = { value: null, expiresAt: 0, pending: null };
 
 function isHotByRsvpCount(rsvpCount, eligibleUserCount) {
   return eligibleUserCount > 0 && Number(rsvpCount) * 2 > eligibleUserCount;
@@ -2917,7 +3050,7 @@ function buildRsvpReminderSchedule(event, { hasCustomReminder = false, now = Dat
       { offset: 60 * 60_000, suffix: "1h", message: `${event.title} starts in 1 hour.` },
       { offset: 30 * 60_000, suffix: "30m", message: `${event.title} is starting in 30 minutes!` }
     ] : []),
-    { offset: 0, suffix: "start", message: `${event.title} has officially started!` }
+    { offset: 0, suffix: "start", message: `${event.title} is live now.` }
   ]
     .map(({ offset, suffix, message }) => ({ suffix, message, dueAt: new Date(startsAt.getTime() - offset) }))
     .filter((reminder) => reminder.dueAt.getTime() > now);
@@ -3146,7 +3279,7 @@ app.get("/api/events/hot", async (request, response) => {
     throw error;
   }
   const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
-  const storedEvents = await listStoredEvents(viewerId);
+  const storedEvents = await listStoredEvents(viewerId, true);
   const hotEligibleUserCount = await getHotEligibleUserCount(database);
   const events = storedEvents
     .filter((event) => {
@@ -3178,7 +3311,7 @@ app.post("/api/events", async (request, response) => {
     if (requestedStatus !== "Draft" && new Date(user.postingBanUntil || 0).getTime() > Date.now()) {
       return response.status(403).json({ error: `Your event-posting access is paused until ${new Date(user.postingBanUntil).toLocaleString()}.` });
     }
-    const event = {
+    let event = {
       ...eventPayload,
       id: crypto.randomUUID(),
       createdByUserId: String(user._id || user.id),
@@ -3213,17 +3346,25 @@ app.post("/api/events", async (request, response) => {
           matches: advisoryMatches
         });
       }
+      event = await externalizeEventBanners(event);
       await storeEvent(event);
       void enqueueCategoryAlert(event).catch((error) => console.error("New-event notifications could not be queued.", error));
       void scheduleEventEndedRecapPrompt(event).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
       return response.status(201).json({ event: toPublicEvent(event), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
+    event = await externalizeEventBanners(event);
     await storeEvent(event);
     void cancelEventEndedRecapPrompts(event.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
     return response.status(201).json({ event: toPublicEvent(event), similarEvents: [] });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
       return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
+    }
+    if (error.code === "EVENT_BANNER_STORAGE_UNAVAILABLE") {
+      return response.status(503).json({ error: error.message });
+    }
+    if (error.code === "EVENT_BANNER_UPLOAD_FAILED") {
+      return response.status(502).json({ error: eventBannerUploadErrorMessage(error) });
     }
     console.error("Event creation failed.", error);
     return response.status(500).json({ error: "Unable to publish this event right now." });
@@ -3244,7 +3385,7 @@ app.patch("/api/events/:eventId", async (request, response) => {
       return response.status(409).json({ error: "Published events cannot be changed back into drafts." });
     }
     const { allowSimilar, ...changes } = request.body || {};
-    const updated = {
+    let updated = {
       ...current,
       ...changes,
       id: current.id,
@@ -3277,6 +3418,7 @@ app.patch("/api/events/:eventId", async (request, response) => {
           matches: advisoryMatches
         });
       }
+      updated = await externalizeEventBanners(updated);
       await storeEvent(updated);
       if (["Published", "Live"].includes(updated.status)) {
         void scheduleEventEndedRecapPrompt(updated).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
@@ -3293,12 +3435,19 @@ app.patch("/api/events/:eventId", async (request, response) => {
       }
       return response.json({ event: toPublicEvent(updated), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
+    updated = await externalizeEventBanners(updated);
     await storeEvent(updated);
     void cancelEventEndedRecapPrompts(updated.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
     return response.json({ event: toPublicEvent(updated), similarEvents: [] });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
       return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
+    }
+    if (error.code === "EVENT_BANNER_STORAGE_UNAVAILABLE") {
+      return response.status(503).json({ error: error.message });
+    }
+    if (error.code === "EVENT_BANNER_UPLOAD_FAILED") {
+      return response.status(502).json({ error: eventBannerUploadErrorMessage(error) });
     }
     console.error("Event update failed.", error);
     return response.status(500).json({ error: "Unable to update this event right now." });
@@ -3413,7 +3562,10 @@ app.post("/api/events/:eventId/announcements", async (request, response) => {
 app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
   recapImageUpload.array("photos", 5)(request, response, (error) => {
     if (error) {
-      return response.status(400).json({ error: error.message || "Unable to process recap photos." });
+      const message = error.code === "LIMIT_FILE_SIZE"
+        ? "Each recap photo must be 5 MB or smaller."
+        : error.message || "Unable to process recap photos.";
+      return response.status(400).json({ error: message });
     }
     return next();
   });
@@ -3447,7 +3599,9 @@ app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
       const isWebp = file.buffer.length >= 12
         && file.buffer.toString("ascii", 0, 4) === "RIFF"
         && file.buffer.toString("ascii", 8, 12) === "WEBP";
-      if (!isJpeg && !isWebp) return response.status(400).json({ error: "A recap photo does not match its declared JPEG or WebP format." });
+      const isPng = file.buffer.length >= 8
+        && file.buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+      if (!isJpeg && !isPng && !isWebp) return response.status(400).json({ error: "A recap photo does not match its declared JPEG, PNG, or WebP format." });
       const uploaded = await uploadRecapImage(file.buffer, event.id);
       uploadedAssets.push(uploaded);
     }
@@ -3493,7 +3647,15 @@ app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
     }));
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
     console.error("Event recap photo upload failed.", error);
-    return response.status(500).json({ error: "Unable to publish the event recap photos right now." });
+    const providerStatus = Number(error?.http_code || error?.statusCode);
+    const message = error?.code === "ETIMEDOUT" || error?.code === "ECONNRESET"
+      ? "The connection to photo storage timed out. Check your internet connection and try again."
+      : providerStatus === 401 || providerStatus === 403
+        ? "Photo storage rejected the upload. The server's Cloudinary credentials need to be checked."
+        : providerStatus >= 500
+          ? "Photo storage is temporarily unavailable. Please try again shortly."
+          : "The server could not save these recap photos. Please try again; if this continues, check the server logs.";
+    return response.status(500).json({ error: message });
   }
 });
 
@@ -3893,11 +4055,34 @@ app.use((error, request, response, next) => {
 });
 
 async function startServer() {
-  const listen = () => {
+  const listen = async () => {
     initializePushProviders();
     realtimeServer = new SocketServer(httpServer, {
       cors: { origin: process.env.CORS_ORIGIN ? CORS_ORIGINS : true, credentials: true },
-      transports: ["websocket", "polling"]
+      transports: ["websocket", "polling"],
+      pingTimeout: 20_000,
+      pingInterval: 25_000
+    });
+    if (process.env.SOCKET_REDIS_URL) {
+      const pubClient = createRedisClient({ url: process.env.SOCKET_REDIS_URL });
+      const subClient = pubClient.duplicate();
+      pubClient.on("error", (error) => console.error("Socket.IO Redis publisher error.", error.code || "connection error"));
+      subClient.on("error", (error) => console.error("Socket.IO Redis subscriber error.", error.code || "connection error"));
+      try {
+        await Promise.all([pubClient.connect(), subClient.connect()]);
+        realtimeServer.adapter(createSocketRedisAdapter(pubClient, subClient));
+        socketRedisClients = [pubClient, subClient];
+        console.log("Socket.IO Redis adapter connected for cross-instance delivery.");
+      } catch (error) {
+        await Promise.allSettled([pubClient.quit(), subClient.quit()]);
+        throw new Error(`SOCKET_REDIS_URL is configured but the Socket.IO Redis adapter could not connect (${error.code || "connection error"}).`);
+      }
+    } else if (process.env.NODE_ENV === "production") {
+      console.warn("SOCKET_REDIS_URL is not set; live Socket.IO broadcasts are limited to this API instance.");
+    }
+    httpServer.once("close", () => {
+      void Promise.allSettled(socketRedisClients.map((client) => client.quit()));
+      socketRedisClients = [];
     });
     realtimeServer.use(async (socket, next) => {
       try {
@@ -3936,7 +4121,11 @@ async function startServer() {
     });
     if (isMongoConnected()) {
       notificationWorkerTimer = setInterval(() => {
-        void runNotificationWorker().catch((error) => console.error("Notification worker tick failed.", error));
+        if (notificationWorkerInFlight) return;
+        notificationWorkerInFlight = true;
+        void runNotificationWorker({ limit: 20 })
+          .catch((error) => console.error("Notification worker tick failed.", error))
+          .finally(() => { notificationWorkerInFlight = false; });
       }, 1000);
       notificationWorkerTimer.unref?.();
     }
@@ -3949,7 +4138,10 @@ async function startServer() {
     return listen();
   }
 
-  return mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 5000 })
+  return mongoose.connect(process.env.MONGO_URI, {
+    serverSelectionTimeoutMS: 5000,
+    maxPoolSize: 10
+  })
     .then(async () => {
       await Promise.all([
         User.init(), EmailChallenge.init(), EventRecord.init(), EngagementAction.init(), EventReport.init(),

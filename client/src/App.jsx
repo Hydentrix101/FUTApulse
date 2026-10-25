@@ -195,7 +195,7 @@ async function compressEventBanner(file) {
     context.drawImage(image, 0, 0, canvas.width, canvas.height)
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/webp', 0.78))
     if (!blob) throw new Error('Unable to prepare this banner. Try another image.')
-    if (blob.size > 600 * 1024) throw new Error('This banner is still too large after compression. Choose a smaller image.')
+    if (blob.size > 400 * 1024) throw new Error('This banner is still too large after compression. Choose a smaller image.')
     const dataUrl = await new Promise((resolve, reject) => {
       const reader = new FileReader()
       reader.onload = () => resolve(reader.result)
@@ -296,6 +296,9 @@ async function apiRequest(endpoint, options = {}, token = '') {
     if (error.name === 'TimeoutError' || error.name === 'AbortError') {
       throw new Error('FUTApulse did not confirm this request in time. Check the feed before retrying.', { cause: error })
     }
+    if (error instanceof TypeError) {
+      throw new Error('FUTApulse could not reach its server. Check your internet connection and retry; no action was confirmed.', { cause: error })
+    }
     throw error
   }
   const result = await response.json().catch(() => ({}))
@@ -313,9 +316,21 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
   const previewRef = useRef(null)
   const category = CATEGORY_DATA.find((item) => item.id === event.category)
   const [avatarFailed, setAvatarFailed] = useState(false)
-  const [bannerFailed, setBannerFailed] = useState(false)
+  const [failedBannerSource, setFailedBannerSource] = useState('')
+  const [bannerIndex, setBannerIndex] = useState(0)
+  const bannerImages = Array.isArray(event.bannerImages)
+    ? event.bannerImages.filter((image) => typeof image === 'string' && image)
+    : []
+  const bannerSource = bannerImages[bannerIndex % Math.max(1, bannerImages.length)] || event.banner || event.image || ''
+  const bannerFailed = failedBannerSource === bannerSource
   const fallback = `/Faculty%20Logo/${encodeURIComponent(event.organizerFaculty || event.faculty || 'SEET')}.png`
   const eventId = getEventId(event)
+
+  useEffect(() => {
+    if (bannerImages.length < 2) return undefined
+    const timer = window.setInterval(() => setBannerIndex((index) => (index + 1) % bannerImages.length), 5500)
+    return () => window.clearInterval(timer)
+  }, [bannerImages.length])
 
   useEffect(() => {
     const preview = previewRef.current
@@ -339,7 +354,7 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
     }} tabIndex={0} role="button" aria-label={`Event preview for ${event.title}`}>
       {homeVariant === 'home-featured-preview' ? (
         <>
-          <div className="home-featured-banner" style={event.banner || event.image ? { backgroundImage: `linear-gradient(90deg, rgba(2,6,23,.94), rgba(2,6,23,.64) 54%, rgba(2,6,23,.22)), url("${event.banner || event.image}")` } : undefined}>
+          <div className="home-featured-banner" style={bannerSource ? { backgroundImage: `linear-gradient(90deg, rgba(2,6,23,.94), rgba(2,6,23,.64) 54%, rgba(2,6,23,.22)), url("${bannerSource}")` } : undefined}>
             <span className="preview-category-badge">{category?.label || String(event.category || 'EVENT').toUpperCase()}</span>
             <div className="home-preview-organizer">
             <span className="organizer-micro-avatar">{avatarFailed ? <Building2 size={16} /> : <img loading="lazy" decoding="async" src={event.organizerPicture || fallback} alt="" onError={(error) => { const image = error.currentTarget; if (image.dataset.fallback) { setAvatarFailed(true); return } image.dataset.fallback = 'true'; image.src = fallback }} />}</span>
@@ -354,7 +369,7 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
       ) : homeVariant === 'home-category-preview' ? (
         <>
           <div className="home-category-banner">
-            {bannerFailed || !(event.banner || event.image) ? <span className="preview-fallback"><Sparkles size={24} /></span> : <img loading="lazy" decoding="async" src={event.banner || event.image} alt="" onError={() => setBannerFailed(true)} />}
+            {bannerFailed || !bannerSource ? <span className="preview-fallback"><Sparkles size={24} /></span> : <img loading="lazy" decoding="async" src={bannerSource} alt="" onError={() => setFailedBannerSource(bannerSource)} />}
             <span className="home-preview-organizer"><span className="organizer-micro-avatar">{avatarFailed ? <Building2 size={14} /> : <img loading="lazy" decoding="async" src={event.organizerPicture || fallback} alt="" onError={(error) => { const image = error.currentTarget; if (image.dataset.fallback) { setAvatarFailed(true); return } image.dataset.fallback = 'true'; image.src = fallback }} />}</span><span className="home-organizer-name">{event.organizerName || event.organizer?.name || 'Campus Organizer'}</span></span>
             <span className="home-category-countdown"><CountdownPill startTime={getStartTime(event)} endTime={event.endTime} /></span>
           </div>
@@ -383,10 +398,10 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
       </div>
       <div className="preview-content">
         <div className="preview-thumbnail">
-          {bannerFailed || !(event.banner || event.image) ? (
+          {bannerFailed || !bannerSource ? (
             <span className="preview-fallback"><Sparkles size={22} /></span>
           ) : (
-            <img loading="lazy" decoding="async" src={event.banner || event.image} alt="" onError={() => setBannerFailed(true)} />
+            <img loading="lazy" decoding="async" src={bannerSource} alt="" onError={() => setFailedBannerSource(bannerSource)} />
           )}
         </div>
         <div className="preview-info">
@@ -431,6 +446,7 @@ function FutaPulseApp() {
   const [isLaunchAdActive, setIsLaunchAdActive] = useState(false)
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
+  const [sessionRestoreSlow, setSessionRestoreSlow] = useState(false)
   const [user, setUser] = useState(null)
   const [guestSignInRequested] = useState(() => initialSearchParams.has('auth'))
   const isGuestSharedView = (!session?.token || !user) && !guestSignInRequested
@@ -1071,16 +1087,18 @@ function FutaPulseApp() {
 
   useEffect(() => {
     const controller = new AbortController()
+    let slowTimer
     const restoreSession = async () => {
       if (!hasRememberedSession()) {
         setSessionLoading(false)
         return
       }
+      slowTimer = window.setTimeout(() => setSessionRestoreSlow(true), 4000)
       try {
         const response = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
           method: 'POST',
           credentials: 'include',
-          signal: controller.signal,
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
         })
         if (response.status === 401) {
           safeSetStored('futapulse-remember-me', 'false')
@@ -1102,14 +1120,22 @@ function FutaPulseApp() {
       } catch (error) {
         if (!controller.signal.aborted) {
           console.warn('Unable to restore the FUTApulse session.', error)
-          notify('We could not restore your session. Sign in again when the server is available.', 'error')
+          notify(error.name === 'TimeoutError'
+            ? 'Connecting to FUTApulse took too long. Check your internet connection or try again when the server is available.'
+            : error instanceof TypeError
+              ? 'FUTApulse could not reach the server. Check your internet connection, then sign in again.'
+              : 'We could not restore your session. Sign in again when the server is available.', 'error')
         }
       } finally {
+        window.clearTimeout(slowTimer)
         if (!controller.signal.aborted) setSessionLoading(false)
       }
     }
     restoreSession()
-    return () => controller.abort()
+    return () => {
+      controller.abort()
+      window.clearTimeout(slowTimer)
+    }
   }, [notify])
 
   useEffect(() => {
@@ -1171,7 +1197,7 @@ function FutaPulseApp() {
       setLoadError('')
       try {
         const response = await fetch(`${API_BASE_URL}/api/events`, {
-          signal: controller.signal,
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]),
           headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
           cache: 'no-cache',
         })
@@ -1187,7 +1213,11 @@ function FutaPulseApp() {
       } catch (error) {
         if (error.name !== 'AbortError') {
           console.error('Unable to load campus events.', error)
-          setLoadError('Campus events could not be loaded. Check your connection and try again.')
+          setLoadError(error.name === 'TimeoutError'
+            ? 'Loading campus events took too long. Check your internet connection and try again.'
+            : error instanceof TypeError
+              ? 'Your internet connection could not reach FUTApulse. Check your connection and try again.'
+              : error.message || 'The FUTApulse server could not load campus events. Please try again shortly.')
         }
       } finally {
         if (!controller.signal.aborted) setLoading(false)
@@ -1983,9 +2013,9 @@ function FutaPulseApp() {
       notify('An event recap can contain at most five photos.', 'error')
       return
     }
-    const invalidFile = files.find((file) => !['image/jpeg', 'image/webp'].includes(file.type) || file.size > 5 * 1024 * 1024)
+    const invalidFile = files.find((file) => !['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 5 * 1024 * 1024)
     if (invalidFile) {
-      notify('Choose JPEG or WebP photos no larger than 5 MB each.', 'error')
+      notify('Choose JPEG, PNG, or WebP photos no larger than 5 MB each.', 'error')
       return
     }
     setRecapUploading(true)
@@ -1997,7 +2027,7 @@ function FutaPulseApp() {
         credentials: 'include',
         headers: { Authorization: `Bearer ${session.token}` },
         body: formData,
-        signal: AbortSignal.timeout(90_000),
+        signal: AbortSignal.timeout(180_000),
       })
       const result = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(result.error || `Recap upload failed (${response.status}).`)
@@ -2008,7 +2038,11 @@ function FutaPulseApp() {
       setRecapPhotoFiles([])
       notify('Your event recap photos are live.', 'success')
     } catch (error) {
-      notify(error.message || 'Unable to upload recap photos.', 'error')
+      notify(error.name === 'TimeoutError' || error.name === 'AbortError'
+        ? 'The photo upload timed out. Check your internet connection and try again.'
+        : error instanceof TypeError
+          ? 'FUTApulse could not reach the photo upload service. Check your internet connection and try again.'
+          : error.message || 'Unable to upload recap photos.', 'error')
     } finally {
       setRecapUploading(false)
     }
@@ -2490,7 +2524,8 @@ function FutaPulseApp() {
       date: validStart ? startAt.toISOString() : '',
       startTime: validStart ? startAt.toISOString() : '',
       endTime: validEnd ? endAt.toISOString() : '',
-      banner: banner || eventData.banner || '',
+      banner: banner || eventData.banner || eventData.bannerImages?.[0] || '',
+      bannerImages: Array.isArray(eventData.bannerImages) ? eventData.bannerImages : [],
       audience: eventData.audience?.length ? eventData.audience : ['all'],
       venueLandmark: eventData.venueLandmark || '',
       turnoutCount: Number(eventData.turnoutCount) || 0,
@@ -2584,7 +2619,8 @@ function FutaPulseApp() {
         date: validStart ? startAt.toISOString() : '',
         startTime: validStart ? startAt.toISOString() : '',
         endTime: endAt && Number.isFinite(endAt.getTime()) ? endAt.toISOString() : '',
-        banner: banner || eventData.banner || '',
+        banner: banner || eventData.banner || eventData.bannerImages?.[0] || '',
+        bannerImages: Array.isArray(eventData.bannerImages) ? eventData.bannerImages : [],
         audience: eventData.audience?.length ? eventData.audience : ['all'],
         venueLandmark: eventData.venueLandmark || '',
         turnoutCount: Number(eventData.turnoutCount) || 0,
@@ -2682,7 +2718,11 @@ function FutaPulseApp() {
   }
 
   if (sessionLoading) {
-    return <div className={`app-root theme-${theme} session-restore-screen`} role="status" aria-live="polite"><BrandHeart size={36} /><span>Connecting to FUTApulse…</span></div>
+    return <div className={`app-root theme-${theme} session-restore-screen`} role="status" aria-live="polite">
+      <BrandHeart size={36} />
+      <span>{sessionRestoreSlow ? 'Still connecting to FUTApulse…' : 'Connecting to FUTApulse…'}</span>
+      {sessionRestoreSlow && <small>Checking the server and your internet connection. This screen will continue automatically.</small>}
+    </div>
   }
 
   if ((!session?.token || !user) && !isGuestSharedView) {
@@ -3270,7 +3310,7 @@ function FutaPulseApp() {
       <input
         ref={recapPhotoInput}
         type="file"
-        accept="image/jpeg,image/webp"
+        accept="image/jpeg,image/png,image/webp"
         multiple
         hidden
         onChange={(event) => { setRecapPhotoFiles(Array.from(event.target.files || [])); event.target.value = '' }}
@@ -3281,7 +3321,7 @@ function FutaPulseApp() {
           <section className="recap-upload-modal" role="dialog" aria-modal="true" aria-labelledby="recap-upload-title">
             <span className="explore-eyebrow">EVENT LOOK-BACK</span>
             <h2 id="recap-upload-title">Share the recap</h2>
-            <p>Choose up to {Math.max(0, 5 - (recapUploadTarget.recapPhotos?.length || 0))} more JPEG or WebP photos for <strong>{recapUploadTarget.title}</strong>. Photos are posted when you select “Post photos”.</p>
+            <p>Choose up to {Math.max(0, 5 - (recapUploadTarget.recapPhotos?.length || 0))} more JPEG, PNG, or WebP photos for <strong>{recapUploadTarget.title}</strong>. Photos are posted when you select “Post photos”.</p>
             {recapPhotoFiles.length > 0 ? (
               <ul className="recap-upload-file-list">
                 {recapPhotoFiles.map((file, index) => <li key={`${file.name}-${file.lastModified}-${index}`}>{file.name}<span>{(file.size / (1024 * 1024)).toFixed(1)} MB</span></li>)}
@@ -3629,7 +3669,7 @@ function FutaPulseApp() {
 }
 
 function emptyEvent() {
-  return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', audience: [], status: 'Draft', banner: '', turnoutCount: 0, turnoutBreakdown: [] }
+  return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', audience: [], status: 'Draft', banner: '', bannerImages: [], turnoutCount: 0, turnoutBreakdown: [] }
 }
 
 function CommunityGuidelines() {

@@ -113,13 +113,21 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
       ? organizerFacultyLogo
       : FACULTY_LOGO_FALLBACK
   const recapPhotos = Array.isArray(event.recapPhotos) ? event.recapPhotos : []
+  const bannerImages = Array.isArray(event.bannerImages)
+    ? event.bannerImages.filter((image) => typeof image === 'string' && image)
+    : []
   const eventEndTimestamp = Date.parse(event.endTime || '')
   const recapWindowOpen = recapPhotos.length > 0
     && Number.isFinite(eventEndTimestamp)
     && currentTime >= eventEndTimestamp
     && currentTime <= eventEndTimestamp + (30 * 60_000)
   const recapPhoto = recapWindowOpen ? recapPhotos[recapPhotoIndex % recapPhotos.length] : null
-  const bannerSource = (typeof recapPhoto === 'string' ? recapPhoto : recapPhoto?.url) || event.banner || event.image || ''
+  const bannerImage = bannerImages[recapPhotoIndex % Math.max(1, bannerImages.length)]
+  const bannerSource = (typeof recapPhoto === 'string' ? recapPhoto : recapPhoto?.url)
+    || bannerImage
+    || event.banner
+    || event.image
+    || ''
   const isCancelled = event.status === 'Cancelled'
   const isBannerUnavailable = !bannerSource || unavailableBannerSource === bannerSource
   const description = event.activity || event.description || 'Event details will be announced soon.'
@@ -201,12 +209,13 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
   }, [])
 
   useEffect(() => {
-    if (!recapWindowOpen || recapPhotos.length < 2 || !isVisible || !isPageVisible) return undefined
+    const rotatingImageCount = recapWindowOpen ? recapPhotos.length : bannerImages.length
+    if (rotatingImageCount < 2 || !isVisible || !isPageVisible) return undefined
     const timer = window.setInterval(() => {
-      setRecapPhotoIndex((index) => (index + 1) % recapPhotos.length)
+      setRecapPhotoIndex((index) => (index + 1) % rotatingImageCount)
     }, 5500)
     return () => window.clearInterval(timer)
-  }, [event.id, isPageVisible, isVisible, recapPhotos.length, recapWindowOpen])
+  }, [event.id, isPageVisible, isVisible, recapWindowOpen, bannerImages.length, recapPhotos.length])
 
   const shareEvent = async () => {
     setShareFeedback('')

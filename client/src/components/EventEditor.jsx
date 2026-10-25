@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CalendarDays, Clock3, Sparkles, X } from 'lucide-react'
 
-const MAX_LOCAL_DRAFT_CHARACTERS = 650_000
+const MAX_LOCAL_DRAFT_CHARACTERS = 3_500_000
+const MAX_EVENT_BANNERS = 5
 
 function readStored(key, fallback) {
   try {
@@ -23,7 +24,7 @@ function safeSetStored(key, value) {
 }
 
 function createEmptyEvent() {
-  return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', audience: [], status: 'Draft', banner: '', turnoutCount: 0, turnoutBreakdown: [] }
+  return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', audience: [], status: 'Draft', banner: '', bannerImages: [], turnoutCount: 0, turnoutBreakdown: [] }
 }
 
 function getEventId(event) {
@@ -241,6 +242,9 @@ function EventEditor({
       ...createEmptyEvent(),
       ...event,
       audience: Array.isArray(event.audience) ? event.audience : String(event.audience || '').split(',').filter(Boolean),
+      bannerImages: Array.isArray(event.bannerImages) && event.bannerImages.length
+        ? event.bannerImages
+        : event.banner ? [event.banner] : [],
       date: start.date,
       startClock: start.time,
       endDateTime: end.date,
@@ -252,7 +256,7 @@ function EventEditor({
       ? { ...initial, ...savedDraft, id: event.id || savedDraft.id || '' }
       : initial
   })
-  const [banner, setBanner] = useState('')
+  const [banner, setBanner] = useState(() => event.bannerImages?.[0] || event.banner || '')
   const formRef = useRef(form)
   const bannerRef = useRef(banner)
   useEffect(() => { formRef.current = form }, [form])
@@ -263,11 +267,17 @@ function EventEditor({
   const [draftSyncError, setDraftSyncError] = useState('')
   const hasEditedRef = useRef(Boolean(event.id || form.title || form.category || form.activity || form.date || form.venue || form.meetingUrl || form.banner))
   const onAutoSaveRef = useRef(onAutoSave)
-  const draftAutoSaveTimerRef = useRef(null)
+  const draftSyncQueueRef = useRef(Promise.resolve())
+  const draftSyncCountRef = useRef(0)
   useEffect(() => { onAutoSaveRef.current = onAutoSave }, [onAutoSave])
   const persistLocalDraft = useCallback((draftForm = formRef.current, draftBanner = bannerRef.current) => {
     if (publishedAtOpen || !hasEditedRef.current) return false
-    const snapshot = { ...draftForm, status: 'Draft', banner: draftBanner || draftForm.banner || '' }
+    const snapshot = {
+      ...draftForm,
+      status: 'Draft',
+      banner: draftBanner || draftForm.banner || '',
+      bannerImages: Array.isArray(draftForm.bannerImages) ? draftForm.bannerImages : (draftBanner ? [draftBanner] : []),
+    }
     const serialized = JSON.stringify(snapshot)
     if (serialized.length > MAX_LOCAL_DRAFT_CHARACTERS) {
       setDraftSaved(false)
@@ -286,10 +296,70 @@ function EventEditor({
     formRef.current = next
     setForm(next)
   }
-  const updateBanner = (value) => {
+  const updateBannerImages = (images) => {
+    const nextImages = images.slice(0, MAX_EVENT_BANNERS)
+    const primaryBanner = nextImages[0] || ''
     hasEditedRef.current = true
-    bannerRef.current = value
-    setBanner(value)
+    bannerRef.current = primaryBanner
+    setBanner(primaryBanner)
+    const next = { ...formRef.current, banner: primaryBanner, bannerImages: nextImages }
+    formRef.current = next
+    setForm(next)
+  }
+  const saveDraftOnBlur = (event) => {
+    if (event.relatedTarget?.type === 'submit') return
+    if (publishedAtOpen || !hasEditedRef.current) return
+    const currentForm = formRef.current
+    const currentBanner = bannerRef.current || currentForm.banner || ''
+    const snapshot = {
+      ...currentForm,
+      status: 'Draft',
+      banner: currentBanner,
+      bannerImages: Array.isArray(currentForm.bannerImages) ? currentForm.bannerImages : (currentBanner ? [currentBanner] : []),
+    }
+    persistLocalDraft(snapshot, currentBanner)
+    const startDateTime = snapshot.date && snapshot.startClock ? `${snapshot.date}T${snapshot.startClock}` : ''
+    const endDateTime = snapshot.endDateTime && snapshot.endClock ? `${snapshot.endDateTime}T${snapshot.endClock}` : ''
+    draftSyncCountRef.current += 1
+    setDraftSyncing(true)
+    const sync = draftSyncQueueRef.current
+      .catch(() => undefined)
+      .then(() => onAutoSaveRef.current({ ...snapshot, date: startDateTime, endDateTime }, currentBanner))
+    draftSyncQueueRef.current = sync
+    void sync.then((saved) => {
+      if (!saved?.id) return
+      const currentImages = formRef.current.bannerImages || []
+      const serverImages = Array.isArray(saved.bannerImages) ? saved.bannerImages : snapshot.bannerImages
+      const imagesUnchanged = currentImages.length === snapshot.bannerImages.length
+        && currentImages.every((image, index) => image === snapshot.bannerImages[index])
+      const syncedSnapshot = {
+        ...snapshot,
+        id: saved.id,
+        ...(imagesUnchanged ? { banner: serverImages[0] || '', bannerImages: serverImages } : {}),
+      }
+      safeSetStored(draftKey, JSON.stringify(syncedSnapshot))
+      formRef.current = {
+        ...formRef.current,
+        id: formRef.current.id || saved.id,
+        ...(imagesUnchanged ? { banner: serverImages[0] || '', bannerImages: serverImages } : {}),
+      }
+      if (imagesUnchanged) {
+        bannerRef.current = serverImages[0] || ''
+        setBanner(serverImages[0] || '')
+      }
+      setDraftSaved(true)
+      setForm((current) => ({
+        ...current,
+        id: current.id || saved.id,
+        ...(imagesUnchanged ? { banner: serverImages[0] || '', bannerImages: serverImages } : {}),
+      }))
+      setDraftSyncError('')
+    }).catch((saveError) => {
+      setDraftSyncError(saveError.message || 'Draft sync failed. It is saved on this device.')
+    }).finally(() => {
+      draftSyncCountRef.current = Math.max(0, draftSyncCountRef.current - 1)
+      if (!draftSyncCountRef.current) setDraftSyncing(false)
+    })
   }
   const createSavePayload = (status, allowSimilar = false) => {
     const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
@@ -299,7 +369,7 @@ function EventEditor({
 
   useEffect(() => {
     if (publishedAtOpen || saving) return undefined
-    const snapshot = { ...form, status: 'Draft', banner: banner || form.banner || '' }
+    const snapshot = { ...form, status: 'Draft', banner: banner || form.banner || '', bannerImages: form.bannerImages || [] }
     if (!hasEditedRef.current) return undefined
     const localSaved = () => {
       try {
@@ -319,28 +389,8 @@ function EventEditor({
       }
     }
     const localSaveTimer = window.setTimeout(localSaved, 250)
-    draftAutoSaveTimerRef.current = window.setTimeout(async () => {
-      localSaved()
-      setDraftSyncing(true)
-      try {
-        const startDateTime = snapshot.date && snapshot.startClock ? `${snapshot.date}T${snapshot.startClock}` : ''
-        const endDateTime = snapshot.endDateTime && snapshot.endClock ? `${snapshot.endDateTime}T${snapshot.endClock}` : ''
-        const saved = await onAutoSaveRef.current({ ...snapshot, date: startDateTime, endDateTime }, snapshot.banner)
-        if (saved?.id) {
-          const syncedSnapshot = { ...snapshot, id: saved.id }
-          safeSetStored(draftKey, JSON.stringify(syncedSnapshot))
-          setForm((current) => current.id ? current : { ...current, id: saved.id })
-        }
-        setDraftSyncError('')
-      } catch (saveError) {
-        setDraftSyncError(saveError.message || 'Draft sync failed. It is saved on this device.')
-      } finally {
-        setDraftSyncing(false)
-      }
-    }, 850)
     return () => {
       window.clearTimeout(localSaveTimer)
-      window.clearTimeout(draftAutoSaveTimerRef.current)
     }
   }, [draftKey, form, banner, publishedAtOpen, saving])
 
@@ -355,8 +405,8 @@ function EventEditor({
   }, [draftKey, publishedAtOpen, persistLocalDraft])
 
   const closeEditor = async () => {
-    window.clearTimeout(draftAutoSaveTimerRef.current)
     if (!publishedAtOpen && hasEditedRef.current) {
+      await draftSyncQueueRef.current.catch(() => undefined)
       const currentForm = formRef.current
       const currentBanner = bannerRef.current || currentForm.banner || ''
       persistLocalDraft(currentForm, currentBanner)
@@ -365,7 +415,14 @@ function EventEditor({
       try {
         const saved = await onAutoSaveRef.current({ ...currentForm, date: startDateTime, endDateTime, status: 'Draft' }, currentBanner)
         if (saved?.id) {
-          const syncedDraft = { ...currentForm, id: saved.id, status: 'Draft', banner: currentBanner }
+          const savedImages = Array.isArray(saved.bannerImages) ? saved.bannerImages : currentForm.bannerImages || []
+          const syncedDraft = {
+            ...currentForm,
+            id: saved.id,
+            status: 'Draft',
+            banner: savedImages[0] || currentBanner,
+            bannerImages: savedImages,
+          }
           formRef.current = syncedDraft
           setForm((current) => current.id ? current : { ...current, id: saved.id })
           safeSetStored(draftKey, JSON.stringify(syncedDraft))
@@ -418,7 +475,7 @@ function EventEditor({
         <button type="button" className="sheet-close" aria-label="Close event creation" onClick={() => { void closeEditor() }}><X size={18} /></button>
         <span className="eyebrow-label">EVENT STUDIO</span>
         <h2 id="event-editor-title">{form.id ? 'Edit campus event' : 'Create a campus event'}</h2>
-        <form className="profile-form" onSubmit={submit}>
+        <form className="profile-form" onSubmit={submit} onBlur={saveDraftOnBlur}>
           <label htmlFor="event-title">Event title</label><input id="event-title" value={form.title} onChange={(eventChange) => update('title', eventChange.target.value)} placeholder="Name your event" required />
           <label htmlFor="event-category">Category</label><select id="event-category" value={form.category} onChange={(eventChange) => update('category', eventChange.target.value)} required><option value="">Select category</option>{categories.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select>
           <label htmlFor="event-activity">Event activity</label><textarea id="event-activity" rows={3} value={form.activity} onChange={(eventChange) => update('activity', eventChange.target.value)} placeholder="What should students expect?" required />
@@ -430,33 +487,49 @@ function EventEditor({
           <label htmlFor="event-landmark">Landmark &amp; directions <span className="optional-field-label">Optional</span></label><textarea id="event-landmark" rows={2} value={form.venueLandmark} onChange={(eventChange) => update('venueLandmark', eventChange.target.value)} maxLength={240} placeholder="Add a nearby landmark or directions students can follow" />
           {form.category === 'seminars' && <><label htmlFor="event-meeting-url">Online seminar link (optional)</label><input id="event-meeting-url" type="url" inputMode="url" autoComplete="url" maxLength={2048} value={form.meetingUrl || ''} onChange={(eventChange) => update('meetingUrl', eventChange.target.value)} placeholder="https://meet.google.com/..." /><small className="profile-edit-limit">Students can open this link from the full event card.</small></>}
           <label htmlFor="event-banner">Event banner (optional)</label>
-          <input ref={bannerInput} id="event-banner" type="file" accept="image/*" hidden onChange={async (eventChange) => {
-            const file = eventChange.target.files?.[0]
+          <input ref={bannerInput} id="event-banner" type="file" accept="image/*" multiple hidden onChange={async (eventChange) => {
+            const files = Array.from(eventChange.target.files || [])
             eventChange.target.value = ''
-            if (!file) return
-            if (file.size > 3 * 1024 * 1024) { setError('Choose an event banner smaller than 3 MB.'); eventChange.target.value = ''; return }
+            if (!files.length) return
+            if ((formRef.current.bannerImages?.length || 0) + files.length > MAX_EVENT_BANNERS) {
+              setError(`Choose no more than ${MAX_EVENT_BANNERS} event banners.`)
+              return
+            }
+            if (files.some((file) => file.size > 3 * 1024 * 1024)) {
+              setError('Each event banner must be smaller than 3 MB.')
+              return
+            }
             try {
-              const dataUrl = compressBanner ? await compressBanner(file) : await new Promise((resolve, reject) => {
+              const dataUrls = await Promise.all(files.map((file) => compressBanner ? compressBanner(file) : new Promise((resolve, reject) => {
                 const reader = new FileReader()
                 reader.onload = () => resolve(reader.result)
                 reader.onerror = () => reject(new Error('Unable to read the event banner.'))
                 reader.readAsDataURL(file)
-              })
-              hasEditedRef.current = true
-              updateBanner(dataUrl)
+              })))
+              updateBannerImages([...(formRef.current.bannerImages || []), ...dataUrls])
+              setError('')
             } catch (readError) { setError(readError.message) }
           }} />
           <button
             type="button"
-            className={`event-banner-upload ${(banner || form.banner) ? 'has-banner' : ''}`}
-            aria-label={(banner || form.banner) ? 'Change event banner' : 'Upload image'}
+            className={`event-banner-upload ${(form.bannerImages?.length || banner || form.banner) ? 'has-banner' : ''}`}
+            aria-label={(form.bannerImages?.length || banner || form.banner) ? 'Add event banners' : 'Upload images'}
             onClick={() => bannerInput.current?.click()}
           >
-            {banner || form.banner
-              ? <><img src={banner || form.banner} alt="Selected event banner preview" /><span className="event-banner-action-label">Change event banner</span></>
-              : <><Sparkles size={24} /><strong>Event banner</strong><span>Optional · choose a JPG or PNG up to 3 MB</span><b>Upload image</b></>}
+            {form.bannerImages?.length || banner || form.banner
+              ? <><strong>Event banners ({form.bannerImages?.length || 1}/{MAX_EVENT_BANNERS})</strong><span className="event-banner-action-label">Add more images</span></>
+              : <><Sparkles size={24} /><strong>Event banners</strong><span>Optional · choose up to 5 images, each under 3 MB</span><b>Upload images</b></>}
           </button>
-          {(banner || form.banner) && <button type="button" className="event-banner-clear" onClick={() => { updateBanner(''); update('banner', '') }}>Clear banner</button>}
+          {(form.bannerImages || []).length > 0 && (
+            <div className="event-banner-image-list">
+              {form.bannerImages.map((image, index) => (
+                <div className="event-banner-image-item" key={`${index}-${image.slice(0, 32)}`}>
+                  <img src={image} alt={`Event banner ${index + 1}`} />
+                  <button type="button" className="event-banner-clear" aria-label={`Remove event banner ${index + 1}`} onClick={() => updateBannerImages(formRef.current.bannerImages.filter((_, imageIndex) => imageIndex !== index))}>Remove</button>
+                </div>
+              ))}
+            </div>
+          )}
           <fieldset className="audience-levels"><legend>Target audience levels</legend>{[['all', 'All levels'], ['100', '100'], ['200', '200'], ['300', '300'], ['400', '400'], ['500', '500']].map(([value, label]) => <label key={value}><input type="checkbox" checked={form.audience.includes(value)} onChange={(eventChange) => update('audience', eventChange.target.checked ? [...form.audience.filter((level) => level !== 'all' && value !== 'all'), value] : form.audience.filter((level) => level !== value))} /> {label}</label>)}</fieldset>
           {draftSaved && !publishedAtOpen && <p className="event-draft-status" role="status">{draftSyncing ? 'Saving draft…' : draftSyncError ? 'Draft saved on this device; server sync will retry.' : 'Draft saved automatically.'}</p>}
           {draftSyncError && <p className="form-error" role="status">{draftSyncError}</p>}
