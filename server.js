@@ -1129,6 +1129,32 @@ function sendSession(response, user, remember = false) {
   return session;
 }
 
+async function advanceUserSessionVersion(user) {
+  const userId = String(user._id || user.id);
+  if (isMongoConnected()) {
+    const updatedUser = await User.findByIdAndUpdate(userId, { $inc: { sessionVersion: 1 } }, { new: true }).exec();
+    if (!updatedUser) throw new Error("The account could not be found while starting a new session.");
+    user.sessionVersion = updatedUser.sessionVersion;
+  } else {
+    const database = readDatabase();
+    const storedUser = database.users.find((item) => String(item.id) === userId);
+    if (!storedUser) throw new Error("The account could not be found while starting a new session.");
+    storedUser.sessionVersion = (Number(storedUser.sessionVersion) || 0) + 1;
+    user.sessionVersion = storedUser.sessionVersion;
+    writeDatabase(database);
+  }
+
+  if (realtimeServer) {
+    const sessions = await realtimeServer.in(`user:${userId}`).fetchSockets();
+    for (const socket of sessions) {
+      if (socket.data.sessionVersion !== user.sessionVersion) {
+        socket.emit("session-revoked", { reason: "signed-in-elsewhere" });
+        socket.disconnect(true);
+      }
+    }
+  }
+}
+
 function clearRefreshCookie(response) {
   response.clearCookie(REFRESH_COOKIE, {
     httpOnly: true,
@@ -1667,9 +1693,11 @@ app.get("/api/notifications/status", async (request, response) => {
 });
 
 app.post("/api/notifications/devices/web", async (request, response) => {
+  let authenticatedUserId = "";
   try {
     const user = await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Authentication required." });
+    authenticatedUserId = String(user._id || user.id);
     const subscription = request.body?.subscription;
     const endpoint = typeof subscription?.endpoint === "string" ? subscription.endpoint : "";
     let endpointUrl;
@@ -1686,13 +1714,35 @@ app.post("/api/notifications/devices/web", async (request, response) => {
     }
     const deviceKey = crypto.createHash("sha256").update(endpoint).digest("hex");
     await PushDevice.findOneAndUpdate(
-      { deviceKey, userId: String(user._id || user.id) },
+      { deviceKey },
       { $set: { platform: "web", endpoint, subscription, enabled: true } },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     ).exec();
     return response.status(201).json({ registered: true });
   } catch (error) {
-    if (error.code === 11000) return response.status(409).json({ error: "That push subscription is already linked to another account." });
+    if (error.code === 11000) {
+      const subscription = request.body?.subscription;
+      const endpoint = typeof subscription?.endpoint === "string" ? subscription.endpoint : "";
+      const deviceKey = endpoint ? crypto.createHash("sha256").update(endpoint).digest("hex") : "";
+      if (deviceKey && authenticatedUserId) {
+        try {
+          const reassigned = await PushDevice.updateOne({ deviceKey }, {
+            $set: {
+              userId: authenticatedUserId,
+              platform: "web",
+              endpoint,
+              subscription,
+              enabled: true
+            }
+          }).exec();
+          if (reassigned.matchedCount > 0) return response.status(201).json({ registered: true });
+        } catch (reassignmentError) {
+          console.error("Concurrent Web Push device reassignment failed.", reassignmentError);
+          return response.status(500).json({ error: "Unable to connect this browser to the signed-in account." });
+        }
+      }
+      return response.status(409).json({ error: "This browser subscription could not be connected to the signed-in account. Please try again." });
+    }
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
     console.error("Web push subscription registration failed.", error);
     return response.status(500).json({ error: "Unable to register this browser for notifications." });
@@ -2286,6 +2336,7 @@ app.post("/api/auth/login", async (request, response) => {
     if (!user.passwordHash || !(await bcrypt.compare(password, user.passwordHash))) {
       return response.status(401).json({ error: "Incorrect password. Check your password and try again." });
     }
+    await advanceUserSessionVersion(user);
     return response.json(sendSession(response, user, remember));
   } catch (error) {
     console.error("Login failed.", error);
@@ -2462,6 +2513,7 @@ app.post("/api/auth/google", async (request, response) => {
       }, JWT_SECRET, { expiresIn: "10m" });
       return response.status(200).json({ passwordRequired: true, passwordSetupToken, email });
     }
+    await advanceUserSessionVersion(user);
     return response.json(sendSession(response, user, body.remember === true));
   } catch (error) {
     if (error.code === 11000) {
@@ -3765,6 +3817,7 @@ async function startServer() {
           : readDatabase().users.find((storedUser) => storedUser.id === claims.sub) || null;
         if (!user || (claims.sessionVersion || 0) !== (user.sessionVersion || 0)) return next(new Error("Session is no longer valid."));
         socket.data.userId = String(user._id || user.id);
+        socket.data.sessionVersion = Number(user.sessionVersion) || 0;
         return next();
       } catch (error) {
         return next(new Error(error instanceof jwt.JsonWebTokenError ? "Session is no longer valid." : "Unable to authenticate the live connection."));

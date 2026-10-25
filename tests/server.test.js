@@ -841,6 +841,42 @@ test("login distinguishes an unknown username from an incorrect password", async
   assert.match((await wrongPassword.json()).error, /Incorrect password/);
 });
 
+test("signing in on another device invalidates the previous account session", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const initialSession = await createVerifiedAccount(baseUrl, "single-session@futa.edu.ng", "single_session");
+
+  const firstLogin = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "single_session", password: "CorrectPassword1" })
+  });
+  assert.equal(firstLogin.status, 200);
+  const firstToken = (await firstLogin.json()).token;
+
+  const initialSessionCheck = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Authorization: `Bearer ${initialSession.token}` }
+  });
+  assert.equal(initialSessionCheck.status, 401);
+
+  const secondLogin = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "single_session", password: "CorrectPassword1" })
+  });
+  assert.equal(secondLogin.status, 200);
+  const secondToken = (await secondLogin.json()).token;
+
+  const firstSessionCheck = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Authorization: `Bearer ${firstToken}` }
+  });
+  assert.equal(firstSessionCheck.status, 401);
+
+  const currentSessionCheck = await fetch(`${baseUrl}/api/auth/session`, {
+    headers: { Authorization: `Bearer ${secondToken}` }
+  });
+  assert.equal(currentSessionCheck.status, 200);
+});
+
 test("signup accepts accented usernames and preserves their exact profile spelling", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const account = await createVerifiedAccount(baseUrl, "unicode-name@futa.edu.ng", "Månûël");

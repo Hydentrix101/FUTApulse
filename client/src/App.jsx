@@ -71,6 +71,24 @@ function decodeVapidKey(value) {
   return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
 }
 
+async function getCurrentPushSubscription(registration, publicKey) {
+  const applicationServerKey = decodeVapidKey(publicKey)
+  let subscription = await registration.pushManager.getSubscription()
+  const currentKey = subscription?.options?.applicationServerKey
+  const currentKeyBytes = currentKey ? new Uint8Array(currentKey) : null
+  const keyMatches = currentKeyBytes
+    && applicationServerKey.length === currentKeyBytes.length
+    && applicationServerKey.every((byte, index) => byte === currentKeyBytes[index])
+  if (subscription && !keyMatches) {
+    await subscription.unsubscribe()
+    subscription = null
+  }
+  return subscription || registration.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey,
+  })
+}
+
 function requestBrowserNotificationPermission() {
   if (!('Notification' in window)) return Promise.resolve({ permission: 'unsupported' })
   if (Notification.permission !== 'default') return Promise.resolve({ permission: Notification.permission })
@@ -645,6 +663,27 @@ function FutaPulseApp() {
   const feedExpiryEventsRef = useRef(events)
   useEffect(() => { feedExpiryEventsRef.current = events }, [events])
 
+  const logout = useCallback((message = 'You have been logged out.', clearServerCookie = true) => {
+    if (clearServerCookie) {
+      fetch(`${API_BASE_URL}/api/auth/logout`, { method: 'POST', credentials: 'include' })
+        .catch((error) => console.error('Unable to clear the server session cookie.', error))
+    }
+    localStorage.removeItem('futapulse-auth-session')
+    localStorage.removeItem('futapulse-auth-user')
+    localStorage.removeItem('futapulse-remember-me')
+    localStorage.removeItem('futapulse-remembered-username')
+    localStorage.removeItem('futapulse-profile')
+    sessionStorage.removeItem('futapulse-auth-session')
+    setSession(null)
+    setUser(null)
+    setProfile(null)
+    setCategoryPreferencesDraft(null)
+    setCategoryPreferencesOpen(false)
+    setProfileMenuOpen(false)
+    setProfileOpen(false)
+    notify(typeof message === 'string' ? message : 'You have been logged out.')
+  }, [notify, setProfileMenuOpen])
+
   useEffect(() => {
     const updateVisibility = () => setDocumentVisible(!document.hidden)
     document.addEventListener('visibilitychange', updateVisibility)
@@ -666,6 +705,9 @@ function FutaPulseApp() {
     document.addEventListener('visibilitychange', updateNotificationVisibility)
     updateNotificationVisibility()
     socket.on('home-notification', receiveNotification)
+    socket.on('session-revoked', () => {
+      logout('This account was signed in on another device. Sign in again to continue.', false)
+    })
     socket.on('connect_error', (error) => {
       if (error.message !== 'Authentication required.' && error.message !== 'Session is no longer valid.') {
         console.warn('Live notification connection is temporarily unavailable.', error.message)
@@ -688,7 +730,7 @@ function FutaPulseApp() {
       socket.disconnect()
       navigator.serviceWorker?.removeEventListener('message', handleServiceWorkerMessage)
     }
-  }, [receiveNotification, session?.token, user?.id])
+  }, [logout, receiveNotification, session?.token, user?.id])
 
   useEffect(() => () => {
     window.clearTimeout(notificationHighlightTimer.current)
@@ -789,25 +831,6 @@ function FutaPulseApp() {
     setSessionLoading(false)
   }, [])
 
-  const logout = useCallback(() => {
-    fetch(`${API_BASE_URL}/api/auth/logout`, { method: 'POST', credentials: 'include' })
-      .catch((error) => console.error('Unable to clear the server session cookie.', error))
-    localStorage.removeItem('futapulse-auth-session')
-    localStorage.removeItem('futapulse-auth-user')
-    localStorage.removeItem('futapulse-remember-me')
-    localStorage.removeItem('futapulse-remembered-username')
-    localStorage.removeItem('futapulse-profile')
-    sessionStorage.removeItem('futapulse-auth-session')
-    setSession(null)
-    setUser(null)
-    setProfile(null)
-    setCategoryPreferencesDraft(null)
-    setCategoryPreferencesOpen(false)
-    setProfileMenuOpen(false)
-    setProfileOpen(false)
-    notify('You have been logged out.')
-  }, [notify, setProfileMenuOpen])
-
   useEffect(() => {
     let active = true
     apiRequest('/api/notifications/config')
@@ -843,6 +866,36 @@ function FutaPulseApp() {
   }, [settingsPage, session?.token, notificationStatusRefresh])
 
   useEffect(() => {
+    if (
+      !session?.token
+      || !user?.id
+      || !('Notification' in window)
+      || !('serviceWorker' in navigator)
+      || Notification.permission !== 'granted'
+    ) return undefined
+    let active = true
+    const reconnectDeviceSubscription = async () => {
+      try {
+        const config = await apiRequest('/api/notifications/config')
+        if (!config.webPushConfigured || !config.webPushPublicKey) return
+        const registration = await navigator.serviceWorker.ready
+        const subscription = await registration.pushManager.getSubscription()
+        if (!subscription) return
+        const currentSubscription = await getCurrentPushSubscription(registration, config.webPushPublicKey)
+        await apiRequest('/api/notifications/devices/web', {
+          method: 'POST',
+          body: JSON.stringify({ subscription: currentSubscription }),
+        }, session.token)
+        if (active) setNotificationStatusRefresh((current) => current + 1)
+      } catch (error) {
+        if (active) console.warn('This device’s push subscription could not be linked to the active account.', error)
+      }
+    }
+    void reconnectDeviceSubscription()
+    return () => { active = false }
+  }, [session?.token, user?.id])
+
+  useEffect(() => {
     const profileReady = profile?.notificationPreferencesOnboardingComplete === true
     if (
       !launchSequenceReady
@@ -868,7 +921,7 @@ function FutaPulseApp() {
         setNotificationDeliveryError('')
         setNotificationDeliveryStatus(status)
         setNotificationDeliveryPermission(permission)
-        if (permission !== 'granted' || !status.deviceRegistered) {
+        if (permission !== 'granted') {
           setAutoNotificationPromptVisible(true)
           setSettingsPage('notifications')
           setProfileMenuOpen(true)
@@ -1843,25 +1896,7 @@ function FutaPulseApp() {
         throw new Error('Web Push is not configured on the FUTApulse server yet.')
       }
       const registration = await navigator.serviceWorker.ready
-      let subscription = await registration.pushManager.getSubscription()
-      const applicationServerKey = decodeVapidKey(config.webPushPublicKey)
-      const currentApplicationServerKey = subscription?.options?.applicationServerKey
-      const currentApplicationServerKeyBytes = currentApplicationServerKey
-        ? new Uint8Array(currentApplicationServerKey)
-        : null
-      const hasMatchingApplicationServerKey = currentApplicationServerKey
-        && applicationServerKey.length === currentApplicationServerKeyBytes.length
-        && applicationServerKey.every((byte, index) => byte === currentApplicationServerKeyBytes[index])
-      if (subscription && !hasMatchingApplicationServerKey) {
-        await subscription.unsubscribe()
-        subscription = null
-      }
-      if (!subscription) {
-        subscription = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey,
-        })
-      }
+      const subscription = await getCurrentPushSubscription(registration, config.webPushPublicKey)
       await apiRequest('/api/notifications/devices/web', {
         method: 'POST',
         body: JSON.stringify({ subscription }),
@@ -3601,7 +3636,7 @@ function LegalPage({ page }) {
             <h2>Google sign-in</h2>
             <p>If you choose Google sign-in, FUTApulse uses Google OAuth to verify your identity and receive basic account information such as your email address and profile name. The sign-in flow requests the OpenID, email, and profile scopes. FUTApulse does not request access to read your Gmail inbox.</p>
             <h2>Notifications and device data</h2>
-            <p>If you enable browser or Android push notifications, the relevant push service provides a device token or subscription endpoint so FUTApulse can deliver event alerts and reminders. You can disable notifications through your device or browser settings; removing your FUTApulse account also removes its registered push devices and pending notifications.</p>
+            <p>If you enable browser or Android push notifications, the relevant push service provides a device token or subscription endpoint so FUTApulse can deliver event alerts and reminders. Browser notification permission belongs to your device; its active FUTApulse push subscription is linked to the account currently signed in on that browser and moves to another account when you switch accounts there. You can disable notifications through your device or browser settings; removing your FUTApulse account also removes its registered push devices and pending notifications.</p>
             <h2>Advertising and cookies</h2>
             <p>FUTApulse does not currently load Google AdSense or serve Google ads. Promotional cards shown in the app are FUTApulse house content. If third-party advertising is introduced, this policy and the app's consent flow will be updated before it is enabled. Google and other ad vendors may use cookies to serve ads based on visits to this site or other websites. Users can opt out of personalized advertising in <a href="https://www.google.com/settings/ads" target="_blank" rel="noopener noreferrer">Google Ads Settings</a> or visit <a href="https://www.aboutads.info/choices/" target="_blank" rel="noopener noreferrer">aboutads.info choices</a> to opt out of some third-party vendors' personalized advertising cookies.</p>
             <p>Before serving Google ads to users in the European Economic Area, the United Kingdom, or Switzerland, the publisher must configure an applicable Google-certified consent management platform and disclose its selected ad technology providers in the publisher account.</p>
