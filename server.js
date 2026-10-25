@@ -1730,8 +1730,24 @@ app.get("/api/notifications/status", async (request, response) => {
     const userId = String(user._id || user.id);
     const vapidConfiguration = getVapidConfiguration();
     const pushConfigured = vapidConfiguration.valid;
-    const deviceRegistered = isMongoConnected()
-      ? Boolean(await PushDevice.exists({ userId, platform: requestedPlatform, enabled: true }))
+    const requestedDeviceKey = String(request.query.deviceKey || "");
+    if (requestedDeviceKey && !/^[a-f0-9]{64}$/.test(requestedDeviceKey)) {
+      return response.status(400).json({ error: "Device key must be a SHA-256 hex digest." });
+    }
+    const deviceRegistered = requestedDeviceKey
+      ? isMongoConnected()
+        ? Boolean(await PushDevice.exists({
+          userId,
+          deviceKey: requestedDeviceKey,
+          platform: requestedPlatform,
+          enabled: true
+        }))
+        : (readDatabase().pushDevices || []).some((device) =>
+          String(device.userId) === userId
+          && device.deviceKey === requestedDeviceKey
+          && device.platform === requestedPlatform
+          && device.enabled === true
+        )
       : false;
     return response.json({
       durableSchedulingAvailable: isMongoConnected(),
@@ -1770,11 +1786,31 @@ app.post("/api/notifications/devices/web", async (request, response) => {
       return response.status(503).json({ error: `Web Push is not configured correctly: ${vapidConfiguration.error}` });
     }
     const deviceKey = crypto.createHash("sha256").update(endpoint).digest("hex");
-    await PushDevice.findOneAndUpdate(
-      { deviceKey },
-      { $set: { platform: "web", endpoint, subscription, enabled: true } },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    ).exec();
+    if (isMongoConnected()) {
+      await PushDevice.findOneAndUpdate(
+        { deviceKey },
+        { $set: {
+          userId: authenticatedUserId,
+          platform: "web",
+          endpoint,
+          subscription,
+          enabled: true
+        } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      ).exec();
+    } else {
+      const database = readDatabase();
+      database.pushDevices = (database.pushDevices || []).filter((device) => device.deviceKey !== deviceKey);
+      database.pushDevices.push({
+        userId: authenticatedUserId,
+        deviceKey,
+        platform: "web",
+        endpoint,
+        subscription,
+        enabled: true
+      });
+      writeDatabase(database);
+    }
     return response.status(201).json({ registered: true });
   } catch (error) {
     if (error.code === 11000) {

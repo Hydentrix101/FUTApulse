@@ -172,6 +172,51 @@ test("notification delivery status requires authentication and distinguishes ser
   assert.equal(status.deviceRegistered, false);
 });
 
+test("push registration reassigns one browser device to the currently signed-in account", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const originalPublicKey = process.env.WEB_PUSH_PUBLIC_KEY;
+  const originalPrivateKey = process.env.WEB_PUSH_PRIVATE_KEY;
+  const vapidKeys = webPush.generateVAPIDKeys();
+  process.env.WEB_PUSH_PUBLIC_KEY = vapidKeys.publicKey;
+  process.env.WEB_PUSH_PRIVATE_KEY = vapidKeys.privateKey;
+
+  try {
+    const firstAccount = await createVerifiedAccount(baseUrl, "push-device-first@futa.edu.ng", "push_device_first");
+    const secondAccount = await createVerifiedAccount(baseUrl, "push-device-second@futa.edu.ng", "push_device_second");
+    const endpoint = "https://push.example.test/device-subscription-123";
+    const deviceKey = require("node:crypto").createHash("sha256").update(endpoint).digest("hex");
+    const subscription = {
+      endpoint,
+      keys: { p256dh: "valid-p256dh-test-key", auth: "valid-auth-test-key" }
+    };
+    const register = (account) => fetch(`${baseUrl}/api/notifications/devices/web`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${account.token}` },
+      body: JSON.stringify({ subscription })
+    });
+    const status = (account) => fetch(`${baseUrl}/api/notifications/status?platform=web&deviceKey=${deviceKey}`, {
+      headers: { Authorization: `Bearer ${account.token}` }
+    }).then((response) => response.json());
+
+    assert.equal((await register(firstAccount)).status, 201);
+    assert.equal((await status(firstAccount)).deviceRegistered, true);
+    assert.equal((await status(secondAccount)).deviceRegistered, false);
+
+    assert.equal((await register(secondAccount)).status, 201);
+    assert.equal((await status(firstAccount)).deviceRegistered, false);
+    assert.equal((await status(secondAccount)).deviceRegistered, true);
+
+    const storedDevices = JSON.parse(fs.readFileSync(dataFile, "utf8")).pushDevices;
+    assert.equal(storedDevices.filter((device) => device.deviceKey === deviceKey).length, 1);
+    assert.equal(storedDevices.find((device) => device.deviceKey === deviceKey).userId, secondAccount.user.id);
+  } finally {
+    if (originalPublicKey === undefined) delete process.env.WEB_PUSH_PUBLIC_KEY;
+    else process.env.WEB_PUSH_PUBLIC_KEY = originalPublicKey;
+    if (originalPrivateKey === undefined) delete process.env.WEB_PUSH_PRIVATE_KEY;
+    else process.env.WEB_PUSH_PRIVATE_KEY = originalPrivateKey;
+  }
+});
+
 test("background notification worker trigger is POST-only and requires its configured secret", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const originalSecret = process.env.CRON_SECRET_KEY;

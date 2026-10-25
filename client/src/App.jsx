@@ -89,6 +89,15 @@ async function getCurrentPushSubscription(registration, publicKey) {
   })
 }
 
+async function getPushDeviceKey() {
+  if (!('serviceWorker' in navigator) || !window.crypto?.subtle) return ''
+  const registration = await navigator.serviceWorker.ready
+  const subscription = await registration.pushManager.getSubscription()
+  if (!subscription?.endpoint) return ''
+  const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(subscription.endpoint))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 function requestBrowserNotificationPermission() {
   if (!('Notification' in window)) return Promise.resolve({ permission: 'unsupported' })
   if (Notification.permission !== 'default') return Promise.resolve({ permission: Notification.permission })
@@ -849,19 +858,26 @@ function FutaPulseApp() {
   useEffect(() => {
     if (settingsPage !== 'notifications' || !session?.token) return undefined
     let active = true
-    Promise.all([
-      apiRequest('/api/notifications/status?platform=web', {}, session.token),
-      Promise.resolve('Notification' in window ? Notification.permission : 'unsupported'),
-    ]).then(([status, permission]) => {
-      if (!active) return
-      setNotificationDeliveryError('')
-      setNotificationDeliveryStatus(status)
-      setNotificationDeliveryPermission(permission)
-    }).catch((error) => {
-      if (!active) return
-      setNotificationDeliveryError(error.message || 'Unable to check this device’s notification readiness.')
-      setNotificationDeliveryStatus(null)
-    })
+    const loadStatus = async () => {
+      try {
+        const deviceKey = await getPushDeviceKey()
+        const query = new URLSearchParams({ platform: 'web' })
+        if (deviceKey) query.set('deviceKey', deviceKey)
+        const [status, permission] = await Promise.all([
+          apiRequest(`/api/notifications/status?${query}`, {}, session.token),
+          Promise.resolve('Notification' in window ? Notification.permission : 'unsupported'),
+        ])
+        if (!active) return
+        setNotificationDeliveryError('')
+        setNotificationDeliveryStatus(status)
+        setNotificationDeliveryPermission(permission)
+      } catch (error) {
+        if (!active) return
+        setNotificationDeliveryError(error.message || 'Unable to check this device’s notification readiness.')
+        setNotificationDeliveryStatus(null)
+      }
+    }
+    void loadStatus()
     return () => { active = false }
   }, [settingsPage, session?.token, notificationStatusRefresh])
 
@@ -914,7 +930,12 @@ function FutaPulseApp() {
 
     let active = true
     const permission = 'Notification' in window ? Notification.permission : 'unsupported'
-    apiRequest('/api/notifications/status?platform=web', {}, session.token)
+    getPushDeviceKey()
+      .then((deviceKey) => {
+        const query = new URLSearchParams({ platform: 'web' })
+        if (deviceKey) query.set('deviceKey', deviceKey)
+        return apiRequest(`/api/notifications/status?${query}`, {}, session.token)
+      })
       .then((status) => {
         if (!active) return
         notificationPromptAttemptedForUserRef.current = accountKey
@@ -1903,7 +1924,7 @@ function FutaPulseApp() {
       }, session.token)
       setNotificationDeliveryPermission('granted')
       setNotificationStatusRefresh((current) => current + 1)
-      notify('Push notifications are enabled in this browser.', 'success')
+      notify('Push notifications are enabled and this device is connected to your account.', 'success')
     } catch (error) {
       notify(error.message || 'Unable to enable notifications on this device.', 'error')
     }
@@ -2421,7 +2442,10 @@ function FutaPulseApp() {
     const reminder = { label, notifyAt: new Date(notifyAt).toISOString() }
     let backgroundDeliveryAvailable
     try {
-      const deliveryStatus = await apiRequest('/api/notifications/status?platform=web', {}, session?.token)
+      const deviceKey = await getPushDeviceKey()
+      const query = new URLSearchParams({ platform: 'web' })
+      if (deviceKey) query.set('deviceKey', deviceKey)
+      const deliveryStatus = await apiRequest(`/api/notifications/status?${query}`, {}, session?.token)
       const permission = 'Notification' in window ? Notification.permission : 'unsupported'
       if (deliveryStatus.durableSchedulingAvailable) {
         await apiRequest(`/api/events/${encodeURIComponent(String(reminderTarget))}/reminders/schedule`, {
