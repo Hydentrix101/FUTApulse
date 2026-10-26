@@ -2300,13 +2300,14 @@ function FutaPulseApp() {
     }
     return publishedEvents
       .filter((event) => {
+        if (!matchesProfileAudience(event, profile)) return false
         const { title, organizer } = getFields(event)
         return keywords.every((word) => title.includes(word) || organizer.includes(word))
       })
       .sort((first, second) => getMatchPriority(first) - getMatchPriority(second)
         || Number(Boolean(second.isHot)) - Number(Boolean(first.isHot))
         || Number(second.hotRsvpPercentage || 0) - Number(first.hotRsvpPercentage || 0))
-  }, [publishedEvents, deferredSearch])
+  }, [publishedEvents, deferredSearch, profile])
 
   const remindedEvents = useMemo(() => publishedEvents.filter((event) => {
     const id = String(getEventId(event))

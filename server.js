@@ -301,12 +301,13 @@ function isPublicRecapVisible(event, now = Date.now()) {
 
 function eventAudienceMatchesLevel(event, level) {
   if (isPublicRecapVisible(event) || !level) return true;
+  const normalizeAudienceLevel = (value) => String(value).trim().toLowerCase().replace(/^(\d+)\s*l$/, "$1");
   const rawAudience = Array.isArray(event?.audience)
     ? event.audience
     : String(event?.audience || "").split(",");
-  const audience = rawAudience.map((item) => String(item).trim().replace(/L$/i, ""));
-  if (audience.length === 0 || audience.includes("") || audience.includes("all")) return true;
-  return audience.includes(String(level).trim().replace(/L$/i, ""));
+  const audience = rawAudience.map(normalizeAudienceLevel);
+  if (audience.length === 0 || audience.includes("") || audience.some((item) => ["all", "all levels", "all students", "everyone"].includes(item))) return true;
+  return audience.includes(normalizeAudienceLevel(level));
 }
 
 function toPublicEvent(event, viewerId = "") {
