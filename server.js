@@ -686,10 +686,10 @@ function getMissingCloudinaryVariables() {
 }
 
 function classifyCloudinaryError(error) {
-  const status = Number(error?.http_code || error?.statusCode);
+  const status = Number(error?.http_code || error?.statusCode || error?.status);
   const message = String(error?.message || error?.error?.message || "").toLowerCase();
   if (error?.code === "ETIMEDOUT" || error?.code === "ECONNRESET" || error?.code === "ENOTFOUND") return "network_error";
-  if (status === 401 || /invalid signature|invalid api key|authentication failed/.test(message)) return "invalid_credentials";
+  if (status === 401 || /invalid[_\s-]+(?:api[_\s-]+)?key|invalid[_\s-]+signature|authentication failed/.test(message)) return "invalid_credentials";
   if (status === 403) return "access_denied";
   if (status === 404 || /cloud name.*(invalid|not found)|unknown cloud/.test(message)) return "invalid_cloud_name";
   if (status >= 500) return "provider_unavailable";
@@ -799,7 +799,10 @@ async function externalizeEventBanners(event) {
       try {
         await cloudinary.uploader.destroy(result.value.publicId, { resource_type: "image" });
       } catch (cleanupError) {
-        console.error("Unable to remove an unreferenced event banner after upload failure.", cleanupError);
+        console.error("Unable to remove an unreferenced event banner after upload failure.", {
+          category: classifyCloudinaryError(cleanupError),
+          status: Number(cleanupError?.http_code || cleanupError?.statusCode || cleanupError?.status) || null
+        });
       }
     }));
     const error = failedUpload.reason;
@@ -3661,11 +3664,13 @@ app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
       try {
         await cloudinary.uploader.destroy(asset.public_id, { resource_type: "image" });
       } catch (cleanupError) {
-        console.error("Unable to remove an unreferenced recap image after upload failure.", cleanupError);
+        console.error("Unable to remove an unreferenced recap image after upload failure.", {
+          category: classifyCloudinaryError(cleanupError),
+          status: Number(cleanupError?.http_code || cleanupError?.statusCode || cleanupError?.status) || null
+        });
       }
     }));
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
-    console.error("Event recap photo upload failed.", error);
     const category = classifyCloudinaryError(error);
     console.error("Event recap photo upload failed.", {
       category,

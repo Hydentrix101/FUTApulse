@@ -180,7 +180,7 @@ function storeEventCache(events) {
 async function compressEventBanner(file) {
   const sourceUrl = URL.createObjectURL(file)
   try {
-    const image = new Image()
+    const image = new window.Image()
     await new Promise((resolve, reject) => {
       image.onload = resolve
       image.onerror = () => reject(new Error('Unable to open that event banner.'))
