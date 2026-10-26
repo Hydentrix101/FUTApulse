@@ -467,6 +467,8 @@ function FutaPulseApp() {
   const lastTrackedTabRef = useRef(activeTab)
   const backGuardIdRef = useRef('')
   const [events, setEvents] = useState([])
+  const eventFeedRequestVersionRef = useRef(0)
+  const eventFeedAppliedVersionRef = useRef(0)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [theme, setTheme] = useState(() => readStoredValue('futapulse-theme') || readStoredValue('futapulse-client-theme') || 'light')
@@ -684,7 +686,7 @@ function FutaPulseApp() {
     Object.values(autoScrollResumeTimersRef.current).forEach((timer) => window.clearTimeout(timer))
   }, [])
 
-  const eventExpiryScheduleKey = events.map((event) => `${getEventId(event)}:${event.endTime || ''}`).join('|')
+  const eventExpiryScheduleKey = events.map((event) => `${getEventId(event)}:${event.endTime || ''}:${event.recapPublishedAt || ''}`).join('|')
   const feedExpiryEventsRef = useRef(events)
   useEffect(() => { feedExpiryEventsRef.current = events }, [events])
 
@@ -1190,6 +1192,7 @@ function FutaPulseApp() {
   useEffect(() => {
     const controller = new AbortController()
     const loadEvents = async () => {
+      const requestVersion = ++eventFeedRequestVersionRef.current
       setLoading(true)
       setLoadError('')
       try {
@@ -1201,14 +1204,15 @@ function FutaPulseApp() {
         if (!response.ok) throw new Error(`Could not load events (${response.status}).`)
         const data = await response.json()
         if (!Array.isArray(data.events)) throw new Error('The events endpoint returned an invalid response.')
+        if (requestVersion < eventFeedAppliedVersionRef.current) return
+        eventFeedAppliedVersionRef.current = requestVersion
         const serverEvents = data.events
         startTransition(() => setEvents(serverEvents))
         const serverGoingIds = serverEvents.filter((event) => event.isGoing).map((event) => String(getEventId(event)))
         setGoingIds((current) => current.join('|') === serverGoingIds.join('|') ? current : serverGoingIds)
         setReminderIds(serverEvents.filter((event) => event.isReminded).map((event) => String(getEventId(event))))
-        storeEventCache(serverEvents)
       } catch (error) {
-        if (error.name !== 'AbortError') {
+        if (error.name !== 'AbortError' && requestVersion >= eventFeedAppliedVersionRef.current) {
           console.error('Unable to load campus events.', error)
           setLoadError(error.name === 'TimeoutError'
             ? 'Loading campus events took too long. Check your internet connection and try again.'
@@ -1225,6 +1229,11 @@ function FutaPulseApp() {
   }, [session?.token, session?.user?.id])
 
   useEffect(() => {
+    const timer = window.setTimeout(() => storeEventCache(events), 300)
+    return () => window.clearTimeout(timer)
+  }, [events])
+
+  useEffect(() => {
     let timer
     const scheduleFeedExpiry = () => {
       window.clearTimeout(timer)
@@ -1234,7 +1243,11 @@ function FutaPulseApp() {
       const nextExpiry = feedExpiryEventsRef.current
         .flatMap((event) => {
           const endTime = Date.parse(event.endTime || '')
-          return Number.isFinite(endTime) ? [endTime, endTime + (30 * 60 * 1000)] : []
+          const recapPublishedAt = Date.parse(event.recapPublishedAt || '')
+          return [
+            ...(Number.isFinite(endTime) ? [endTime, endTime + (30 * 60 * 1000)] : []),
+            ...(Number.isFinite(recapPublishedAt) ? [recapPublishedAt + (30 * 60 * 1000)] : []),
+          ]
         })
         .filter((boundary) => boundary > now)
         .sort((first, second) => first - second)[0]
@@ -1266,7 +1279,7 @@ function FutaPulseApp() {
         const updatesById = new Map(data.updates.map((event) => [String(getEventId(event)), event]))
         const activeIds = new Set(updatesById.keys())
         startTransition(() => setEvents((current) => current
-          .filter((event) => event.status === 'Draft' || activeIds.has(String(getEventId(event))))
+          .filter((event) => event.status === 'Draft' || activeIds.has(String(getEventId(event))) || isPublicRecapVisible(event))
           .map((event) => ({ ...event, ...(updatesById.get(String(getEventId(event))) || {}) }))))
         const serverGoingIds = data.updates.filter((event) => event.isGoing).map((event) => String(getEventId(event)))
         setGoingIds((current) => current.join('|') === serverGoingIds.join('|') ? current : serverGoingIds)
@@ -1288,7 +1301,11 @@ function FutaPulseApp() {
   useEffect(() => {
     if (!networkOnline || !documentVisible) return undefined
     let cancelled = false
+    let refreshing = false
     const refreshFeed = async () => {
+      if (refreshing) return
+      refreshing = true
+      const requestVersion = ++eventFeedRequestVersionRef.current
       try {
         const response = await fetch(`${API_BASE_URL}/api/events`, {
           headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
@@ -1298,12 +1315,16 @@ function FutaPulseApp() {
         if (!response.ok) return
         const data = await response.json()
         if (cancelled || !Array.isArray(data.events)) return
+        if (requestVersion < eventFeedAppliedVersionRef.current) return
+        eventFeedAppliedVersionRef.current = requestVersion
+        setLoadError('')
         startTransition(() => setEvents(data.events))
         setGoingIds(data.events.filter((event) => event.isGoing).map((event) => String(getEventId(event))))
         setReminderIds(data.events.filter((event) => event.isReminded).map((event) => String(getEventId(event))))
-        storeEventCache(data.events)
       } catch {
         // Keep the last confirmed feed snapshot if the periodic refresh fails.
+      } finally {
+        refreshing = false
       }
     }
     const timer = window.setInterval(refreshFeed, 15_000)
@@ -2029,6 +2050,7 @@ function FutaPulseApp() {
       })
       const result = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(result.error || `Recap upload failed (${response.status}).`)
+      eventFeedAppliedVersionRef.current = ++eventFeedRequestVersionRef.current
       setEvents((current) => current.map((event) => String(getEventId(event)) === String(getEventId(recapUploadTarget))
         ? { ...event, ...result.event }
         : event))
@@ -2541,10 +2563,14 @@ function FutaPulseApp() {
       method: editing ? 'PATCH' : 'POST',
       body: JSON.stringify(payload),
     }, session.token)
-    const resultEvent = response.event || payload
+    const resultEvent = response.event
+    if (!resultEvent?.id) throw new Error('The server did not confirm the saved draft. It remains saved on this device; retry when your connection is stable.')
     const savedId = String(getEventId(resultEvent))
+    eventFeedAppliedVersionRef.current = ++eventFeedRequestVersionRef.current
     setEvents((current) => current.some((item) => String(getEventId(item)) === savedId)
-      ? current.map((item) => String(getEventId(item)) === savedId ? resultEvent : item)
+      ? current.map((item) => String(getEventId(item)) === savedId
+        ? { ...item, ...resultEvent, isGoing: item.isGoing, isHyped: item.isHyped, isReminded: item.isReminded }
+        : item)
       : [...current, resultEvent])
     return resultEvent
   }
@@ -2559,6 +2585,7 @@ function FutaPulseApp() {
     setEventDeleting(true)
     try {
       const result = await apiRequest(`/api/events/${encodeURIComponent(eventId)}`, { method: 'DELETE' }, session.token)
+      eventFeedAppliedVersionRef.current = ++eventFeedRequestVersionRef.current
       setEvents((current) => result.cancelled
         ? current.map((item) => String(getEventId(item)) === eventId
           ? { ...item, status: 'Cancelled', cancelledAt: new Date().toISOString() }
@@ -2601,7 +2628,6 @@ function FutaPulseApp() {
   const saveEvent = async (eventData, banner) => {
     if (!profile || !session?.token) {
       notify('Please sign in and complete your profile before creating events.', 'error')
-      setEventEditor(null)
       return false
     }
     setEventSaving(true)
@@ -2637,10 +2663,14 @@ function FutaPulseApp() {
         method: editing ? 'PATCH' : 'POST',
         body: JSON.stringify(savedEvent),
       }, session.token)
-      const resultEvent = response.event || savedEvent
+      const resultEvent = response.event
+      if (!resultEvent?.id) throw new Error('The server did not confirm this event. Check your home feed before trying again; your event details are still saved on this device.')
       const savedId = String(getEventId(resultEvent))
+      eventFeedAppliedVersionRef.current = ++eventFeedRequestVersionRef.current
       setEvents((current) => current.some((item) => String(getEventId(item)) === savedId)
-        ? current.map((item) => String(getEventId(item)) === savedId ? resultEvent : item)
+        ? current.map((item) => String(getEventId(item)) === savedId
+          ? { ...item, ...resultEvent, isGoing: item.isGoing, isHyped: item.isHyped, isReminded: item.isReminded }
+          : item)
         : [...current, resultEvent])
       setEventDuplicateState({ code: '', matches: [] })
       setEventEditor(null)

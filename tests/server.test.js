@@ -1054,6 +1054,68 @@ test("event organizer details follow the account's current profile", async () =>
   assert.equal(engagement.event.organizerPicture, "data:image/png;base64,bmV3");
 });
 
+test("event creation retries reuse the original event after a lost response", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const owner = await createVerifiedAccount(baseUrl, "idempotent-event@futa.edu.ng", "idempotent_event");
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${owner.token}` };
+  const setup = await fetch(`${baseUrl}/api/profile/setup`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ username: "idempotent_event", displayName: "Idempotent Event", faculty: "SEET", department: "EEE", level: "300", role: "explorer" })
+  });
+  assert.equal(setup.status, 200);
+
+  const clientRequestId = "event-create-retry-123456789";
+  const start = new Date(Date.now() + 86400000);
+  const payload = {
+    clientRequestId,
+    title: "Event created once despite retries",
+    category: "academic",
+    activity: "Retry-safe event submission",
+    date: start.toISOString(),
+    startTime: start.toISOString(),
+    endTime: new Date(start.getTime() + 3600000).toISOString(),
+    venue: "Lecture Theatre",
+    audience: ["all"],
+    status: "Draft"
+  };
+  const firstResponse = await fetch(`${baseUrl}/api/events`, { method: "POST", headers, body: JSON.stringify(payload) });
+  assert.equal(firstResponse.status, 201);
+  const firstEvent = (await firstResponse.json()).event;
+  assert.equal(firstEvent.clientRequestId, undefined, "internal retry identifiers must not be exposed publicly");
+
+  const draftRetryResponse = await fetch(`${baseUrl}/api/events`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...payload, activity: "Updated details after draft sync retry" })
+  });
+  assert.equal(draftRetryResponse.status, 201);
+  const draftRetryEvent = (await draftRetryResponse.json()).event;
+  assert.equal(draftRetryEvent.id, firstEvent.id);
+  assert.equal(draftRetryEvent.activity, "Updated details after draft sync retry");
+
+  const publishResponse = await fetch(`${baseUrl}/api/events`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...payload, status: "Published", activity: "Updated details after draft sync retry" })
+  });
+  assert.equal(publishResponse.status, 201);
+  assert.equal((await publishResponse.json()).event.id, firstEvent.id);
+
+  const retryResponse = await fetch(`${baseUrl}/api/events`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...payload, status: "Published", activity: "Updated details after draft sync retry" })
+  });
+  assert.equal(retryResponse.status, 200);
+  const retryEvent = (await retryResponse.json()).event;
+  assert.equal(retryEvent.id, firstEvent.id);
+
+  const ownerEvents = await fetch(`${baseUrl}/api/events`, { headers });
+  const matchingEvents = (await ownerEvents.json()).events.filter((event) => event.title === payload.title);
+  assert.equal(matchingEvents.length, 1);
+});
+
 test("drafts are private and only their owner can permanently delete them", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const owner = await createVerifiedAccount(baseUrl, "draft-owner@futa.edu.ng", "draft_owner");

@@ -23,6 +23,11 @@ function safeSetStored(key, value) {
   }
 }
 
+function createClientRequestId() {
+  return globalThis.crypto?.randomUUID?.()
+    || `event-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
 function createEmptyEvent() {
   return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', audience: [], status: 'Draft', banner: '', bannerImages: [], turnoutCount: 0, turnoutBreakdown: [] }
 }
@@ -236,11 +241,13 @@ function EventEditor({
   const draftKey = `futapulse-event-editor-draft:${owner}:${event.id || 'new'}`
   const publishedAtOpen = ['Published', 'Live'].includes(event.status)
   const [form, setForm] = useState(() => {
+    const savedDraft = publishedAtOpen ? null : readStored(draftKey, null)
     const start = toLocalDateAndTime(event.startTime || event.date || '')
     const end = toLocalDateAndTime(event.endTime || '')
     const initial = {
       ...createEmptyEvent(),
       ...event,
+      clientRequestId: event.clientRequestId || savedDraft?.clientRequestId || (!event.id ? createClientRequestId() : ''),
       audience: Array.isArray(event.audience) ? event.audience : String(event.audience || '').split(',').filter(Boolean),
       bannerImages: Array.isArray(event.bannerImages) && event.bannerImages.length
         ? event.bannerImages
@@ -251,9 +258,8 @@ function EventEditor({
       endClock: end.time,
     }
     if (publishedAtOpen) return initial
-    const savedDraft = readStored(draftKey, null)
     return savedDraft && typeof savedDraft === 'object'
-      ? { ...initial, ...savedDraft, id: event.id || savedDraft.id || '' }
+      ? { ...initial, ...savedDraft, id: event.id || savedDraft.id || '', clientRequestId: initial.clientRequestId }
       : initial
   })
   const [banner, setBanner] = useState(() => event.bannerImages?.[0] || event.banner || '')
@@ -265,8 +271,10 @@ function EventEditor({
   const [draftSaved, setDraftSaved] = useState(false)
   const [draftSyncing, setDraftSyncing] = useState(false)
   const [draftSyncError, setDraftSyncError] = useState('')
+  const [bannerProcessing, setBannerProcessing] = useState(false)
   const hasEditedRef = useRef(Boolean(event.id || form.title || form.category || form.activity || form.date || form.venue || form.meetingUrl || form.banner))
   const onAutoSaveRef = useRef(onAutoSave)
+  const draftSyncOnReconnectRef = useRef(null)
   const draftSyncQueueRef = useRef(Promise.resolve())
   const draftSyncCountRef = useRef(0)
   useEffect(() => { onAutoSaveRef.current = onAutoSave }, [onAutoSave])
@@ -330,7 +338,12 @@ function EventEditor({
     setDraftSyncing(true)
     const sync = draftSyncQueueRef.current
       .catch(() => undefined)
-      .then(() => onAutoSaveRef.current({ ...snapshot, date: startDateTime, endDateTime }, currentBanner))
+      .then(() => onAutoSaveRef.current({
+        ...snapshot,
+        id: snapshot.id || formRef.current.id || '',
+        date: startDateTime,
+        endDateTime,
+      }, currentBanner))
     draftSyncQueueRef.current = sync
     void sync.then((saved) => {
       if (!saved?.id) return
@@ -369,10 +382,18 @@ function EventEditor({
       if (!draftSyncCountRef.current) setDraftSyncing(false)
     })
   }
-  const createSavePayload = (status, allowSimilar = false) => {
-    const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
-    const endDateTime = form.endDateTime && form.endClock ? `${form.endDateTime}T${form.endClock}` : ''
-    return { ...form, date: startDateTime, endDateTime, status, allowSimilar }
+  useEffect(() => {
+    draftSyncOnReconnectRef.current = saveDraftOnBlur
+  })
+  useEffect(() => {
+    const retryDraftSync = () => draftSyncOnReconnectRef.current?.({ relatedTarget: null })
+    window.addEventListener('online', retryDraftSync)
+    return () => window.removeEventListener('online', retryDraftSync)
+  }, [])
+  const createSavePayload = (status, allowSimilar = false, sourceForm = form) => {
+    const startDateTime = sourceForm.date && sourceForm.startClock ? `${sourceForm.date}T${sourceForm.startClock}` : ''
+    const endDateTime = sourceForm.endDateTime && sourceForm.endClock ? `${sourceForm.endDateTime}T${sourceForm.endClock}` : ''
+    return { ...sourceForm, date: startDateTime, endDateTime, status, allowSimilar }
   }
 
   useEffect(() => {
@@ -453,14 +474,19 @@ function EventEditor({
     eventSubmit.preventDefault()
     setError('')
     try {
+      if (bannerProcessing) throw new Error('Wait for the event banners to finish preparing before publishing.')
       const status = eventSubmit.nativeEvent.submitter?.dataset.status || 'Published'
-      const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
-      const endDateTime = form.endDateTime && form.endClock ? `${form.endDateTime}T${form.endClock}` : ''
+      if (!publishedAtOpen) await draftSyncQueueRef.current.catch(() => undefined)
+      const submitForm = formRef.current
+      const submitBanner = bannerRef.current || banner
+      const startDateTime = submitForm.date && submitForm.startClock ? `${submitForm.date}T${submitForm.startClock}` : ''
+      const endDateTime = submitForm.endDateTime && submitForm.endClock ? `${submitForm.endDateTime}T${submitForm.endClock}` : ''
       if (status === 'Published' && (!startDateTime || !endDateTime)) throw new Error('Choose both the event start and end date and time.')
       if (status === 'Published' && new Date(endDateTime).getTime() <= new Date(startDateTime).getTime()) {
         throw new Error('The event end time must be later than the start time.')
       }
-      const saved = await onSave({ ...form, date: startDateTime, endDateTime, status, allowSimilar: false }, banner)
+      persistLocalDraft({ ...submitForm, status: 'Draft', banner: submitBanner, bannerImages: submitForm.bannerImages || [] }, submitBanner)
+      const saved = await onSave({ ...submitForm, date: startDateTime, endDateTime, status, allowSimilar: false }, submitBanner)
       if (saved) {
         localStorage.removeItem(draftKey)
         setDraftSaved(false)
@@ -471,10 +497,16 @@ function EventEditor({
   }
 
   const saveDraft = async () => {
-    const startDateTime = form.date && form.startClock ? `${form.date}T${form.startClock}` : ''
-    const endDateTime = form.endDateTime && form.endClock ? `${form.endDateTime}T${form.endClock}` : ''
+    if (bannerProcessing) {
+      setError('Wait for the event banners to finish preparing before saving the draft.')
+      return
+    }
     try {
-      const saved = await onSave({ ...form, date: startDateTime, endDateTime, status: 'Draft' }, banner)
+      await draftSyncQueueRef.current.catch(() => undefined)
+      const draftForm = formRef.current
+      const draftBanner = bannerRef.current || banner
+      persistLocalDraft({ ...draftForm, status: 'Draft', banner: draftBanner, bannerImages: draftForm.bannerImages || [] }, draftBanner)
+      const saved = await onSave(createSavePayload('Draft', false, draftForm), draftBanner)
       if (saved) {
         localStorage.removeItem(draftKey)
         setDraftSaved(false)
@@ -514,6 +546,7 @@ function EventEditor({
               setError('Each event banner must be smaller than 3 MB.')
               return
             }
+            setBannerProcessing(true)
             try {
               const dataUrls = await Promise.all(files.map((file) => compressBanner ? compressBanner(file) : new Promise((resolve, reject) => {
                 const reader = new FileReader()
@@ -524,10 +557,12 @@ function EventEditor({
               updateBannerImages([...(formRef.current.bannerImages || []), ...dataUrls])
               setError('')
             } catch (readError) { setError(readError.message) }
+            finally { setBannerProcessing(false) }
           }} />
           <button
             type="button"
             className={`event-banner-upload ${(form.bannerImages?.length || banner || form.banner) ? 'has-banner' : ''}`}
+            disabled={bannerProcessing}
             aria-label={(form.bannerImages?.length || banner || form.banner) ? 'Add event banners' : 'Upload images'}
             onClick={() => bannerInput.current?.click()}
           >
@@ -556,15 +591,17 @@ function EventEditor({
                 : 'Review these close matches before confirming that your event is different.'}</p>
               <div className="event-duplicate-matches">
                 {duplicateState.matches.map(({ event: match, score }) => (
-                  <button key={getEventId(match)} type="button" className="event-duplicate-match" onClick={() => onOpenDuplicate?.(match)}>
+                <button key={getEventId(match)} type="button" className="event-duplicate-match" disabled={saving || bannerProcessing} onClick={() => onOpenDuplicate?.(match)}>
                     <span><strong>{match.title}</strong><small>{match.category} · {match.venue}</small><small>{new Date(match.date || match.startTime).toLocaleString()} – {new Date(match.endTime).toLocaleString()}</small><small>{match.activity}</small></span>
                     <b>{score}%</b>
                   </button>
                 ))}
               </div>
               {duplicateState.code === 'POSSIBLE_DUPLICATE' && (
-                <button type="button" className="setup-submit event-duplicate-confirm" disabled={saving} onClick={async () => {
-                  const saved = await onSave(createSavePayload('Published', true), banner)
+                <button type="button" className="setup-submit event-duplicate-confirm" disabled={saving || bannerProcessing} onClick={async () => {
+                  await draftSyncQueueRef.current.catch(() => undefined)
+                  const latestForm = formRef.current
+                  const saved = await onSave(createSavePayload('Published', true, latestForm), bannerRef.current || banner)
                   if (saved) {
                     localStorage.removeItem(draftKey)
                     setDraftSaved(false)
@@ -576,7 +613,7 @@ function EventEditor({
             </section>
           )}
           {error && <p className="form-error" role="alert">{error}</p>}
-          <div className="event-form-actions">{!publishedAtOpen && <button type="button" className="event-draft-btn" disabled={saving} onClick={saveDraft}>Save draft</button>}<button className="setup-submit" type="submit" data-status="Published" disabled={saving}>Publish event <span>→</span></button></div>
+          <div className="event-form-actions">{!publishedAtOpen && <button type="button" className="event-draft-btn" disabled={saving || bannerProcessing} onClick={saveDraft}>Save draft</button>}<button className="setup-submit" type="submit" data-status="Published" disabled={saving || bannerProcessing}>{bannerProcessing ? 'Preparing banners…' : 'Publish event'} <span>→</span></button></div>
         </form>
       </section>
     </div>

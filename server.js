@@ -316,6 +316,8 @@ function toPublicEvent(event, viewerId = "") {
     reminderUserIds = [],
     viewCount,
     recapPromptDismissed,
+    clientRequestId,
+    clientRequestFingerprint,
     ...publicEvent
   } = event;
   const endAt = new Date(event.endTime || "");
@@ -1180,6 +1182,15 @@ async function findStoredEvent(eventId) {
   return record?.record || null;
 }
 
+function getIdempotentEventId(ownerUserId, clientRequestId) {
+  return `event-${crypto.createHash("sha256").update(`${ownerUserId}:${clientRequestId}`).digest("hex")}`;
+}
+
+function getEventSubmissionFingerprint(payload) {
+  const { allowSimilar, ...submission } = payload || {};
+  return crypto.createHash("sha256").update(JSON.stringify(submission)).digest("hex");
+}
+
 async function storeEvent(event) {
   if (!isMongoConnected()) {
     const database = readDatabase();
@@ -1799,7 +1810,7 @@ const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo";
 app.disable("x-powered-by");
 app.use(compression());
 app.use(cors({
-  origin: process.env.CORS_ORIGIN ? CORS_ORIGINS : true,
+  origin: CORS_ORIGINS,
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-FUTApulse-OAuth-Request"],
   credentials: true
@@ -3359,13 +3370,42 @@ app.post("/api/events", async (request, response) => {
     const payload = request.body || {};
     const { allowSimilar, ...eventPayload } = payload;
     const requestedStatus = payload.status || "Draft";
+    if (!["Draft", "Published", "Live"].includes(requestedStatus)) {
+      return response.status(400).json({ error: "Events can only be saved as drafts or published events." });
+    }
+    const clientRequestId = typeof payload.clientRequestId === "string" ? payload.clientRequestId.trim() : "";
+    if (clientRequestId && !/^[a-zA-Z0-9_-]{12,128}$/.test(clientRequestId)) {
+      return response.status(400).json({ error: "The event submission identifier is invalid. Reopen the event editor and try again." });
+    }
     if (requestedStatus !== "Draft" && new Date(user.postingBanUntil || 0).getTime() > Date.now()) {
       return response.status(403).json({ error: `Your event-posting access is paused until ${new Date(user.postingBanUntil).toLocaleString()}.` });
     }
+    const ownerUserId = String(user._id || user.id);
+    const eventId = clientRequestId ? getIdempotentEventId(ownerUserId, clientRequestId) : crypto.randomUUID();
+    const submissionFingerprint = clientRequestId ? getEventSubmissionFingerprint(payload) : "";
+    const existing = clientRequestId ? await findStoredEvent(eventId) : null;
+    if (existing && String(existing.createdByUserId || "") !== ownerUserId) {
+      return response.status(409).json({ error: "This event submission identifier is already in use. Reopen the event editor and try again." });
+    }
+    if (existing && existing.status !== "Draft") {
+      if (existing.status === "Cancelled") return response.status(409).json({ error: "This event was already cancelled and cannot be resubmitted." });
+      if (existing.clientRequestFingerprint !== submissionFingerprint) {
+        return response.status(409).json({
+          code: "EVENT_SUBMISSION_ALREADY_PUBLISHED",
+          error: "This event was already published, but the details changed after the last request. Refresh your events and edit the published event to apply those changes."
+        });
+      }
+      void enqueueCategoryAlert(existing).catch((error) => console.error("New-event notifications could not be queued.", error));
+      void scheduleEventEndedRecapPrompt(existing).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
+      return response.json({ event: toPublicEvent(existing), similarEvents: [] });
+    }
+    const now = new Date().toISOString();
     let event = {
+      ...(existing || {}),
       ...eventPayload,
-      id: crypto.randomUUID(),
-      createdByUserId: String(user._id || user.id),
+      ...(clientRequestId ? { clientRequestId, clientRequestFingerprint: submissionFingerprint } : {}),
+      id: eventId,
+      createdByUserId: ownerUserId,
       ...getCurrentOrganizerMetadata(user),
       venue: typeof payload.venue === "string" ? payload.venue.trim().slice(0, 120) : "",
       venueLandmark: typeof payload.venueLandmark === "string" ? payload.venueLandmark.trim().slice(0, 240) : "",
@@ -3373,14 +3413,14 @@ app.post("/api/events", async (request, response) => {
       turnoutCount: typeof payload.turnoutCount === "number" ? payload.turnoutCount : (Number(payload.turnoutCount) || 0),
       turnoutBreakdown: Array.isArray(payload.turnoutBreakdown) ? payload.turnoutBreakdown : [],
       status: requestedStatus,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      createdAt: existing?.createdAt || now,
+      updatedAt: now
     };
     if (!validateEvent(event)) return response.status(400).json({ error: "Event is missing required fields." });
     const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
     const storedEvents = await listStoredEvents();
     if (event.status !== "Draft") {
-      const matches = getEventDuplicateMatches({ events: storedEvents }, event);
+      const matches = getEventDuplicateMatches({ events: storedEvents }, event, event.id);
       const blockingMatches = matches.filter((match) => match.score === 100);
       if (blockingMatches.length) {
         return response.status(409).json({
@@ -3447,6 +3487,9 @@ app.patch("/api/events/:eventId", async (request, response) => {
       meetingUrl: typeof changes.meetingUrl === "string" ? changes.meetingUrl.trim() : current.meetingUrl || "",
       updatedAt: new Date().toISOString()
     };
+    if (!["Draft", "Published", "Live"].includes(updated.status)) {
+      return response.status(400).json({ error: "An event can only be saved as a draft or published event." });
+    }
     if (updated.status !== "Draft" && new Date(user.postingBanUntil || 0).getTime() > Date.now()) {
       return response.status(403).json({ error: `Your event-posting access is paused until ${new Date(user.postingBanUntil).toLocaleString()}.` });
     }
@@ -4147,7 +4190,7 @@ async function startServer() {
   const listen = async () => {
     initializePushProviders();
     realtimeServer = new SocketServer(httpServer, {
-      cors: { origin: process.env.CORS_ORIGIN ? CORS_ORIGINS : true, credentials: true },
+      cors: { origin: CORS_ORIGINS, credentials: true },
       transports: ["websocket", "polling"],
       pingTimeout: 20_000,
       pingInterval: 25_000
