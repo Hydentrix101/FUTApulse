@@ -449,7 +449,6 @@ function FutaPulseApp() {
   const [isLaunchAdActive, setIsLaunchAdActive] = useState(false)
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
-  const [sessionRestoreSlow, setSessionRestoreSlow] = useState(false)
   const [user, setUser] = useState(null)
   const [guestSignInRequested] = useState(() => initialSearchParams.has('auth'))
   const isGuestSharedView = (!session?.token || !user) && !guestSignInRequested
@@ -479,6 +478,7 @@ function FutaPulseApp() {
   const [homeCategory, setHomeCategory] = useState('all')
   const [expandedHomeCategory, setExpandedHomeCategory] = useState('')
   const [pendingFullEventId, setPendingFullEventId] = useState('')
+  const feedReturnSnapshotRef = useRef(null)
   const [notificationFeedEventId, setNotificationFeedEventId] = useState('')
   const [pendingOrganizerEventId, setPendingOrganizerEventId] = useState('')
   const homeSectionRefs = useRef({})
@@ -1093,13 +1093,11 @@ function FutaPulseApp() {
 
   useEffect(() => {
     const controller = new AbortController()
-    let slowTimer
     const restoreSession = async () => {
       if (!hasRememberedSession()) {
         setSessionLoading(false)
         return
       }
-      slowTimer = window.setTimeout(() => setSessionRestoreSlow(true), 4000)
       try {
         const response = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
           method: 'POST',
@@ -1133,14 +1131,12 @@ function FutaPulseApp() {
               : 'We could not restore your session. Sign in again when the server is available.', 'error')
         }
       } finally {
-        window.clearTimeout(slowTimer)
         if (!controller.signal.aborted) setSessionLoading(false)
       }
     }
     restoreSession()
     return () => {
       controller.abort()
-      window.clearTimeout(slowTimer)
     }
   }, [notify])
 
@@ -2391,6 +2387,13 @@ function FutaPulseApp() {
   }
 
   const openCategoryFeed = (category, eventId = '') => {
+    if (!expandedHomeCategory) {
+      feedReturnSnapshotRef.current = {
+        activeTab,
+        homeCategory,
+        scrollTop: document.querySelector('.app-main')?.scrollTop || 0,
+      }
+    }
     if (!eventId) setHomeCategory(category === 'hot' ? 'all' : category)
     else {
       resumeAutoScroll('hot')
@@ -2744,11 +2747,7 @@ function FutaPulseApp() {
   }
 
   if (sessionLoading) {
-    return <div className={`app-root theme-${theme} session-restore-screen`} role="status" aria-live="polite">
-      <BrandHeart size={36} />
-      <span>{sessionRestoreSlow ? 'Still connecting to FUTApulse…' : 'Connecting to FUTApulse…'}</span>
-      {sessionRestoreSlow && <small>Checking the server and your internet connection. This screen will continue automatically.</small>}
-    </div>
+    return <div className={`app-root theme-${theme} session-restore-screen`} role="status" aria-label="Loading FUTApulse"><BrandHeart size={36} /></div>
   }
 
   if ((!session?.token || !user) && !isGuestSharedView) {
@@ -2881,11 +2880,23 @@ function FutaPulseApp() {
                 ) : (
                   <section className="home-full-feed-view">
                     <button className={`home-back-button ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''}`} type="button" onClick={() => {
+                      const returnSnapshot = feedReturnSnapshotRef.current
+                      feedReturnSnapshotRef.current = null
                       setExpandedHomeCategory('')
                       setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
                       setPendingFullEventId('')
                       setNotificationFeedEventId('')
-                      window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 0)
+                      if (returnSnapshot) {
+                        setHomeCategory(returnSnapshot.homeCategory)
+                        setActiveTab(returnSnapshot.activeTab)
+                        window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+                          document.querySelector('.app-main')?.scrollTo({ top: returnSnapshot.scrollTop, behavior: 'auto' })
+                        }))
+                      } else {
+                        setHomeCategory('all')
+                        setActiveTab('home')
+                        window.requestAnimationFrame(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'auto' }))
+                      }
                     }}><ChevronLeft size={18} /> Back to home</button>
                     <div className="home-full-feed-heading"><h1 className="home-full-feed-title">{expandedHomeCategory === 'hot' ? '🔥 Hot Events on Campus' : CATEGORY_DATA.find((item) => item.id === expandedHomeCategory)?.label || 'Events Happening Today & Next 2 Days'}</h1><span className="home-row-count">{expandedFeedEventCount} {expandedFeedEventCount === 1 ? 'event' : 'events'}</span></div>
                     {(() => {
