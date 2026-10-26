@@ -128,7 +128,9 @@ function readInitialEventCache() {
     return []
   }
   const cachedEvents = readStored('futapulse-events', [])
-  return Array.isArray(cachedEvents) ? cachedEvents.slice(0, MAX_CACHED_EVENTS) : []
+  return Array.isArray(cachedEvents)
+    ? cachedEvents.filter((event) => ['Published', 'Live'].includes(event?.status)).slice(0, MAX_CACHED_EVENTS)
+    : []
 }
 const reportedStorageWriteFailures = new Set()
 
@@ -168,7 +170,8 @@ function withoutInlineImages(value) {
 function storeEventCache(events) {
   const compactEvents = []
   let cacheCharacters = 2
-  for (const event of (Array.isArray(events) ? events : []).slice(0, MAX_CACHED_EVENTS)) {
+  const publicEvents = (Array.isArray(events) ? events : []).filter((event) => ['Published', 'Live'].includes(event?.status))
+  for (const event of publicEvents.slice(0, MAX_CACHED_EVENTS)) {
     const serializedEvent = JSON.stringify(withoutInlineImages(event))
     const nextSize = cacheCharacters + serializedEvent.length + (compactEvents.length ? 1 : 0)
     if (nextSize > MAX_EVENT_CACHE_CHARACTERS) break
@@ -466,7 +469,7 @@ function FutaPulseApp() {
   const tabHistoryRef = useRef([])
   const lastTrackedTabRef = useRef(activeTab)
   const backGuardIdRef = useRef('')
-  const [events, setEvents] = useState([])
+  const [events, setEvents] = useState(readInitialEventCache)
   const eventFeedRequestVersionRef = useRef(0)
   const eventFeedAppliedVersionRef = useRef(0)
   const [loading, setLoading] = useState(true)
@@ -1005,15 +1008,6 @@ function FutaPulseApp() {
       if (adFrame) window.cancelAnimationFrame(adFrame)
     }
   }, [bypassLaunchSequence])
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      if (!session?.token) return
-      const cachedEvents = readInitialEventCache()
-      startTransition(() => setEvents((current) => current.length ? current : cachedEvents))
-    }, 0)
-    return () => window.clearTimeout(timer)
-  }, [session?.token])
 
   useEffect(() => {
     if (!facultyLogoOpen) return undefined
@@ -2882,6 +2876,7 @@ function FutaPulseApp() {
                 </div>
               </section>
               <div className="feed-container">
+                {loadError && publishedEvents.length > 0 && <p className="feed-error" role="status">You’re seeing saved campus events while the live feed reconnects. {loadError}</p>}
                 {!expandedHomeCategory ? (
                   <div className="home-discovery-view">
                     {(hotEvent || loading) && <section className="feed-section hot-section" ref={(node) => { homeSectionRefs.current.hot = node }}>
