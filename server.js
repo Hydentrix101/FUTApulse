@@ -286,6 +286,16 @@ function isWithinEventDisplayWindow(event, now = Date.now()) {
     && endTime + (30 * 60 * 1000) > now;
 }
 
+function isPublicRecapVisible(event, now = Date.now()) {
+  const publishedAt = new Date(event?.recapPublishedAt || "").getTime();
+  return ["Published", "Live"].includes(event?.status)
+    && Array.isArray(event?.recapPhotos)
+    && event.recapPhotos.length > 0
+    && Number.isFinite(publishedAt)
+    && publishedAt <= now
+    && now - publishedAt <= 30 * 60_000;
+}
+
 function toPublicEvent(event, viewerId = "") {
   const {
     attendeeUserIds = [],
@@ -1032,7 +1042,12 @@ async function listStoredEvents(viewerId = "", onlyVisible = false) {
     const visibleEventStart = new Date(now - (30 * 60_000));
     const recentOwnerHistoryStart = new Date(now - (7 * 24 * 60 * 60_000));
     const visibilityFilters = [
-      { status: { $in: ["Published", "Live"] }, endsAt: { $gt: visibleEventStart } }
+      { status: { $in: ["Published", "Live"] }, endsAt: { $gt: visibleEventStart } },
+      {
+        status: { $in: ["Published", "Live"] },
+        "record.recapPhotos.0": { $exists: true },
+        "record.recapPublishedAt": { $gte: new Date(now - (30 * 60_000)).toISOString(), $lte: new Date(now).toISOString() }
+      }
     ];
     if (viewerId) {
       visibilityFilters.push(
@@ -2837,7 +2852,7 @@ app.get("/api/events", async (request, response) => {
       return isOwnerDraft
         || isOwnerRecentEndedEvent
         || isOwnerRecentCancellation
-        || (["Published", "Live"].includes(event.status) && isWithinEventDisplayWindow(event));
+        || (["Published", "Live"].includes(event.status) && (isWithinEventDisplayWindow(event) || isPublicRecapVisible(event)));
     });
     if (level) events = events.filter((event) => !event.audience || event.audience.includes("all") || event.audience.includes(level));
     if (category && category !== "all") events = events.filter((event) => event.category === category);
@@ -3627,7 +3642,7 @@ app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
       const uploaded = await uploadRecapImage(file.buffer, event.id);
       uploadedAssets.push(uploaded);
     }
-    const recapPublishedAt = event.recapPublishedAt || new Date().toISOString();
+    const recapPublishedAt = new Date().toISOString();
     const updated = {
       ...event,
       recapPhotos: [
@@ -4079,12 +4094,7 @@ app.get("/api/events/:eventId", async (request, response) => {
       && event.status !== "Cancelled"
       && eventEnd <= Date.now()
       && Date.now() - eventEnd <= 7 * 24 * 60 * 60_000;
-    const recapPublishedAt = new Date(event.recapPublishedAt || "").getTime();
-    const publicRecapVisible = Array.isArray(event.recapPhotos)
-      && event.recapPhotos.length > 0
-      && Number.isFinite(recapPublishedAt)
-      && recapPublishedAt <= Date.now()
-      && Date.now() - recapPublishedAt <= 7 * 24 * 60 * 60_000;
+    const publicRecapVisible = isPublicRecapVisible(event);
     const cancellationDate = new Date(event.cancelledAt || "").getTime();
     const cancellationVisible = event.status === "Cancelled"
       && Number.isFinite(cancellationDate)

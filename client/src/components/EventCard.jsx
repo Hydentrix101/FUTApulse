@@ -117,10 +117,13 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
     ? event.bannerImages.filter((image) => typeof image === 'string' && image)
     : []
   const eventEndTimestamp = Date.parse(event.endTime || '')
+  const recapPublishedTimestamp = Date.parse(event.recapPublishedAt || '')
   const recapWindowOpen = recapPhotos.length > 0
     && Number.isFinite(eventEndTimestamp)
     && currentTime >= eventEndTimestamp
-    && currentTime <= eventEndTimestamp + (30 * 60_000)
+    && Number.isFinite(recapPublishedTimestamp)
+    && recapPublishedTimestamp <= currentTime
+    && currentTime - recapPublishedTimestamp <= 30 * 60_000
   const recapPhoto = recapWindowOpen ? recapPhotos[recapPhotoIndex % recapPhotos.length] : null
   const bannerImage = bannerImages[recapPhotoIndex % Math.max(1, bannerImages.length)]
   const bannerSource = (typeof recapPhoto === 'string' ? recapPhoto : recapPhoto?.url)

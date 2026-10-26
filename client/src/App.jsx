@@ -260,6 +260,16 @@ function isWithinEventDisplayWindow(event, now = Date.now()) {
     && endTime + (30 * 60 * 1000) > now
 }
 
+function isPublicRecapVisible(event, now = Date.now()) {
+  const publishedAt = Date.parse(event?.recapPublishedAt || '')
+  return ['Published', 'Live'].includes(event?.status)
+    && Array.isArray(event?.recapPhotos)
+    && event.recapPhotos.length > 0
+    && Number.isFinite(publishedAt)
+    && publishedAt <= now
+    && now - publishedAt <= 30 * 60_000
+}
+
 function formatEventTimeRange(event) {
   const start = new Date(getStartTime(event))
   const end = new Date(event.endTime)
@@ -1430,7 +1440,7 @@ function FutaPulseApp() {
     () => events.filter((event) => {
       if (event.status === 'Cancelled') return false
       if (!['Published', 'Live', undefined].includes(event.status)) return false
-      return isWithinEventDisplayWindow(event, feedClock)
+      return isWithinEventDisplayWindow(event, feedClock) || isPublicRecapVisible(event, feedClock)
     }),
     [events, feedClock],
   )
