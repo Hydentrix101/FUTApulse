@@ -25,6 +25,7 @@ const {
 } = require("../server");
 const { buildApprovedMigrationPlan } = require("../server/dataMigration");
 const webPush = require("web-push");
+const cloudinary = require("cloudinary").v2;
 const jwt = require("jsonwebtoken");
 const deliveredEmails = [];
 app.locals.emailSender = async ({ text }) => deliveredEmails.push(text);
@@ -1125,6 +1126,65 @@ test("event image data is rejected explicitly when Cloudinary storage is not con
     const eventsResponse = await fetch(`${baseUrl}/api/events`, { headers });
     assert.ok(!(await eventsResponse.json()).events.some((event) => event.title === "Banner storage draft"));
   } finally {
+    for (const [key, value] of Object.entries(previousVariables)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("Cloudinary verification is admin-only, checks credentials, and never returns secret values", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const admin = await createVerifiedAccount(baseUrl, "immanuelidowu1@gmail.com", "cloudinary_admin");
+  const ordinaryUser = await createVerifiedAccount(baseUrl, "cloudinary-user@futa.edu.ng", "cloudinary_user");
+  const previousVariables = {
+    CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME,
+    CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY,
+    CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET
+  };
+  const originalPing = cloudinary.api.ping;
+  const adminHeaders = { Authorization: `Bearer ${admin.token}` };
+
+  try {
+    const unauthenticated = await fetch(`${baseUrl}/api/admin/cloudinary/verify`);
+    assert.equal(unauthenticated.status, 401);
+
+    const forbidden = await fetch(`${baseUrl}/api/admin/cloudinary/verify`, {
+      headers: { Authorization: `Bearer ${ordinaryUser.token}` }
+    });
+    assert.equal(forbidden.status, 403);
+
+    process.env.CLOUDINARY_CLOUD_NAME = " ";
+    process.env.CLOUDINARY_API_KEY = "";
+    process.env.CLOUDINARY_API_SECRET = "";
+    const missing = await fetch(`${baseUrl}/api/admin/cloudinary/verify`, { headers: adminHeaders });
+    assert.equal(missing.status, 503);
+    assert.deepEqual((await missing.json()).missingVariables, [
+      "CLOUDINARY_CLOUD_NAME",
+      "CLOUDINARY_API_KEY",
+      "CLOUDINARY_API_SECRET"
+    ]);
+
+    process.env.CLOUDINARY_CLOUD_NAME = "test-cloud";
+    process.env.CLOUDINARY_API_KEY = "test-api-key";
+    process.env.CLOUDINARY_API_SECRET = "test-api-secret";
+    cloudinary.api.ping = async () => ({ status: "ok" });
+    const valid = await fetch(`${baseUrl}/api/admin/cloudinary/verify`, { headers: adminHeaders });
+    assert.equal(valid.status, 200);
+    assert.deepEqual(await valid.json(), { configured: true, valid: true });
+
+    cloudinary.api.ping = async () => {
+      const error = new Error("Invalid signature");
+      error.http_code = 401;
+      throw error;
+    };
+    const rejected = await fetch(`${baseUrl}/api/admin/cloudinary/verify`, { headers: adminHeaders });
+    assert.equal(rejected.status, 502);
+    const rejectedBody = await rejected.json();
+    assert.equal(rejectedBody.category, "invalid_credentials");
+    assert.equal(JSON.stringify(rejectedBody).includes("test-api-secret"), false);
+  } finally {
+    cloudinary.api.ping = originalPing;
     for (const [key, value] of Object.entries(previousVariables)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

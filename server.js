@@ -667,7 +667,9 @@ function initializePushProviders() {
 }
 
 function configureCloudinary() {
-  const { CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET } = process.env;
+  const CLOUDINARY_CLOUD_NAME = String(process.env.CLOUDINARY_CLOUD_NAME || "").trim();
+  const CLOUDINARY_API_KEY = String(process.env.CLOUDINARY_API_KEY || "").trim();
+  const CLOUDINARY_API_SECRET = String(process.env.CLOUDINARY_API_SECRET || "").trim();
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) return false;
   cloudinary.config({
     cloud_name: CLOUDINARY_CLOUD_NAME,
@@ -680,7 +682,31 @@ function configureCloudinary() {
 
 function getMissingCloudinaryVariables() {
   return ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
-    .filter((variable) => !process.env[variable]);
+    .filter((variable) => !String(process.env[variable] || "").trim());
+}
+
+function classifyCloudinaryError(error) {
+  const status = Number(error?.http_code || error?.statusCode);
+  const message = String(error?.message || error?.error?.message || "").toLowerCase();
+  if (error?.code === "ETIMEDOUT" || error?.code === "ECONNRESET" || error?.code === "ENOTFOUND") return "network_error";
+  if (status === 401 || /invalid signature|invalid api key|authentication failed/.test(message)) return "invalid_credentials";
+  if (status === 403) return "access_denied";
+  if (status === 404 || /cloud name.*(invalid|not found)|unknown cloud/.test(message)) return "invalid_cloud_name";
+  if (status >= 500) return "provider_unavailable";
+  return "upload_rejected";
+}
+
+function cloudinaryErrorMessage(error, assetLabel) {
+  const category = classifyCloudinaryError(error);
+  if (category === "network_error") return `The connection to ${assetLabel} storage timed out. Check your internet connection and try again.`;
+  if (category === "invalid_credentials") {
+    const subject = assetLabel === "Cloudinary" ? "Cloudinary" : `${assetLabel} storage`;
+    return `${subject} rejected the configured credentials. Check the cloud name, API key, and API secret on the API host.`;
+  }
+  if (category === "invalid_cloud_name") return `Cloudinary could not find the configured cloud. Check CLOUDINARY_CLOUD_NAME on the API host.`;
+  if (category === "access_denied") return `Cloudinary denied this ${assetLabel} upload. Check the API key permissions and account upload settings.`;
+  if (category === "provider_unavailable") return `${assetLabel} storage is temporarily unavailable. Please try again shortly.`;
+  return `The ${assetLabel} could not be saved to Cloudinary. Please try again.`;
 }
 
 const recapImageUpload = multer({
@@ -785,14 +811,7 @@ async function externalizeEventBanners(event) {
 }
 
 function eventBannerUploadErrorMessage(error) {
-  const status = Number(error?.http_code || error?.statusCode);
-  if (error?.code === "ETIMEDOUT" || error?.code === "ECONNRESET") {
-    return "Event image storage timed out. Check your internet connection and try again.";
-  }
-  if (status === 401 || status === 403) {
-    return "Event image storage rejected the upload. Check the server's Cloudinary credentials.";
-  }
-  return "The event images could not be saved to image storage. Please try again.";
+  return cloudinaryErrorMessage(error, "Event image");
 }
 
 function describeWebPushFailure(error, endpoint) {
@@ -3647,15 +3666,14 @@ app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
     }));
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
     console.error("Event recap photo upload failed.", error);
-    const providerStatus = Number(error?.http_code || error?.statusCode);
-    const message = error?.code === "ETIMEDOUT" || error?.code === "ECONNRESET"
-      ? "The connection to photo storage timed out. Check your internet connection and try again."
-      : providerStatus === 401 || providerStatus === 403
-        ? "Photo storage rejected the upload. The server's Cloudinary credentials need to be checked."
-        : providerStatus >= 500
-          ? "Photo storage is temporarily unavailable. Please try again shortly."
-          : "The server could not save these recap photos. Please try again; if this continues, check the server logs.";
-    return response.status(500).json({ error: message });
+    const category = classifyCloudinaryError(error);
+    console.error("Event recap photo upload failed.", {
+      category,
+      status: Number(error?.http_code || error?.statusCode) || null
+    });
+    return response.status(category === "provider_unavailable" ? 503 : 502).json({
+      error: cloudinaryErrorMessage(error, "Photo")
+    });
   }
 });
 
@@ -3663,6 +3681,48 @@ function isFutapulseAdmin(user) {
   return user?.emailVerified === true
     && String(user.email || "").trim().toLowerCase() === FUTAPULSE_ADMIN_EMAIL;
 }
+
+app.get("/api/admin/cloudinary/verify", async (request, response) => {
+  try {
+    const reviewer = await getAuthenticatedUser(request);
+    if (!reviewer) return response.status(401).json({ error: "Authentication required." });
+    if (!isFutapulseAdmin(reviewer)) return response.status(403).json({ error: "Only the authorized FUTApulse account can verify Cloudinary configuration." });
+
+    const missingVariables = getMissingCloudinaryVariables();
+    if (missingVariables.length) {
+      return response.status(503).json({
+        configured: false,
+        valid: false,
+        category: "missing_credentials",
+        missingVariables
+      });
+    }
+
+    configureCloudinary();
+    try {
+      await cloudinary.api.ping({ timeout: 10_000 });
+      return response.json({ configured: true, valid: true });
+    } catch (error) {
+      const category = classifyCloudinaryError(error);
+      console.error("Cloudinary credential verification failed.", {
+        category,
+        status: Number(error?.http_code || error?.statusCode) || null
+      });
+      return response.status(502).json({
+        configured: true,
+        valid: false,
+        category,
+        error: cloudinaryErrorMessage(error, "Cloudinary")
+      });
+    }
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Your session is no longer valid." });
+    }
+    console.error("Cloudinary credential verification could not run.", error);
+    return response.status(500).json({ error: "Unable to verify Cloudinary configuration right now." });
+  }
+});
 
 app.post("/api/events/:eventId/report", async (request, response) => {
   try {

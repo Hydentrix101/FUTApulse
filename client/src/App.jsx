@@ -1,6 +1,6 @@
 import { Fragment, lazy, startTransition, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Bell, Building2, Check, ChevronLeft, ChevronRight, Clock3, Download, Eye, EyeOff, Flame, Heart, Home, LogOut,
+  Bell, Building2, Check, ChevronLeft, ChevronRight, Clock3, Download, Eye, EyeOff, Flame, Heart, Home, Image, LogOut,
   MapPin, Search, Shield, Sparkles, Trash2, User, X,
 } from 'lucide-react'
 import AuthScreen from './components/AuthScreen'
@@ -306,6 +306,8 @@ async function apiRequest(endpoint, options = {}, token = '') {
     const error = new Error(result.error || `Request failed (${response.status}).`)
     error.status = response.status
     error.code = result.code
+    error.category = result.category
+    error.missingVariables = Array.isArray(result.missingVariables) ? result.missingVariables : []
     error.matches = Array.isArray(result.matches) ? result.matches : []
     throw error
   }
@@ -534,6 +536,8 @@ function FutaPulseApp() {
   const handledNotificationIds = useRef(new Set())
   const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [settingsPage, setSettingsPage] = useState('menu')
+  const [cloudinaryCheck, setCloudinaryCheck] = useState(null)
+  const [cloudinaryCheckLoading, setCloudinaryCheckLoading] = useState(false)
   const [notifications, setNotifications] = useState(() => readStored('futapulse-notification-preferences', { reminders: true, updates: true }))
   const [notificationDeliveryStatus, setNotificationDeliveryStatus] = useState(null)
   const [notificationDeliveryPermission, setNotificationDeliveryPermission] = useState('checking')
@@ -2659,6 +2663,26 @@ function FutaPulseApp() {
     }
   }
 
+  const verifyCloudinaryConfiguration = async () => {
+    if (!session?.token || !isFutapulseAdmin) return
+    setCloudinaryCheckLoading(true)
+    setCloudinaryCheck(null)
+    try {
+      const result = await apiRequest('/api/admin/cloudinary/verify', {}, session.token)
+      setCloudinaryCheck(result)
+    } catch (error) {
+      setCloudinaryCheck({
+        configured: error.status === 502,
+        valid: false,
+        category: error.category || 'verification_failed',
+        missingVariables: error.missingVariables || [],
+        error: error.message || 'Unable to verify Cloudinary configuration right now.',
+      })
+    } finally {
+      setCloudinaryCheckLoading(false)
+    }
+  }
+
   const sendFeedback = async (event) => {
     event.preventDefault()
     const form = event.currentTarget
@@ -3409,6 +3433,7 @@ function FutaPulseApp() {
                   <button type="button" className="profile-option" onClick={toggleTheme}><Sparkles size={18} /><span>Switch Theme</span><b>{theme}</b></button>
                   <button type="button" className="profile-option" onClick={() => setSettingsPage('feedback')}><Heart size={18} /><span>Feedback &amp; Bug Report</span><ChevronRight size={18} /></button>
                   <button type="button" className="profile-option" onClick={() => setSettingsPage('about-policies')}><Shield size={18} /><span>About &amp; Policies</span><ChevronRight size={18} /></button>
+                  {isFutapulseAdmin && <button type="button" className="profile-option" onClick={() => { setCloudinaryCheck(null); setSettingsPage('cloudinary') }}><Image size={18} /><span>Image storage diagnostics</span><ChevronRight size={18} /></button>}
                   {isFutapulseAdmin && <button type="button" className="profile-option" onClick={() => setSettingsPage('event-reports')}><Shield size={18} /><span>Reported event review</span><b>{reportReviewCases.length}</b></button>}
                   <button type="button" className="profile-option profile-option-logout" onClick={logout}><LogOut size={18} /><span>Log Out</span><ChevronRight size={18} /></button>
                 </div>
@@ -3549,6 +3574,23 @@ function FutaPulseApp() {
                     <a className="profile-option profile-legal-link" href="/terms"><Shield size={18} /><span>Terms of Service</span><ChevronRight size={18} /></a>
                     <a className="profile-option profile-legal-link" href="/about"><Heart size={18} /><span>About &amp; Contact</span><ChevronRight size={18} /></a>
                   </div>
+                </>}
+                {settingsPage === 'cloudinary' && isFutapulseAdmin && <>
+                  <span className="explore-eyebrow">SERVER IMAGE STORAGE</span><h2>Cloudinary diagnostics</h2>
+                  <p className="options-detail-copy">Verify the API server can authenticate with Cloudinary. This check does not upload or change any images.</p>
+                  <button type="button" className="profile-edit-pill" disabled={cloudinaryCheckLoading} onClick={() => { void verifyCloudinaryConfiguration() }}>
+                    {cloudinaryCheckLoading ? 'Checking Cloudinary…' : 'Verify Cloudinary credentials'}
+                  </button>
+                  {cloudinaryCheckLoading && <p className="options-detail-copy" role="status">Checking the configured credentials with Cloudinary…</p>}
+                  {cloudinaryCheck?.valid && <p className="event-draft-status" role="status">Cloudinary credentials verified. The API server can authenticate successfully.</p>}
+                  {cloudinaryCheck && !cloudinaryCheck.valid && (
+                    <div className="form-error" role="alert">
+                      <p>{cloudinaryCheck.error || 'Cloudinary credentials could not be verified.'}</p>
+                      {cloudinaryCheck.missingVariables?.length > 0 && (
+                        <p>Missing Render environment variables: {cloudinaryCheck.missingVariables.join(', ')}.</p>
+                      )}
+                    </div>
+                  )}
                 </>}
                 {settingsPage === 'guidelines' && (
                   <>
