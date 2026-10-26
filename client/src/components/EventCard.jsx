@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Bell, Building2, CircleHelp, Clock3, ExternalLink, Flame, MapPin, Share2, TriangleAlert, X } from 'lucide-react'
 import CountdownPill from './CountdownPill'
+import { isPublicRecapVisible } from '../utils/eventVisibility'
 
 const categoryStyles = {
   tech: 'tech-badge',
@@ -102,6 +103,7 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
   const isHotEvent = isHot || event.isHot === true || Number(event.hotScore) >= 10
   const categoryClass = categoryStyles[category] || categoryStyles.social
   const categoryLabel = categoryLabels[category] || category.toUpperCase()
+  const isCancelled = event.status === 'Cancelled'
   const title = event.title || 'Untitled event'
   const organizer = event.organizerName || event.organizer?.name || 'Campus Organizer'
   const organizerPicture = event.organizerPicture || event.organizer?.picture || getFacultyLogoPath(event.organizerFaculty || event.faculty)
@@ -116,14 +118,8 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
   const bannerImages = Array.isArray(event.bannerImages)
     ? event.bannerImages.filter((image) => typeof image === 'string' && image)
     : []
-  const eventEndTimestamp = Date.parse(event.endTime || '')
-  const recapPublishedTimestamp = Date.parse(event.recapPublishedAt || '')
-  const recapWindowOpen = recapPhotos.length > 0
-    && Number.isFinite(eventEndTimestamp)
-    && currentTime >= eventEndTimestamp
-    && Number.isFinite(recapPublishedTimestamp)
-    && recapPublishedTimestamp <= currentTime
-    && currentTime - recapPublishedTimestamp <= 30 * 60_000
+  const recapWindowOpen = isPublicRecapVisible(event, currentTime)
+  const isRecapArchive = recapWindowOpen
   const recapPhoto = recapWindowOpen ? recapPhotos[recapPhotoIndex % recapPhotos.length] : null
   const bannerImage = bannerImages[recapPhotoIndex % Math.max(1, bannerImages.length)]
   const bannerSource = (typeof recapPhoto === 'string' ? recapPhoto : recapPhoto?.url)
@@ -131,7 +127,6 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
     || event.banner
     || event.image
     || ''
-  const isCancelled = event.status === 'Cancelled'
   const isBannerUnavailable = !bannerSource || unavailableBannerSource === bannerSource
   const description = event.activity || event.description || 'Event details will be announced soon.'
   const venue = event.venue || 'Venue to be announced'
@@ -287,7 +282,7 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
         {isHotEvent && <><Flame size={12} aria-hidden="true" /> HOT · </>}{categoryLabel}
       </span>
       {isCancelled && <div className="event-cancellation-notice" role="alert">⚠️ CANCELLATION NOTICE — This event has been called off.</div>}
-      {!isCancelled && event.isEnded && recapPhotos.length > 0 && <div className="event-recap-notice" role="status">Event recap is live · {recapPhotos.length} {recapPhotos.length === 1 ? 'photo' : 'photos'}</div>}
+      {isRecapArchive && <div className="event-recap-notice" role="status">Event recap is live · {recapPhotos.length} {recapPhotos.length === 1 ? 'photo' : 'photos'}</div>}
 
       <header className="card-header grid min-h-[98px] grid-cols-[76px_minmax(0,1fr)_76px] items-end gap-1 pt-7">
         <div className="organizer-info organizer-avatar-wrap flex w-[76px] shrink-0 flex-col items-center gap-1 text-center">
@@ -388,15 +383,15 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
 
         {meetingUrl && <a className="seminar-meeting-link" href={meetingUrl} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer"><ExternalLink size={16} aria-hidden="true" /><span>Join online seminar</span></a>}
 
-        <button
+        {!isRecapArchive && <button
           type="button"
           className="rounded-xl border border-slate-500/80 bg-slate-950/80 px-3 py-1.5 text-xs font-bold text-slate-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition hover:border-slate-300"
           onClick={() => setIsTurnoutOpen((open) => !open)}
           aria-expanded={isTurnoutOpen}
         >
           {attendeeCount} People are coming
-        </button>
-        {isTurnoutOpen && (
+        </button>}
+        {!isRecapArchive && isTurnoutOpen && (
           <section className="turnout-panel w-full rounded-2xl border border-slate-600/80 bg-slate-950/95 px-3 py-3 text-center shadow-lg transition-all duration-200">
             {departmentAttendees > 0 && (
               <div className="department-turnout-cloud" role="status">
@@ -420,7 +415,7 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
         )}
       </div>
 
-      <footer className="event-card-actions-grid">
+      {!isRecapArchive && <footer className="event-card-actions-grid">
         {readOnly || isCancelled ? (
           <div className="event-action-row event-action-row-share event-card-read-only-actions">
             {shareAction}
@@ -468,9 +463,9 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
             </button>
           </div>
         )}
-      </footer>
-      {showReminderNudge && <p id={`event-reminder-hint-${eventId}`} className="event-reminder-suggestion" role="status">Want a reminder? Tap Remind Me.</p>}
-      {shareFeedback && <p className="px-1 text-center text-xs text-cyan-200" role="status">{shareFeedback}</p>}
+      </footer>}
+      {!isRecapArchive && showReminderNudge && <p id={`event-reminder-hint-${eventId}`} className="event-reminder-suggestion" role="status">Want a reminder? Tap Remind Me.</p>}
+      {!isRecapArchive && shareFeedback && <p className="px-1 text-center text-xs text-cyan-200" role="status">{shareFeedback}</p>}
     </article>
     </>
   )

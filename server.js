@@ -287,13 +287,26 @@ function isWithinEventDisplayWindow(event, now = Date.now()) {
 }
 
 function isPublicRecapVisible(event, now = Date.now()) {
+  const eventEnd = new Date(event?.endTime || "").getTime();
   const publishedAt = new Date(event?.recapPublishedAt || "").getTime();
   return ["Published", "Live"].includes(event?.status)
+    && Number.isFinite(eventEnd)
+    && eventEnd <= now
     && Array.isArray(event?.recapPhotos)
     && event.recapPhotos.length > 0
     && Number.isFinite(publishedAt)
     && publishedAt <= now
     && now - publishedAt <= 30 * 60_000;
+}
+
+function eventAudienceMatchesLevel(event, level) {
+  if (isPublicRecapVisible(event) || !level) return true;
+  const rawAudience = Array.isArray(event?.audience)
+    ? event.audience
+    : String(event?.audience || "").split(",");
+  const audience = rawAudience.map((item) => String(item).trim().replace(/L$/i, ""));
+  if (audience.length === 0 || audience.includes("") || audience.includes("all")) return true;
+  return audience.includes(String(level).trim().replace(/L$/i, ""));
 }
 
 function toPublicEvent(event, viewerId = "") {
@@ -1045,6 +1058,7 @@ async function listStoredEvents(viewerId = "", onlyVisible = false) {
       { status: { $in: ["Published", "Live"] }, endsAt: { $gt: visibleEventStart } },
       {
         status: { $in: ["Published", "Live"] },
+        endsAt: { $lte: new Date(now) },
         "record.recapPhotos.0": { $exists: true },
         "record.recapPublishedAt": { $gte: new Date(now - (30 * 60_000)).toISOString(), $lte: new Date(now).toISOString() }
       }
@@ -2854,7 +2868,7 @@ app.get("/api/events", async (request, response) => {
         || isOwnerRecentCancellation
         || (["Published", "Live"].includes(event.status) && (isWithinEventDisplayWindow(event) || isPublicRecapVisible(event)));
     });
-    if (level) events = events.filter((event) => !event.audience || event.audience.includes("all") || event.audience.includes(level));
+    if (level) events = events.filter((event) => eventAudienceMatchesLevel(event, level));
     if (category && category !== "all") events = events.filter((event) => event.category === category);
     const hotEligibleUserCount = await getHotEligibleUserCount(database);
     events = events.map((event) => withHotStatus(event, hotEligibleUserCount));

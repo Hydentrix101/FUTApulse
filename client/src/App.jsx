@@ -9,6 +9,7 @@ import AdSlot from './components/AdSlot'
 import LaunchAdGate from './components/LaunchAdGate'
 import BrandHeart from './components/BrandHeart'
 import { API_BASE_URL, SOCKET_BASE_URL } from './config/api'
+import { isPublicRecapVisible, matchesProfileAudience } from './utils/eventVisibility'
 import { io } from 'socket.io-client'
 
 const EventCard = lazy(() => import('./components/EventCard'))
@@ -260,16 +261,6 @@ function isWithinEventDisplayWindow(event, now = Date.now()) {
     && endTime + (30 * 60 * 1000) > now
 }
 
-function isPublicRecapVisible(event, now = Date.now()) {
-  const publishedAt = Date.parse(event?.recapPublishedAt || '')
-  return ['Published', 'Live'].includes(event?.status)
-    && Array.isArray(event?.recapPhotos)
-    && event.recapPhotos.length > 0
-    && Number.isFinite(publishedAt)
-    && publishedAt <= now
-    && now - publishedAt <= 30 * 60_000
-}
-
 function formatEventTimeRange(event) {
   const start = new Date(getStartTime(event))
   const end = new Date(event.endTime)
@@ -280,12 +271,6 @@ function formatEventTimeRange(event) {
   const endDateLabel = end.toLocaleDateString([], { month: 'short', day: 'numeric' })
   const endLabel = end.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
   return `${dateLabel} · ${startLabel}–${dateLabel === endDateLabel ? endLabel : `${endDateLabel} · ${endLabel}`}`
-}
-
-function matchesProfileAudience(event, profile) {
-  if (!profile?.level) return true
-  const audience = Array.isArray(event.audience) ? event.audience : String(event.audience || 'all').split(',').map((item) => item.trim())
-  return audience.includes('all') || audience.includes(String(profile.level))
 }
 
 async function apiRequest(endpoint, options = {}, token = '') {
@@ -1308,6 +1293,7 @@ function FutaPulseApp() {
         const response = await fetch(`${API_BASE_URL}/api/events`, {
           headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
           signal: AbortSignal.timeout(20000),
+          cache: 'no-cache',
         })
         if (!response.ok) return
         const data = await response.json()
@@ -1320,7 +1306,7 @@ function FutaPulseApp() {
         // Keep the last confirmed feed snapshot if the periodic refresh fails.
       }
     }
-    const timer = window.setInterval(refreshFeed, 60_000)
+    const timer = window.setInterval(refreshFeed, 15_000)
     return () => {
       cancelled = true
       window.clearInterval(timer)
