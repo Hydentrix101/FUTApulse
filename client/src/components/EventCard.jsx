@@ -132,6 +132,7 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
   const venue = event.venue || 'Venue to be announced'
   const landmark = event.venueLandmark || 'Check with the student organizers for venue directions.'
   const meetingUrl = category === 'seminars' ? safeHttpUrl(event.meetingUrl) : ''
+  const infoUrl = safeHttpUrl(event.infoUrl)
   const eventId = event.id ?? event._id
   const attendeeCount = Number(event.turnoutCount ?? event.rsvpCount ?? event.attendeeCount) || 0
   const turnout = Array.isArray(event.turnoutBreakdown) ? event.turnoutBreakdown : []
@@ -382,6 +383,7 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
         )}
 
         {meetingUrl && <a className="seminar-meeting-link" href={meetingUrl} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer"><ExternalLink size={16} aria-hidden="true" /><span>Join online seminar</span></a>}
+        {infoUrl && <a className="seminar-meeting-link event-info-link" href={infoUrl} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer"><ExternalLink size={16} aria-hidden="true" /><span>More event info</span></a>}
 
         {!isRecapArchive && <button
           type="button"

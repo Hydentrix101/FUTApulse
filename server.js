@@ -174,6 +174,16 @@ function validateEvent(event) {
       return false;
     }
   }
+  const infoUrl = typeof event.infoUrl === "string" ? event.infoUrl.trim() : "";
+  if (infoUrl) {
+    if (infoUrl.length > 2048) return false;
+    try {
+      const parsedInfoUrl = new URL(infoUrl);
+      if (!["http:", "https:"].includes(parsedInfoUrl.protocol) || parsedInfoUrl.username || parsedInfoUrl.password) return false;
+    } catch {
+      return false;
+    }
+  }
   if (event.status === "Draft") return true;
   const requiredFields = ["title", "category", "activity", "date", "endTime", "venue", "organizerName"];
   const start = new Date(event.date).getTime();
@@ -3411,6 +3421,7 @@ app.post("/api/events", async (request, response) => {
       venue: typeof payload.venue === "string" ? payload.venue.trim().slice(0, 120) : "",
       venueLandmark: typeof payload.venueLandmark === "string" ? payload.venueLandmark.trim().slice(0, 240) : "",
       meetingUrl: typeof payload.meetingUrl === "string" ? payload.meetingUrl.trim() : "",
+      infoUrl: typeof payload.infoUrl === "string" ? payload.infoUrl.trim() : "",
       turnoutCount: typeof payload.turnoutCount === "number" ? payload.turnoutCount : (Number(payload.turnoutCount) || 0),
       turnoutBreakdown: Array.isArray(payload.turnoutBreakdown) ? payload.turnoutBreakdown : [],
       status: requestedStatus,
@@ -3486,6 +3497,7 @@ app.patch("/api/events/:eventId", async (request, response) => {
       venue: typeof changes.venue === "string" ? changes.venue.trim().slice(0, 120) : current.venue,
       venueLandmark: typeof changes.venueLandmark === "string" ? changes.venueLandmark.trim().slice(0, 240) : current.venueLandmark || "",
       meetingUrl: typeof changes.meetingUrl === "string" ? changes.meetingUrl.trim() : current.meetingUrl || "",
+      infoUrl: typeof changes.infoUrl === "string" ? changes.infoUrl.trim() : current.infoUrl || "",
       updatedAt: new Date().toISOString()
     };
     if (!["Draft", "Published", "Live"].includes(updated.status)) {

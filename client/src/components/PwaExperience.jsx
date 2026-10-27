@@ -108,7 +108,7 @@ export default function PwaExperience() {
   return (
     <aside className="pwa-prompts" aria-live="polite">
       {showInstall && (
-        <section className="pwa-prompt-card" aria-label="Install FUTApulse">
+        <section className="pwa-prompt-card" data-tour="pwa-install" aria-label="Install FUTApulse">
           <div className="pwa-prompt-icon"><Download size={19} aria-hidden="true" /></div>
           <div className="pwa-prompt-copy">
             <strong>Take FUTApulse with you</strong>

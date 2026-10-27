@@ -29,7 +29,7 @@ function createClientRequestId() {
 }
 
 function createEmptyEvent() {
-  return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', audience: [], status: 'Draft', banner: '', bannerImages: [], turnoutCount: 0, turnoutBreakdown: [] }
+  return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', infoUrl: '', audience: [], status: 'Draft', banner: '', bannerImages: [], turnoutCount: 0, turnoutBreakdown: [] }
 }
 
 function getEventId(event) {
@@ -272,7 +272,7 @@ function EventEditor({
   const [draftSyncing, setDraftSyncing] = useState(false)
   const [draftSyncError, setDraftSyncError] = useState('')
   const [bannerProcessing, setBannerProcessing] = useState(false)
-  const hasEditedRef = useRef(Boolean(event.id || form.title || form.category || form.activity || form.date || form.venue || form.meetingUrl || form.banner))
+  const hasEditedRef = useRef(Boolean(event.id || form.title || form.category || form.activity || form.date || form.venue || form.meetingUrl || form.infoUrl || form.banner))
   const onAutoSaveRef = useRef(onAutoSave)
   const draftSyncOnReconnectRef = useRef(null)
   const draftSyncQueueRef = useRef(Promise.resolve())
@@ -533,6 +533,7 @@ function EventEditor({
           <label htmlFor="event-venue">Venue</label><input id="event-venue" value={form.venue} onChange={(eventChange) => update('venue', eventChange.target.value)} maxLength={120} placeholder="e.g. LT1 / SEET Complex" required />
           <label htmlFor="event-landmark">Landmark &amp; directions <span className="optional-field-label">Optional</span></label><textarea id="event-landmark" rows={2} value={form.venueLandmark} onChange={(eventChange) => update('venueLandmark', eventChange.target.value)} maxLength={240} placeholder="Add a nearby landmark or directions students can follow" />
           {form.category === 'seminars' && <><label htmlFor="event-meeting-url">Online seminar link (optional)</label><input id="event-meeting-url" type="url" inputMode="url" autoComplete="url" maxLength={2048} value={form.meetingUrl || ''} onChange={(eventChange) => update('meetingUrl', eventChange.target.value)} placeholder="https://meet.google.com/..." /><small className="profile-edit-limit">Students can open this link from the full event card.</small></>}
+          <label htmlFor="event-info-url">More event info <span className="optional-field-label">Optional</span></label><input id="event-info-url" type="url" inputMode="url" autoComplete="url" maxLength={2048} value={form.infoUrl || ''} onChange={(eventChange) => update('infoUrl', eventChange.target.value)} placeholder="https://..." /><small className="profile-edit-limit">Add a page with registration, updates, or more details. Students can open it from the event card.</small>
           <label htmlFor="event-banner">Event banner (optional)</label>
           <input ref={bannerInput} id="event-banner" type="file" accept="image/*" multiple hidden onChange={async (eventChange) => {
             const files = Array.from(eventChange.target.files || [])

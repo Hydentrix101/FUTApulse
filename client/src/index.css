@@ -5065,3 +5065,27 @@ button {
 .theme-dark .notification-delivery-status h3,
 .theme-dark .notification-delivery-status strong { color: #f8fafc; }
 .theme-dark .notification-delivery-status .notification-delivery-error { color: #fca5a5; }
+.app-tour { position: fixed; inset: 0; z-index: 10000; pointer-events: none; }
+.app-tour-mask { position: fixed; z-index: 10000; background: rgba(3, 8, 20, .72); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); pointer-events: auto; }
+.app-tour-mask-top { inset: 0 0 auto; }
+.app-tour-mask-left { left: 0; }
+.app-tour-mask-right { right: 0; }
+.app-tour-mask-bottom { inset: auto 0 0; }
+.app-tour-mask-full { inset: 0; }
+.app-tour-spotlight { position: fixed; z-index: 10001; border: 2px solid rgba(125, 211, 252, .95); border-radius: 18px; box-shadow: 0 0 0 4px rgba(56, 189, 248, .18), 0 0 32px rgba(59, 130, 246, .45); pointer-events: none; transition: top .22s ease, left .22s ease, width .22s ease, height .22s ease; }
+.app-tour-spotlight.is-blocking { pointer-events: auto; }
+.app-tour-card { position: fixed; z-index: 10002; left: 50%; bottom: max(24px, env(safe-area-inset-bottom)); width: min(440px, calc(100vw - 32px)); padding: 24px; transform: translateX(-50%); border: 1px solid rgba(148, 163, 184, .35); border-radius: 24px; color: #f8fafc; background: linear-gradient(145deg, rgba(20, 30, 52, .96), rgba(8, 14, 29, .97)); box-shadow: 0 24px 80px rgba(0, 0, 0, .48), inset 0 1px rgba(255,255,255,.1); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); pointer-events: auto; }
+.app-tour-close { position: absolute; top: 14px; right: 14px; display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid rgba(148,163,184,.32); border-radius: 50%; color: #cbd5e1; background: rgba(51,65,85,.42); cursor: pointer; }
+.app-tour-eyebrow { display: block; margin-bottom: 9px; color: #7dd3fc; font-size: .7rem; font-weight: 900; letter-spacing: .14em; }
+.app-tour-card h2 { margin: 0 34px 8px 0; color: #f8fafc; font-size: 1.3rem; line-height: 1.2; }
+.app-tour-card p { margin: 0; color: #cbd5e1; font-size: .92rem; line-height: 1.55; }
+.app-tour-progress { display: flex; gap: 7px; margin: 20px 0 18px; }
+.app-tour-progress span { flex: 1; height: 4px; border-radius: 8px; background: rgba(148,163,184,.26); }
+.app-tour-progress span.is-active { background: linear-gradient(90deg, #38bdf8, #6366f1); }
+.app-tour-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.app-tour-controls > div { display: flex; align-items: center; gap: 9px; }
+.app-tour-skip, .app-tour-back, .app-tour-next { display: inline-flex; min-height: 40px; align-items: center; justify-content: center; gap: 5px; padding: 0 14px; border-radius: 12px; font-weight: 800; cursor: pointer; }
+.app-tour-skip, .app-tour-back { border: 1px solid rgba(148,163,184,.28); color: #cbd5e1; background: rgba(30,41,59,.62); }
+.app-tour-next { border: 0; color: white; background: linear-gradient(110deg, #2563eb, #4f46e5); box-shadow: 0 8px 22px rgba(37,99,235,.3); }
+.app-tour-controls button:focus-visible, .app-tour-close:focus-visible { outline: 3px solid #7dd3fc; outline-offset: 3px; }
+@media (max-height: 650px) { .app-tour-card { bottom: max(12px, env(safe-area-inset-bottom)); padding: 18px; } .app-tour-progress { margin: 12px 0; } }
