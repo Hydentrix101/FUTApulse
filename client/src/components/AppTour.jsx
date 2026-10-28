@@ -6,7 +6,7 @@ const STEPS = [
   { id: 'search', target: '.explore-search', eyebrow: 'STEP 2 OF 5', title: 'Find a specific event', description: 'Use Explore to search campus events by title or organizer.' },
   { id: 'reminders', target: '.reminders-content', eyebrow: 'STEP 3 OF 5', title: 'Keep track of what’s next', description: 'Events you’re anticipating and events you set reminders for are collected here.' },
   { id: 'create', target: '[data-tour="create-event"]', eyebrow: 'STEP 4 OF 5', title: 'Create a campus event', description: "Organizing a campus meetup? Use '+ Create Event' on your profile to publish it." },
-  { id: 'event-actions', target: '.home-full-feed-view .event-card-actions-grid', eyebrow: 'STEP 5 OF 5', title: 'Interact from the full event card', description: 'On a full event card, Hype it, mark that you’re coming, set a reminder, share it, or report an issue.' },
+  { id: 'event-actions', target: '.home-full-feed-view .event-card-actions-grid', eyebrow: 'STEP 5 OF 5', title: 'Interact from the full event card', description: 'Use Coming? to show you’re anticipating the event, set a reminder, share it, or report an issue.' },
 ]
 
 function saveCompletion() {

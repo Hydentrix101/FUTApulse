@@ -1577,36 +1577,6 @@ function FutaPulseApp() {
     if (!silent) notify(nextValue ? 'Event reminder saved.' : 'Event reminder removed.', nextValue ? 'success' : 'info')
   }, [reminderIds, remindEventIds, notify, queueEngagement, session])
 
-  const handleHype = useCallback(async (id) => {
-    const eventId = String(id)
-    if (!session?.token || !session?.user?.id) {
-      notify('Sign in to hype this event.', 'error')
-      return
-    }
-    if (!navigator.onLine) {
-      notify('Connect to the internet to hype this event. No change was made.', 'error')
-      return
-    }
-    if (onlineEngagementsInFlight.current.has(`hype:${eventId}`)) return
-    const event = events.find((item) => String(getEventId(item)) === eventId)
-    if (!event) return
-    const enabled = !event.isHyped
-    onlineEngagementsInFlight.current.add(`hype:${eventId}`)
-    try {
-      const result = await apiRequest(`/api/events/${encodeURIComponent(eventId)}/hype`, {
-        method: 'POST',
-        body: JSON.stringify({ enabled }),
-      }, session.token)
-      if (!result.event) throw new Error('The server did not confirm the event Hype.')
-      setEvents((current) => current.map((item) => String(getEventId(item)) === eventId ? { ...item, ...result.event, isHyped: enabled } : item))
-      notify(enabled ? 'You hyped this event!' : 'Your Hype was removed.', 'success')
-    } catch (error) {
-      notify(error.message || 'Unable to hype this event right now.', 'error')
-    } finally {
-      onlineEngagementsInFlight.current.delete(`hype:${eventId}`)
-    }
-  }, [events, notify, session])
-
   const handleRsvp = useCallback(async (id) => {
     if (id === undefined || id === null) return
     const eventId = String(id)
@@ -2975,7 +2945,7 @@ function FutaPulseApp() {
                         : listedEvents
                       return fullEvents.length ? <>{fullEvents.slice(0, visibleFullFeedCount).map((event, index) => <Fragment key={getEventId(event)}>
                         <div id={`home-full-event-${getEventId(event)}`} className={`home-full-event-anchor ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''} ${String(getEventId(event)) === highlightedNotificationEventId ? 'is-notification-highlighted' : ''}`}>
-                          <LazyEventCard isHot={event.isHot === true} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id) => handleRsvp(id)} onHype={(id) => handleHype(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
+                          <LazyEventCard isHot={event.isHot === true} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
                         </div>
                         {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <AdSlot placement="category-full-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
                       </Fragment>)}{visibleFullFeedCount < fullEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleFullFeedCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more events</button>}</> : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon">◌</span><strong>No events in this section yet</strong><span>Try another category to explore campus activity.</span></div><AdSlot placement="category-empty-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} /></>
@@ -3105,7 +3075,6 @@ function FutaPulseApp() {
                             viewerProfile={profile}
                             onView={recordEventView}
                             onComing={(id) => handleRsvp(id)}
-                            onHype={(id) => handleHype(id)}
                             onRemind={(id) => setReminderTarget(String(id))}
                             onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }}
                           />
@@ -3132,7 +3101,6 @@ function FutaPulseApp() {
                             viewerProfile={profile}
                             onView={recordEventView}
                             onComing={(id) => handleRsvp(id)}
-                            onHype={(id) => handleHype(id)}
                             onRemind={(id) => setReminderTarget(String(id))}
                             onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }}
                           />
@@ -3479,7 +3447,6 @@ function FutaPulseApp() {
               readOnly={isGuestSharedView}
               onView={recordEventView}
               onComing={(id) => handleRsvp(id)}
-              onHype={(id) => handleHype(id)}
               onRemind={(id) => setReminderTarget(String(id))}
               onReport={() => { setReportTarget(detailEvent); setReportReason('inappropriate'); setReportDetails('') }}
             />
