@@ -1,6 +1,6 @@
 import { Fragment, lazy, startTransition, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Bell, Building2, Check, ChevronLeft, ChevronRight, Clock3, Download, Eye, EyeOff, Flame, Heart, Home, Image, LogOut,
+  Bell, Building2, Check, ChevronLeft, ChevronRight, Clock3, Download, Eye, EyeOff, Heart, Home, Image, LogOut,
   MapPin, Search, Shield, Sparkles, Trash2, User, X,
 } from 'lucide-react'
 import AuthScreen from './components/AuthScreen'
@@ -422,6 +422,8 @@ function App() {
     '/privacy': 'privacy',
     '/terms': 'terms',
     '/about': 'about',
+    '/guidelines': 'guidelines',
+    '/contact': 'contact',
   }
 
   if (legalPages[pathname]) return <LegalPage page={legalPages[pathname]} />
@@ -457,7 +459,7 @@ function FutaPulseApp() {
     return requestedTab
   })
   const [appTourOpen, setAppTourOpen] = useState(false)
-  const appTourAutoStarted = useRef(false)
+  const appTourAutoStarted = useRef('')
   const tabHistoryRef = useRef([])
   const lastTrackedTabRef = useRef(activeTab)
   const backGuardIdRef = useRef('')
@@ -692,11 +694,37 @@ function FutaPulseApp() {
     }
   }, [])
 
+  const completeAppTour = useCallback(async () => {
+    if (!session?.token || !user?.id) throw new Error('Sign in again to save your tour progress to your account.')
+    try {
+      const result = await apiRequest('/api/auth/tour/complete', { method: 'POST' }, session.token)
+      if (result.hasCompletedTour !== true) throw new Error('The server did not confirm your tour progress.')
+      const nextProfile = { ...(profile || {}), hasCompletedTour: true }
+      const updatedUser = { ...user, profile: nextProfile }
+      setProfile(nextProfile)
+      setUser(updatedUser)
+      setSession((current) => current ? { ...current, user: updatedUser } : current)
+    } catch (error) {
+      notify(error.message || 'Could not save your tour progress. Please try again.', 'error')
+      throw error
+    }
+  }, [notify, profile, session, user])
+
   useEffect(() => {
-    if (appTourAutoStarted.current || sessionLoading || !user || !profile || !launchSequenceReady || isLaunchAdActive
+    if (sessionLoading || !user || !profile || !launchSequenceReady || isLaunchAdActive
       || shouldShowCategoryPreferences || guidelinesOpen || profileOpen || eventEditor || detailEvent || isGuestSharedView) return
-    appTourAutoStarted.current = true
-    if (readStoredValue('futapulse_tour_completed') !== 'true') setAppTourOpen(true)
+    const accountKey = String(user.id || user.username)
+    if (appTourAutoStarted.current === accountKey) return
+    appTourAutoStarted.current = accountKey
+    if (profile.hasCompletedTour === true) {
+      safeSetStored('hasCompletedTour', 'true')
+      safeSetStored('futapulse_tour_completed', 'true')
+      safeSetStored(`hasCompletedTour:${encodeURIComponent(accountKey)}`, 'true')
+      return
+    }
+    if (readStoredValue(`hasCompletedTour:${encodeURIComponent(accountKey)}`) === 'true') return
+    const timer = window.setTimeout(() => setAppTourOpen(true), 0)
+    return () => window.clearTimeout(timer)
   }, [sessionLoading, user, profile, launchSequenceReady, isLaunchAdActive, shouldShowCategoryPreferences, guidelinesOpen, profileOpen, eventEditor, detailEvent, isGuestSharedView])
 
   useEffect(() => () => {
@@ -718,6 +746,8 @@ function FutaPulseApp() {
     localStorage.removeItem('futapulse-remembered-username')
     localStorage.removeItem('futapulse-profile')
     sessionStorage.removeItem('futapulse-auth-session')
+    appTourAutoStarted.current = ''
+    setAppTourOpen(false)
     setSession(null)
     setUser(null)
     setProfile(null)
@@ -1367,6 +1397,7 @@ function FutaPulseApp() {
           : [...current, shared]))
       }).catch((error) => {
         console.warn('Unable to restore the shared event link.', error)
+        notify(error.message || 'The shared event could not be loaded. Check your connection and try again.', 'error')
       }).finally(() => {
         if (fetchingSharedEventId.current === requestedEventId) fetchingSharedEventId.current = ''
       })
@@ -1398,7 +1429,7 @@ function FutaPulseApp() {
       }
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [events, activeTab, session?.token])
+  }, [events, activeTab, session?.token, notify])
 
   useEffect(() => {
     if (activeTab !== 'reminders') return undefined
@@ -2860,6 +2891,8 @@ function FutaPulseApp() {
           </div>
         </header>
 
+        {!networkOnline && <div className="offline-toast-banner" role="status" aria-live="polite"><span aria-hidden="true">⌁</span>You are offline. Showing cached FUTApulse events</div>}
+
         <main className="app-main">
           {isGuestSharedView && (
             <section className="public-feed-intro" aria-labelledby="public-feed-title">
@@ -2909,7 +2942,7 @@ function FutaPulseApp() {
                           ? <div className="home-event-track">{category.events.slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-category-preview" event={event} onView={recordEventView} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
                           : <div className="home-category-empty-track"><div className="home-category-empty-card"><span className="home-category-empty-mark"><Sparkles size={18} aria-hidden="true" /></span><strong>No {category.label} events yet</strong><span>Check back as campus events are added.</span></div></div>}
                       </section>
-                      {(categoryIndex + 1) % 2 === 0 && <AdSlot placement="home-category-pairs" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
+                      {(categoryIndex + 1) % 2 === 0 && (category.events.length > 0 || homeCategories[categoryIndex - 1]?.events.length > 0) && <AdSlot placement="home-category-pairs" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
                       </Fragment>
                     ))}
                   </div>
@@ -2948,7 +2981,7 @@ function FutaPulseApp() {
                           <LazyEventCard isHot={event.isHot === true} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
                         </div>
                         {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <AdSlot placement="category-full-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
-                      </Fragment>)}{visibleFullFeedCount < fullEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleFullFeedCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more events</button>}</> : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon">◌</span><strong>No events in this section yet</strong><span>Try another category to explore campus activity.</span></div><AdSlot placement="category-empty-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} /></>
+                      </Fragment>)}{visibleFullFeedCount < fullEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleFullFeedCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more events</button>}</> : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon"><Search size={30} aria-hidden="true" /></span><strong>No Upcoming Events in this Category</strong><span>Try another category to explore campus activity.</span></div></>
                       })()}
                   </section>
                 )}
@@ -3025,7 +3058,7 @@ function FutaPulseApp() {
                     </div>
                     {visibleSearchCount < searchEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleSearchCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more results</button>}
                     </>
-                  ) : <p className="explore-search-empty">{loadError || `No events or organizers match “${search.trim()}”. Try another keyword.`}</p>}
+                  ) : <div className="explore-search-empty" role="status"><Search size={28} aria-hidden="true" /><strong>{loadError ? 'Unable to Search Events' : 'No Search Results Found'}</strong><span>{loadError || `No events or organizers match “${search.trim()}”. Try another keyword.`}</span></div>}
                   {loadError && searchEvents.length > 0 && <p className="feed-error" role="status">Showing saved events while offline.</p>}
                 </section>
               )}
@@ -3114,7 +3147,7 @@ function FutaPulseApp() {
               ) : (
                 <div className="reminders-empty-state">
                   <Sparkles size={34} className="reminders-empty-icon" />
-                  <h2>No event plans yet</h2>
+                  <h2>No Saved Reminders Yet</h2>
                   <p>Mark an event Coming or set a reminder to keep it here.</p>
                   <button type="button" className="reminders-explore-btn" onClick={() => switchTab('search')}>Explore events</button>
                 </div>
@@ -3273,10 +3306,11 @@ function FutaPulseApp() {
 
         <footer className="app-legal-footer">
           <span>FUTApulse · Built for campus life</span>
-          <nav aria-label="Legal and information links">
-            <a href="/privacy">Privacy</a>
-            <a href="/terms">Terms</a>
-            <a href="/about">About &amp; Contact</a>
+          <nav aria-label="Legal and support links">
+            <a href="/privacy">Privacy Policy</a>
+            <a href="/terms">Terms of Service</a>
+            <a href="/guidelines">Community Guidelines</a>
+            <a href="/contact">Contact Support</a>
           </nav>
         </footer>
 
@@ -3360,10 +3394,10 @@ function FutaPulseApp() {
             </div>
             <div className="category-preferences-actions">
               {profile?.notificationPreferencesOnboardingComplete && <button type="button" className="profile-edit-pill" onClick={() => setCategoryPreferencesOpen(false)}>Cancel</button>}
-              <button type="button" className="setup-submit" disabled={categoryPreferencesSaving} onClick={() => { void saveCategoryPreferences(categoryPreferences) }}>
+              <button type="button" className="profile-edit-pill" disabled={categoryPreferencesSaving} onClick={() => { void saveCategoryPreferences(categoryPreferences) }}>
                 {categoryPreferencesSaving ? 'Saving…' : 'Save interests'} <span>→</span>
               </button>
-              <button type="button" className="category-enable-notifications" disabled={categoryPreferencesSaving} onClick={() => {
+              <button type="button" className="setup-submit category-enable-notifications" disabled={categoryPreferencesSaving} onClick={() => {
                 const permissionRequest = requestBrowserNotificationPermission()
                 void saveCategoryPreferences(categoryPreferences, permissionRequest)
               }}>Save &amp; enable device alerts</button>
@@ -3620,7 +3654,8 @@ function FutaPulseApp() {
                   <div className="profile-options-list">
                     <a className="profile-option profile-legal-link" href="/privacy"><Shield size={18} /><span>Privacy Policy</span><ChevronRight size={18} /></a>
                     <a className="profile-option profile-legal-link" href="/terms"><Shield size={18} /><span>Terms of Service</span><ChevronRight size={18} /></a>
-                    <a className="profile-option profile-legal-link" href="/about"><Heart size={18} /><span>About &amp; Contact</span><ChevronRight size={18} /></a>
+                    <a className="profile-option profile-legal-link" href="/guidelines"><Shield size={18} /><span>Community Guidelines</span><ChevronRight size={18} /></a>
+                    <a className="profile-option profile-legal-link" href="/contact"><Heart size={18} /><span>Contact Support</span><ChevronRight size={18} /></a>
                   </div>
                 </>}
                 {settingsPage === 'cloudinary' && isFutapulseAdmin && <>
@@ -3726,7 +3761,7 @@ function FutaPulseApp() {
           onSave={saveEvent}
         /></Suspense>
       )}
-      {appTourOpen && <AppTour onClose={() => setAppTourOpen(false)} onStepChange={handleTourStepChange} />}
+      {appTourOpen && <AppTour accountKey={encodeURIComponent(String(user?.id || user?.username || ''))} onComplete={completeAppTour} onClose={() => setAppTourOpen(false)} onStepChange={handleTourStepChange} />}
       {facultyLogoOpen && (
         <div
           className="faculty-logo-viewer-backdrop"
@@ -3777,7 +3812,7 @@ function CommunityGuidelines() {
 }
 
 function LegalPage({ page }) {
-  const title = page === 'privacy' ? 'Privacy Policy' : page === 'terms' ? 'Terms of Service' : 'About FUTApulse'
+  const title = page === 'privacy' ? 'Privacy Policy' : page === 'terms' ? 'Terms of Service' : page === 'guidelines' ? 'Community Guidelines' : page === 'contact' ? 'Contact Support' : 'About FUTApulse'
   return (
     <div className="legal-page-shell">
       <main className="legal-page-panel">
@@ -3829,11 +3864,26 @@ function LegalPage({ page }) {
             <p>For event-specific concerns, use the report action on the event card so the report is attached to the relevant listing.</p>
           </>
         )}
+        {page === 'guidelines' && (
+          <>
+            <p>FUTApulse is for sharing accurate, relevant campus events and helping students plan safely.</p>
+            <CommunityGuidelines />
+            <p>Use the report action on an event card to alert the team about a specific listing. Reports are reviewed and may result in content removal or posting restrictions.</p>
+          </>
+        )}
+        {page === 'contact' && (
+          <>
+            <p>Contact the FUTApulse team for account help, privacy requests, accessibility feedback, or service issues.</p>
+            <p><a href="mailto:futapulse.ng@gmail.com">Email FUTApulse Support</a></p>
+            <p>For concerns about a specific event, use the report action on its event card so the report includes the relevant listing.</p>
+          </>
+        )}
         <div className="legal-page-actions">
           <a href="/">Back to FUTApulse</a>
-          {page !== 'privacy' && <a href="/privacy">Privacy</a>}
-          {page !== 'terms' && <a href="/terms">Terms</a>}
-          {page !== 'about' && <a href="/about">About</a>}
+          {page !== 'privacy' && <a href="/privacy">Privacy Policy</a>}
+          {page !== 'terms' && <a href="/terms">Terms of Service</a>}
+          {page !== 'guidelines' && <a href="/guidelines">Community Guidelines</a>}
+          {page !== 'contact' && <a href="/contact">Contact Support</a>}
         </div>
       </main>
     </div>

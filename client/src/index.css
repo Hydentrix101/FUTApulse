@@ -3675,6 +3675,54 @@ button {
 .theme-dark .category-preferences-note { color: #cbd5e1; }
 .theme-dark .category-preference-row { border-color: rgba(148, 163, 184, 0.22); background: rgba(30, 41, 59, 0.8); }
 .theme-dark .category-enable-notifications { border-color: rgba(96, 165, 250, 0.5); color: #bfdbfe; background: rgba(30, 58, 138, 0.3); }
+.category-preferences-actions .category-enable-notifications {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 1px solid #1d4ed8;
+  color: #fff;
+  background: linear-gradient(120deg, #2563eb, #4f46e5);
+  box-shadow: 0 8px 20px rgba(37, 99, 235, 0.28);
+  font-size: 0.79rem;
+}
+.category-preferences-actions .category-enable-notifications:hover:not(:disabled) { filter: brightness(1.08); }
+.category-preferences-actions .category-enable-notifications:disabled { cursor: wait; opacity: 0.68; }
+.theme-dark .category-preferences-actions .category-enable-notifications { border-color: #60a5fa; color: #fff; background: linear-gradient(120deg, #2563eb, #4f46e5); }
+
+.offline-toast-banner {
+  position: sticky;
+  z-index: 70;
+  top: 58px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 14px;
+  color: #fff;
+  background: #9a3412;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.2);
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-align: center;
+}
+.offline-toast-banner span { font-size: 1.15rem; line-height: 1; }
+
+.explore-search-empty {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 24px 16px;
+  color: #1e293b;
+  background: #f8fafc;
+  text-align: center;
+}
+.explore-search-empty > svg { color: #1d4ed8; }
+.explore-search-empty strong { font-size: 0.92rem; }
+.explore-search-empty span { font-size: 0.82rem; line-height: 1.5; }
+.theme-dark .explore-search-empty { color: #f8fafc; background: #111827; }
+.theme-dark .explore-search-empty > svg { color: #93c5fd; }
+
+.app-tour-error { padding: 9px 11px; border: 1px solid rgba(239, 68, 68, 0.45); border-radius: 10px; color: #991b1b; background: #fef2f2; font-size: 0.78rem; }
+.theme-dark .app-tour-error { color: #fecaca; background: rgba(127, 29, 29, 0.35); }
 
 .feedback-tabs {
   display: grid;

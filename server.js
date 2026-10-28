@@ -3,8 +3,12 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const http = require("node:http");
 const express = require("express");
+require("express-async-errors");
 const cors = require("cors");
 const compression = require("compression");
+const helmet = require("helmet");
+const { rateLimit } = require("express-rate-limit");
+const morgan = require("morgan");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
@@ -33,7 +37,14 @@ const DEFAULT_FRONTEND_URL = process.env.NODE_ENV === "production"
   ? "https://fut-apulse.vercel.app"
   : "http://localhost:5173";
 const FRONTEND_URL = String(process.env.FRONTEND_URL || DEFAULT_FRONTEND_URL).replace(/\/$/, "");
-const CORS_ORIGINS = String(process.env.CORS_ORIGIN || FRONTEND_URL).split(",").map((origin) => origin.trim()).filter(Boolean);
+const CORS_ORIGINS = [...new Set([
+  FRONTEND_URL,
+  "https://fut-apulse.vercel.app",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173"
+].map((value) => {
+  try { return new URL(value).origin; } catch { return ""; }
+}).filter(Boolean))];
 // GIS popup code flow must exchange the code using the requesting app origin.
 // Keep this default for non-browser flows, but select the allowlisted request
 // origin for each popup exchange below.
@@ -1037,6 +1048,13 @@ function isMongoConnected() {
   return mongoose.connection.readyState === 1;
 }
 
+mongoose.connection.on("disconnected", () => {
+  if (databaseBackend === "mongodb") console.error("MongoDB connection dropped; API requests will return a temporary service error until it reconnects.");
+});
+mongoose.connection.on("error", (error) => {
+  console.error("MongoDB connection error.", error.message || "Database connection unavailable.");
+});
+
 function buildFacultyTurnoutBreakdown(attendees, facultyByUserId = new Map()) {
   const turnoutBreakdown = new Map();
   for (const action of attendees) {
@@ -1333,6 +1351,7 @@ function normalizeUser(user) {
     },
     profile: {
       ...profile,
+      hasCompletedTour: profile.hasCompletedTour === true,
       notificationPreferences: normalizeNotificationPreferences(profile.notificationPreferences),
       notificationPreferencesOnboardingComplete: profile.notificationPreferencesOnboardingComplete === true
     }
@@ -1819,14 +1838,33 @@ async function createUser(user) {
 const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo";
 
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" }
+}));
+if (process.env.NODE_ENV === "production") app.use(morgan("combined"));
 app.use(compression());
 app.use(cors({
-  origin: CORS_ORIGINS,
+  origin(origin, callback) {
+    if (!origin || CORS_ORIGINS.includes(origin)) return callback(null, true);
+    const error = new Error("This website is not allowed to access the FUTApulse API.");
+    error.status = 403;
+    return callback(error);
+  },
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-FUTApulse-OAuth-Request"],
   credentials: true
 }));
 app.use(express.json({ limit: "4mb" }));
+
+const authRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "Too many sign-in attempts. Please wait a few minutes and try again." }
+});
 
 app.get("/api/health", (request, response) => {
   const missingCloudinaryVariables = getMissingCloudinaryVariables();
@@ -2194,7 +2232,8 @@ app.post("/api/profile/setup", async (request, response) => {
       picture: typeof body.picture === "string" ? body.picture : "",
       communityGuidelinesAcceptedAt: user.profile?.communityGuidelinesAcceptedAt || null,
       notificationPreferences: normalizeNotificationPreferences(user.profile?.notificationPreferences),
-      notificationPreferencesOnboardingComplete: user.profile?.notificationPreferencesOnboardingComplete === true
+      notificationPreferencesOnboardingComplete: user.profile?.notificationPreferencesOnboardingComplete === true,
+      hasCompletedTour: user.profile?.hasCompletedTour === true
     };
     if (!validateProfile(profile)) {
       return response.status(400).json({ error: "Complete your faculty, department, level, and role." });
@@ -2286,7 +2325,8 @@ app.patch("/api/auth/profile", async (request, response) => {
       picture: typeof profileWithUsername.picture === "string" ? profileWithUsername.picture : "",
       communityGuidelinesAcceptedAt: user.profile?.communityGuidelinesAcceptedAt || null,
       notificationPreferences: normalizeNotificationPreferences(user.profile?.notificationPreferences),
-      notificationPreferencesOnboardingComplete: user.profile?.notificationPreferencesOnboardingComplete === true
+      notificationPreferencesOnboardingComplete: user.profile?.notificationPreferencesOnboardingComplete === true,
+      hasCompletedTour: user.profile?.hasCompletedTour === true
     };
     if (isMongoConnected()) {
       user.profile = savedProfile;
@@ -2501,6 +2541,29 @@ app.post("/api/auth/guidelines/accept", async (request, response) => {
   }
 });
 
+app.post("/api/auth/tour/complete", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in before saving your tour progress." });
+    const profile = { ...(user.profile || {}), hasCompletedTour: true };
+    if (isMongoConnected()) {
+      user.profile = profile;
+      await user.save();
+    } else {
+      const database = readDatabase();
+      const storedUser = database.users.find((item) => item.id === user.id);
+      if (!storedUser) return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
+      storedUser.profile = profile;
+      writeDatabase(database);
+    }
+    return response.json({ hasCompletedTour: true });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Your session expired. Sign in again." });
+    console.error("App tour completion could not be saved.", error);
+    return response.status(500).json({ error: "Unable to save your onboarding progress right now." });
+  }
+});
+
 app.post("/api/feedback", async (request, response) => {
   try {
     const user = await getAuthenticatedUser(request);
@@ -2534,7 +2597,7 @@ app.post("/api/feedback", async (request, response) => {
   }
 });
 
-app.post("/api/auth/signup", async (request, response) => {
+app.post("/api/auth/signup", authRateLimit, async (request, response) => {
   const body = request.body || {};
   const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
   const displayName = typeof body.username === "string" ? body.username.trim() : "";
@@ -2560,7 +2623,7 @@ app.post("/api/auth/signup", async (request, response) => {
   }
 });
 
-app.post("/api/auth/signup/verify", async (request, response) => {
+app.post("/api/auth/signup/verify", authRateLimit, async (request, response) => {
   const email = typeof request.body?.email === "string" ? request.body.email.trim().toLowerCase() : "";
   const code = typeof request.body?.code === "string" ? request.body.code.trim() : "";
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(code)) {
@@ -2605,7 +2668,7 @@ app.post("/api/auth/signup/verify", async (request, response) => {
   }
 });
 
-app.post("/api/auth/login", async (request, response) => {
+app.post("/api/auth/login", authRateLimit, async (request, response) => {
   const body = request.body || {};
   const username = normalizeUsername(body.username);
   const password = typeof body.password === "string" ? body.password : "";
@@ -4193,10 +4256,23 @@ app.get("/", (request, response) => {
   return response.sendFile(clientEntry);
 });
 app.use((error, request, response, next) => {
+  if (response.headersSent) return next(error);
   if (error instanceof SyntaxError && "body" in error) return response.status(400).json({ error: "Request body must be valid JSON." });
 
   console.error("Unhandled API error.", error);
-  return response.status(500).json({ error: "Internal server error." });
+  const status = Number(error.status || error.statusCode);
+  const databaseUnavailable = databaseBackend === "mongodb" && !isMongoConnected();
+  const safeStatus = databaseUnavailable ? 503 : Number.isInteger(status) && status >= 400 && status < 500 ? status : 500;
+  const message = databaseUnavailable
+    ? "FUTApulse is temporarily disconnected from its cloud database. Please retry shortly."
+    : safeStatus === 403
+    ? "This website is not allowed to access the FUTApulse API."
+    : safeStatus === 429
+      ? "Too many requests. Please wait a moment and try again."
+      : safeStatus >= 500
+        ? "FUTApulse is temporarily unavailable. Please try again shortly."
+        : error.message || "The request could not be completed.";
+  return response.status(safeStatus).json({ error: message });
 });
 
 async function startServer() {

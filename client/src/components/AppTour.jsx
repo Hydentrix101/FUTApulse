@@ -9,13 +9,19 @@ const STEPS = [
   { id: 'event-actions', target: '.home-full-feed-view .event-card-actions-grid', eyebrow: 'STEP 5 OF 5', title: 'Interact from the full event card', description: 'Use Coming? to show you’re anticipating the event, set a reminder, share it, or report an issue.' },
 ]
 
-function saveCompletion() {
-  try { localStorage.setItem('futapulse_tour_completed', 'true') } catch { /* Storage may be disabled. */ }
+function saveCompletion(accountKey) {
+  try {
+    localStorage.setItem('hasCompletedTour', 'true')
+    localStorage.setItem('futapulse_tour_completed', 'true')
+    if (accountKey) localStorage.setItem(`hasCompletedTour:${accountKey}`, 'true')
+  } catch { /* Storage may be disabled. */ }
 }
 
-export default function AppTour({ onClose, onStepChange }) {
+export default function AppTour({ onClose, onComplete, onStepChange, accountKey }) {
   const [index, setIndex] = useState(0)
   const [targetRect, setTargetRect] = useState(null)
+  const [completionError, setCompletionError] = useState('')
+  const [finishing, setFinishing] = useState(false)
   const step = STEPS[index]
 
   const measureTarget = useCallback(() => {
@@ -44,14 +50,21 @@ export default function AppTour({ onClose, onStepChange }) {
       window.removeEventListener('resize', measureTarget)
       window.removeEventListener('scroll', measureTarget, true)
     }
-  }, [measureTarget, onStepChange, step.id])
+  }, [measureTarget, onStepChange, step.id, step.target])
 
-  const finish = () => { saveCompletion(); onClose() }
-  const next = () => {
-    if (index === STEPS.length - 1) finish()
-    else setIndex((current) => current + 1)
+  const finish = async () => {
+    if (finishing) return
+    setFinishing(true)
+    setCompletionError('')
+    try {
+      await onComplete?.()
+      saveCompletion(accountKey)
+      onClose()
+    } catch (error) {
+      setCompletionError(error.message || 'Could not save your tour progress. Please try again.')
+      setFinishing(false)
+    }
   }
-
   return (
     <div className="app-tour" role="presentation">
       {targetRect ? <>
@@ -62,18 +75,19 @@ export default function AppTour({ onClose, onStepChange }) {
         <div className={`app-tour-spotlight${step.id === 'create' ? ' is-blocking' : ''}`} style={{ top: targetRect.top - 8, left: targetRect.left - 8, width: targetRect.right - targetRect.left + 16, height: targetRect.bottom - targetRect.top + 16 }} />
       </> : <div className="app-tour-mask app-tour-mask-full" />}
       <section className={`app-tour-card${targetRect ? ' has-target' : ''}`} role="dialog" aria-modal="true" aria-labelledby="app-tour-title">
-        <button type="button" className="app-tour-close" aria-label="Skip app tour" onClick={finish}><X size={18} /></button>
+        <button type="button" className="app-tour-close" aria-label="Skip app tour" disabled={finishing} onClick={() => { void finish() }}><X size={18} /></button>
         <span className="app-tour-eyebrow">{step.eyebrow}</span>
         <h2 id="app-tour-title">{step.title}</h2>
         <p>{step.description}</p>
+        {completionError && <p className="app-tour-error" role="alert">{completionError}</p>}
         <div className="app-tour-progress" aria-label={`Step ${index + 1} of ${STEPS.length}`}>
           {STEPS.map((item, itemIndex) => <span key={item.id} className={itemIndex <= index ? 'is-active' : ''} />)}
         </div>
         <div className="app-tour-controls">
-          <button type="button" className="app-tour-skip" onClick={finish}>Skip</button>
+          <button type="button" className="app-tour-skip" disabled={finishing} onClick={() => { void finish() }}>Skip</button>
           <div>
-            {index > 0 && <button type="button" className="app-tour-back" onClick={() => setIndex((current) => current - 1)}><ChevronLeft size={16} /> Back</button>}
-            <button type="button" className="app-tour-next" onClick={next}>{index === STEPS.length - 1 ? 'Done' : 'Next'} {index < STEPS.length - 1 && <ChevronRight size={16} />}</button>
+            {index > 0 && <button type="button" className="app-tour-back" disabled={finishing} onClick={() => setIndex((current) => current - 1)}><ChevronLeft size={16} /> Back</button>}
+            <button type="button" className="app-tour-next" disabled={finishing} onClick={() => { if (index === STEPS.length - 1) void finish(); else setIndex((current) => current + 1) }}>{finishing ? 'Saving…' : index === STEPS.length - 1 ? 'Done' : 'Next'} {index < STEPS.length - 1 && <ChevronRight size={16} />}</button>
           </div>
         </div>
       </section>
