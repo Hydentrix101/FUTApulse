@@ -313,7 +313,7 @@ async function apiRequest(endpoint, options = {}, token = '') {
   return result
 }
 
-function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp, onView, homeVariant = '' }) {
+function EventPreview({ event, onOpen, onView, homeVariant = '' }) {
   const previewRef = useRef(null)
   const category = CATEGORY_DATA.find((item) => item.id === event.category)
   const [avatarFailed, setAvatarFailed] = useState(false)
@@ -326,8 +326,6 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
   const bannerFailed = failedBannerSource === bannerSource
   const fallback = `/Faculty%20Logo/${encodeURIComponent(event.organizerFaculty || event.faculty || 'SEET')}.png`
   const eventId = getEventId(event)
-  const eventHyped = Boolean(hyped ?? event.isHyped)
-  const eventReminded = Boolean(reminded ?? event.isReminded)
 
   useEffect(() => {
     if (bannerImages.length < 2) return undefined
@@ -379,14 +377,6 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
           <h3 className="preview-title">{event.title}</h3>
           <span className="home-category-venue"><MapPin size={11} /> {event.venue || 'Venue TBA'}</span>
           <p className="home-category-attendance">People coming: <strong>{Number(event.turnoutCount ?? event.attendeeCount ?? event.rsvpCount) || 0}</strong></p>
-          <div className="preview-actions" aria-label="Event actions">
-            <button type="button" className={`preview-action hype ${eventHyped ? 'is-active' : ''}`} disabled={eventHyped} aria-label={eventHyped ? 'Event hyped' : 'Hype event'} aria-pressed={eventHyped} onClick={(clickEvent) => { clickEvent.stopPropagation(); onHype?.() }}>
-              <Flame size={15} aria-hidden="true" /> <span>{Number(event.flameCount ?? event.hypeCount) || 0}</span>
-            </button>
-            <button type="button" className={`preview-action reminder ${eventReminded ? 'is-active' : ''}`} aria-label={eventReminded ? 'Turn reminder off' : 'Turn reminder on'} aria-pressed={eventReminded} onClick={(clickEvent) => { clickEvent.stopPropagation(); onRemind?.() }}>
-              <Bell size={14} aria-hidden="true" />
-            </button>
-          </div>
         </>
       ) : <>
       <span className="preview-category-badge">{category?.label || String(event.category || 'EVENT').toUpperCase()}</span>
@@ -419,17 +409,6 @@ function EventPreview({ event, reminded, hyped, onOpen, onHype, onRemind, onRsvp
           <span className="preview-location"><MapPin size={12} /> {event.venue || 'Venue TBA'}</span>
           <span className="preview-time-range"><Clock3 size={12} /> {formatEventTimeRange(event)}</span>
           <CountdownPill startTime={getStartTime(event)} endTime={event.endTime} />
-          <div className="preview-actions">
-            <button type="button" className={`preview-action hype ${hyped ? 'is-active' : ''}`} disabled={hyped} aria-label="Hype event" onClick={(clickEvent) => { clickEvent.stopPropagation(); onHype() }}>
-              <Flame size={15} /> <span>{Number(event.flameCount ?? event.hypeCount) || 0}</span>
-            </button>
-            <button type="button" className={`preview-action rsvp ${event.isGoing ? 'is-active' : ''}`} aria-label="Toggle attending" aria-pressed={Boolean(event.isGoing)} onClick={(clickEvent) => { clickEvent.stopPropagation(); onRsvp() }}>
-              <span>＋</span>
-            </button>
-            <button type="button" className={`preview-action reminder ${reminded ? 'is-active' : ''}`} aria-label={reminded ? 'Turn reminder off' : 'Turn reminder on'} aria-pressed={reminded} onClick={(clickEvent) => { clickEvent.stopPropagation(); onRemind() }}>
-              <Bell size={14} />
-            </button>
-          </div>
         </div>
       </div>
       </>}
@@ -699,8 +678,13 @@ function FutaPulseApp() {
   })
 
   const handleTourStepChange = useCallback((stepId) => {
-    setActiveTab(stepId === 'create' ? 'profile' : 'home')
-    if (stepId !== 'create') {
+    setActiveTab(stepId === 'create' ? 'profile' : stepId === 'search' ? 'search' : stepId === 'reminders' ? 'reminders' : 'home')
+    if (stepId === 'event-actions') {
+      setExpandedHomeCategory('all')
+      setHomeCategory('all')
+      setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
+      feedReturnSnapshotRef.current = null
+    } else if (stepId !== 'create') {
       setExpandedHomeCategory('')
       setHomeCategory('all')
       setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
@@ -1605,16 +1589,17 @@ function FutaPulseApp() {
     }
     if (onlineEngagementsInFlight.current.has(`hype:${eventId}`)) return
     const event = events.find((item) => String(getEventId(item)) === eventId)
-    if (!event || event.isHyped) return
+    if (!event) return
+    const enabled = !event.isHyped
     onlineEngagementsInFlight.current.add(`hype:${eventId}`)
     try {
       const result = await apiRequest(`/api/events/${encodeURIComponent(eventId)}/hype`, {
         method: 'POST',
-        body: JSON.stringify({ enabled: true }),
+        body: JSON.stringify({ enabled }),
       }, session.token)
       if (!result.event) throw new Error('The server did not confirm the event Hype.')
-      setEvents((current) => current.map((item) => String(getEventId(item)) === eventId ? { ...item, ...result.event, isHyped: true } : item))
-      notify('You hyped this event!', 'success')
+      setEvents((current) => current.map((item) => String(getEventId(item)) === eventId ? { ...item, ...result.event, isHyped: enabled } : item))
+      notify(enabled ? 'You hyped this event!' : 'Your Hype was removed.', 'success')
     } catch (error) {
       notify(error.message || 'Unable to hype this event right now.', 'error')
     } finally {
@@ -2951,7 +2936,7 @@ function FutaPulseApp() {
                       <section className="feed-section home-category-section" ref={(node) => { homeSectionRefs.current[category.id] = node }}>
                         <h2 className="home-row-heading"><button type="button" className={`home-row-button home-category-heading home-category-heading-${category.id}`} aria-label={`Show all ${category.label} events, ${category.events.length} ${category.events.length === 1 ? 'event' : 'events'}`} onClick={() => openCategoryFeed(category.id)}><span className="home-row-button-title">{category.label}</span><span className="home-row-count">{category.events.length} {category.events.length === 1 ? 'event' : 'events'}</span><span className="home-row-arrow-area"><ChevronRight size={22} /></span></button></h2>
                         {category.events.length
-                          ? <div className="home-event-track">{category.events.slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-category-preview" event={event} hyped={Boolean(event.isHyped)} reminded={reminderIds.includes(String(getEventId(event)))} onHype={() => handleHype(getEventId(event))} onRemind={() => handleReminder(getEventId(event))} onView={recordEventView} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
+                          ? <div className="home-event-track">{category.events.slice(0, 8).map((event) => <EventPreview key={getEventId(event)} homeVariant="home-category-preview" event={event} onView={recordEventView} onOpen={() => openCategoryFeed(event.category, getEventId(event))} />)}</div>
                           : <div className="home-category-empty-track"><div className="home-category-empty-card"><span className="home-category-empty-mark"><Sparkles size={18} aria-hidden="true" /></span><strong>No {category.label} events yet</strong><span>Check back as campus events are added.</span></div></div>}
                       </section>
                       {(categoryIndex + 1) % 2 === 0 && <AdSlot placement="home-category-pairs" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
@@ -2990,7 +2975,7 @@ function FutaPulseApp() {
                         : listedEvents
                       return fullEvents.length ? <>{fullEvents.slice(0, visibleFullFeedCount).map((event, index) => <Fragment key={getEventId(event)}>
                         <div id={`home-full-event-${getEventId(event)}`} className={`home-full-event-anchor ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''} ${String(getEventId(event)) === highlightedNotificationEventId ? 'is-notification-highlighted' : ''}`}>
-                          <LazyEventCard isHot={event.isHot === true} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
+                          <LazyEventCard isHot={event.isHot === true} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id) => handleRsvp(id)} onHype={(id) => handleHype(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
                         </div>
                         {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <AdSlot placement="category-full-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
                       </Fragment>)}{visibleFullFeedCount < fullEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleFullFeedCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more events</button>}</> : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon">◌</span><strong>No events in this section yet</strong><span>Try another category to explore campus activity.</span></div><AdSlot placement="category-empty-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} /></>
@@ -3063,10 +3048,6 @@ function FutaPulseApp() {
                           key={getEventId(event)}
                           homeVariant="home-category-preview"
                           event={{ ...event, isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))) }}
-                          hyped={Boolean(event.isHyped)}
-                          reminded={reminderIds.includes(String(getEventId(event)))}
-                          onHype={() => handleHype(getEventId(event))}
-                          onRemind={() => handleReminder(getEventId(event))}
                           onView={recordEventView}
                           onOpen={() => { rememberSearch(search); setSearchFocused(false); openCategoryFeed(event.category, getEventId(event)) }}
                         />
@@ -3124,6 +3105,7 @@ function FutaPulseApp() {
                             viewerProfile={profile}
                             onView={recordEventView}
                             onComing={(id) => handleRsvp(id)}
+                            onHype={(id) => handleHype(id)}
                             onRemind={(id) => setReminderTarget(String(id))}
                             onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }}
                           />
@@ -3150,6 +3132,7 @@ function FutaPulseApp() {
                             viewerProfile={profile}
                             onView={recordEventView}
                             onComing={(id) => handleRsvp(id)}
+                            onHype={(id) => handleHype(id)}
                             onRemind={(id) => setReminderTarget(String(id))}
                             onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }}
                           />
@@ -3496,6 +3479,7 @@ function FutaPulseApp() {
               readOnly={isGuestSharedView}
               onView={recordEventView}
               onComing={(id) => handleRsvp(id)}
+              onHype={(id) => handleHype(id)}
               onRemind={(id) => setReminderTarget(String(id))}
               onReport={() => { setReportTarget(detailEvent); setReportReason('inappropriate'); setReportDetails('') }}
             />

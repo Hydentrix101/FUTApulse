@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Bell, Building2, CircleHelp, Clock3, ExternalLink, Flame, MapPin, Share2, TriangleAlert, X } from 'lucide-react'
+import { Bell, Building2, CircleHelp, Clock3, ExternalLink, Flame, MapPin, Share2, Sparkles, TriangleAlert, X } from 'lucide-react'
 import CountdownPill from './CountdownPill'
 import { isPublicRecapVisible } from '../utils/eventVisibility'
 
@@ -81,7 +81,7 @@ function FacultyBadge({ faculty, count }) {
   )
 }
 
-function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile, isHot = false, readOnly = false }) {
+function EventCard({ event, onComing, onHype, onRemind, onReport, onView, viewerProfile, isHot = false, readOnly = false }) {
   const cardRef = useRef(null)
   const hasTrackedViewRef = useRef(false)
   const [isLocationModalOpen, setIsLocationModalOpen] = useState(false)
@@ -95,6 +95,7 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
   const [showReminderNudge, setShowReminderNudge] = useState(false)
   const reminderNudgeTimer = useRef(null)
   const isReminded = Boolean(event.isReminded || event.reminded)
+  const isHyped = Boolean(event.isHyped)
   const isComing = Boolean(event.isGoing ?? event.hasHyped)
   const [unavailableBannerSource, setUnavailableBannerSource] = useState('')
   const [organizerFallback, setOrganizerFallback] = useState({ source: '', stage: 0 })
@@ -426,6 +427,13 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
         ) : (
           <div className="event-action-row event-action-row-all">
             {shareAction}
+            {onHype && <button
+              type="button"
+              className={`event-action event-primary-action inline-flex items-center justify-center gap-2 rounded-full border px-3 text-sm font-bold transition ${isHyped ? 'border-purple-400/50 bg-purple-500/20 text-purple-100' : 'border-slate-600 bg-slate-800/80 text-slate-100 hover:border-purple-300/70 hover:text-purple-100'}`}
+              onClick={() => onHype(eventId)}
+              aria-label={isHyped ? `Remove Hype from ${title}` : `Hype ${title}`}
+              aria-pressed={isHyped}
+            ><Sparkles size={16} aria-hidden="true" />{isHyped ? `Hyped · ${Number(event.flameCount ?? event.hypeCount) || 0}` : `Hype · ${Number(event.flameCount ?? event.hypeCount) || 0}`}</button>}
             <button
               type="button"
               className={`event-action event-primary-action inline-flex items-center justify-center gap-2 rounded-full border px-3 text-sm font-bold transition ${

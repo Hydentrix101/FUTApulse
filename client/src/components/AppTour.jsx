@@ -2,11 +2,11 @@ import { useCallback, useEffect, useState } from 'react'
 import { ChevronLeft, ChevronRight, X } from 'lucide-react'
 
 const STEPS = [
-  { id: 'categories', target: '.category-filter-shell', eyebrow: 'STEP 1 OF 5', title: 'Find your kind of event', description: 'Filter campus events by Academic, Tech, or Social. Choose a category to focus the feed.' },
-  { id: 'create', target: '[data-tour="create-event"]', eyebrow: 'STEP 2 OF 5', title: 'Publish a campus event', description: "Organizing a campus meetup? Tap '+' to publish your event in seconds." },
-  { id: 'card', target: '.home-category-preview', eyebrow: 'STEP 3 OF 5', title: 'Get the useful details', description: 'Event cards open to venue and landmark directions, plus real-time faculty turnout.' },
-  { id: 'hype', target: '.home-category-preview .preview-actions', eyebrow: 'STEP 4 OF 5', title: 'Hype it and set reminders', description: 'Tap 🔥 to boost events, or use the bell to subscribe to time-sensitive campus reminders.' },
-  { id: 'install', target: '[data-tour="pwa-install"]', eyebrow: 'STEP 5 OF 5', title: 'Take FUTApulse with you', description: 'Install FUTApulse on your phone for an app-like feel and push alerts when your device supports them.' },
+  { id: 'categories', target: '.category-filter-shell', eyebrow: 'STEP 1 OF 5', title: 'Browse the home feed', description: 'Filter campus events by Academic, Tech, Social, or any other category.' },
+  { id: 'search', target: '.explore-search', eyebrow: 'STEP 2 OF 5', title: 'Find a specific event', description: 'Use Explore to search campus events by title or organizer.' },
+  { id: 'reminders', target: '.reminders-content', eyebrow: 'STEP 3 OF 5', title: 'Keep track of what’s next', description: 'Events you’re anticipating and events you set reminders for are collected here.' },
+  { id: 'create', target: '[data-tour="create-event"]', eyebrow: 'STEP 4 OF 5', title: 'Create a campus event', description: "Organizing a campus meetup? Use '+ Create Event' on your profile to publish it." },
+  { id: 'event-actions', target: '.home-full-feed-view .event-card-actions-grid', eyebrow: 'STEP 5 OF 5', title: 'Interact from the full event card', description: 'On a full event card, Hype it, mark that you’re coming, set a reminder, share it, or report an issue.' },
 ]
 
 function saveCompletion() {
