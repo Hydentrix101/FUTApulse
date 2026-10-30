@@ -1,9 +1,9 @@
 import { ArrowUpRight, Sparkles } from 'lucide-react'
 
-function HouseSponsorCard({ onAction, compact = false, launch = false }) {
+function HouseSponsorCard({ onAction, compact = false }) {
   return (
     <article
-      className={`native-ad-card house-sponsor-card${compact ? ' native-ad-card-compact' : ''}${launch ? ' launch-house-sponsor-card' : ''}`}
+      className={`native-ad-card house-sponsor-card${compact ? ' native-ad-card-compact' : ''}`}
       aria-label="FUTApulse sponsor message"
       data-ad-mode="house"
     >
@@ -16,7 +16,7 @@ function HouseSponsorCard({ onAction, compact = false, launch = false }) {
       </div>
       <div className="native-ad-copy">
         <span className="native-ad-eyebrow">FUTApulse house sponsor</span>
-        <h2>{launch ? 'Your campus starts here.' : 'Make your next campus move count.'}</h2>
+        <h2>Make your next campus move count.</h2>
         <p>Campus promotions and partner offers will appear here.</p>
         <button type="button" className="native-ad-action" onClick={onAction}>
           Explore offer <ArrowUpRight size={16} aria-hidden="true" />

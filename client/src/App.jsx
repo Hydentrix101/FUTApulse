@@ -6,7 +6,6 @@ import {
 import AuthScreen from './components/AuthScreen'
 import CountdownPill from './components/CountdownPill'
 import AdSlot from './components/AdSlot'
-import LaunchAdGate from './components/LaunchAdGate'
 import BrandHeart from './components/BrandHeart'
 import AppTour from './components/AppTour'
 import { API_BASE_URL, SOCKET_BASE_URL } from './config/api'
@@ -433,10 +432,9 @@ function App() {
 function FutaPulseApp() {
   const initialSearchParams = new URLSearchParams(window.location.search)
   const requestedAuthMode = initialSearchParams.get('auth')
-  const bypassLaunchSequence = initialSearchParams.has('auth') || initialSearchParams.has('event')
+  const bypassLaunchSequence = initialSearchParams.has('auth') || initialSearchParams.has('event') || !hasRememberedSession()
   const [launchVisible, setLaunchVisible] = useState(!bypassLaunchSequence)
   const [launchSequenceReady, setLaunchSequenceReady] = useState(bypassLaunchSequence)
-  const [isLaunchAdActive, setIsLaunchAdActive] = useState(false)
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
   const [user, setUser] = useState(null)
@@ -711,7 +709,7 @@ function FutaPulseApp() {
   }, [notify, profile, session, user])
 
   useEffect(() => {
-    if (sessionLoading || !user || !profile || !launchSequenceReady || isLaunchAdActive
+    if (sessionLoading || !user || !profile || !launchSequenceReady
       || shouldShowCategoryPreferences || guidelinesOpen || profileOpen || eventEditor || detailEvent || isGuestSharedView) return
     const accountKey = String(user.id || user.username)
     if (appTourAutoStarted.current === accountKey) return
@@ -725,7 +723,7 @@ function FutaPulseApp() {
     if (readStoredValue(`hasCompletedTour:${encodeURIComponent(accountKey)}`) === 'true') return
     const timer = window.setTimeout(() => setAppTourOpen(true), 0)
     return () => window.clearTimeout(timer)
-  }, [sessionLoading, user, profile, launchSequenceReady, isLaunchAdActive, shouldShowCategoryPreferences, guidelinesOpen, profileOpen, eventEditor, detailEvent, isGuestSharedView])
+  }, [sessionLoading, user, profile, launchSequenceReady, shouldShowCategoryPreferences, guidelinesOpen, profileOpen, eventEditor, detailEvent, isGuestSharedView])
 
   useEffect(() => () => {
     Object.values(autoScrollResumeTimersRef.current).forEach((timer) => window.clearTimeout(timer))
@@ -981,7 +979,6 @@ function FutaPulseApp() {
     if (
       !launchSequenceReady
       || launchVisible
-      || isLaunchAdActive
       || sessionLoading
       || !session?.token
       || !notificationPromptAccountKey
@@ -1026,7 +1023,6 @@ function FutaPulseApp() {
 
     return () => { active = false }
   }, [
-    isLaunchAdActive,
     launchSequenceReady,
     launchVisible,
     profile?.notificationPreferencesOnboardingComplete,
@@ -1038,18 +1034,15 @@ function FutaPulseApp() {
   useEffect(() => {
     if (bypassLaunchSequence) return undefined
     let splashFrame = 0
-    let adFrame = 0
     const timer = window.setTimeout(() => {
       setLaunchVisible(false)
       splashFrame = window.requestAnimationFrame(() => {
         setLaunchSequenceReady(true)
-        adFrame = window.requestAnimationFrame(() => setIsLaunchAdActive(true))
       })
     }, 2500)
     return () => {
       window.clearTimeout(timer)
       if (splashFrame) window.cancelAnimationFrame(splashFrame)
-      if (adFrame) window.cancelAnimationFrame(adFrame)
     }
   }, [bypassLaunchSequence])
 
@@ -2802,15 +2795,6 @@ function FutaPulseApp() {
   }
 
   if (!launchSequenceReady) return <div className="launch-screen" aria-hidden="true" />
-
-  if (isLaunchAdActive) {
-    return (
-      <LaunchAdGate
-        onComplete={() => setIsLaunchAdActive(false)}
-        onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')}
-      />
-    )
-  }
 
   if (sessionLoading) {
     return <div className={`app-root theme-${theme} session-restore-screen`} role="status" aria-label="Loading FUTApulse"><BrandHeart size={36} /></div>
