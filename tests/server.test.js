@@ -29,11 +29,13 @@ const cloudinary = require("cloudinary").v2;
 const jwt = require("jsonwebtoken");
 const deliveredEmails = [];
 app.locals.emailSender = async ({ text }) => deliveredEmails.push(text);
+let testClientIp = 1;
 
 async function createVerifiedAccount(baseUrl, email, username) {
+  const headers = { "Content-Type": "application/json", "X-Forwarded-For": `192.0.2.${testClientIp++}` };
   const signupResponse = await fetch(`${baseUrl}/api/auth/signup`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({ email, username, password: "CorrectPassword1" })
   });
   assert.equal(signupResponse.status, 202);
@@ -41,7 +43,7 @@ async function createVerifiedAccount(baseUrl, email, username) {
   assert.ok(code, "signup should send a six-digit verification code");
   const verifyResponse = await fetch(`${baseUrl}/api/auth/signup/verify`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({ email, code })
   });
   assert.equal(verifyResponse.status, 201);
@@ -391,6 +393,7 @@ test("signup sends verification through Gmail API and sanitizes provider failure
   const providerLogs = [];
   let oauthSignal;
   let failureType = "";
+  const signupHeaders = { "Content-Type": "application/json", "X-Forwarded-For": "192.0.2.232" };
 
   app.locals.emailSender = undefined;
   app.locals.gmailOAuthClientFactory = ({ clientId, clientSecret, transporterOptions }) => {
@@ -438,7 +441,7 @@ test("signup sends verification through Gmail API and sanitizes provider failure
   try {
     const success = await fetch(`${baseUrl}/api/auth/signup`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: signupHeaders,
       body: JSON.stringify({ email: "gmail-success@futa.edu.ng", username: "gmail_success", password: "CorrectPassword1" })
     });
     assert.equal(success.status, 202);
@@ -459,7 +462,7 @@ test("signup sends verification through Gmail API and sanitizes provider failure
     failureType = "permission";
     const failure = await fetch(`${baseUrl}/api/auth/signup`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: signupHeaders,
       body: JSON.stringify({ email: "gmail-failure@futa.edu.ng", username: "gmail_failure", password: "CorrectPassword1" })
     });
     assert.equal(failure.status, 502);
@@ -475,7 +478,7 @@ test("signup sends verification through Gmail API and sanitizes provider failure
     failureType = "invalid_grant";
     const tokenFailure = await fetch(`${baseUrl}/api/auth/signup`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: signupHeaders,
       body: JSON.stringify({ email: "gmail-token-failure@futa.edu.ng", username: "gmail_token_failure", password: "CorrectPassword1" })
     });
     assert.equal(tokenFailure.status, 502);
@@ -489,7 +492,7 @@ test("signup sends verification through Gmail API and sanitizes provider failure
     delete process.env.GMAIL_REFRESH_TOKEN;
     const unconfigured = await fetch(`${baseUrl}/api/auth/signup`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: signupHeaders,
       body: JSON.stringify({ email: "unconfigured@futa.edu.ng", username: "unconfigured_user", password: "CorrectPassword1" })
     });
     assert.equal(unconfigured.status, 503);
@@ -501,6 +504,44 @@ test("signup sends verification through Gmail API and sanitizes provider failure
     app.locals.gmailApiFetch = originalGmailApiFetch;
     app.locals.emailSender = originalEmailSender;
     process.env.GMAIL_REFRESH_TOKEN = originalRefreshToken;
+  }
+});
+
+test("signup retries temporary verification email failures with backoff", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const originalEmailSender = app.locals.emailSender;
+  const deliveredMessages = [];
+  let attempts = 0;
+  app.locals.emailSender = async (message) => {
+    attempts += 1;
+    if (attempts < 3) {
+      const error = new Error("Temporary email provider failure.");
+      error.code = "EMAIL_DELIVERY_FAILED";
+      error.statusCode = 503;
+      throw error;
+    }
+    deliveredMessages.push(message);
+  };
+
+  try {
+    const signup = await fetch(`${baseUrl}/api/auth/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Forwarded-For": "192.0.2.234" },
+      body: JSON.stringify({ email: "retry-signup@futa.edu.ng", username: "retry_signup", password: "CorrectPassword1" })
+    });
+    assert.equal(signup.status, 202);
+    assert.equal(attempts, 3);
+    const code = deliveredMessages[0].text.match(/code is (\d{6})/)?.[1];
+    assert.ok(code, "successful retry should deliver the verification code");
+
+    const verified = await fetch(`${baseUrl}/api/auth/signup/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Forwarded-For": "192.0.2.234" },
+      body: JSON.stringify({ email: "retry-signup@futa.edu.ng", code })
+    });
+    assert.equal(verified.status, 201);
+  } finally {
+    app.locals.emailSender = originalEmailSender;
   }
 });
 

@@ -23,6 +23,8 @@ const multer = require("multer");
 if (fs.existsSync(path.join(__dirname, ".env"))) process.loadEnvFile(path.join(__dirname, ".env"));
 
 const EMAIL_SEND_TIMEOUT_MS = 15_000;
+const EMAIL_DELIVERY_MAX_ATTEMPTS = 3;
+const EMAIL_DELIVERY_INITIAL_BACKOFF_MS = 500;
 const PORT = Number(process.env.PORT || 3001);
 const ROOT = __dirname;
 const CLIENT_DIST = path.join(ROOT, "client", "dist");
@@ -1653,6 +1655,40 @@ async function deliverEmail({ to, subject, text, replyTo }) {
   }
 }
 
+function isTransientEmailDeliveryError(error) {
+  const statusCode = Number(error?.statusCode || error?.response?.status);
+  if ([408, 425, 429].includes(statusCode) || statusCode >= 500 && statusCode <= 599) return true;
+
+  const transientCodes = new Set([
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "EAI_AGAIN",
+    "ECONNREFUSED",
+    "EPIPE",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_SOCKET"
+  ]);
+  for (let current = error; current; current = current.cause) {
+    if (transientCodes.has(current.code) || current.name === "AbortError" || current.name === "TimeoutError" || current instanceof TypeError) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function deliverEmailWithRetry(message) {
+  for (let attempt = 1; attempt <= EMAIL_DELIVERY_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await deliverEmail(message);
+      return;
+    } catch (error) {
+      if (attempt === EMAIL_DELIVERY_MAX_ATTEMPTS || !isTransientEmailDeliveryError(error)) throw error;
+      const delayMs = EMAIL_DELIVERY_INITIAL_BACKOFF_MS * (2 ** (attempt - 1));
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 async function saveEmailChallenge({ email, purpose, codeHash, expiresAt, payload = {} }) {
   if (isMongoConnected()) {
     await EmailChallenge.findOneAndUpdate(
@@ -1727,7 +1763,7 @@ async function issueEmailChallenge(email, purpose, payload = {}) {
       : purpose === "signup" ? "Verify your FUTApulse email"
         : purpose === "email-change" ? "Confirm your new FUTApulse email"
           : "FUTApulse feedback";
-    await deliverEmail({
+    await deliverEmailWithRetry({
       to: email,
       subject,
       text: `Your FUTApulse verification code is ${code}. It expires in 15 minutes. If you did not request this, you can ignore this email.`
@@ -2604,7 +2640,7 @@ app.post("/api/auth/signup", authRateLimit, async (request, response) => {
   const username = normalizeUsername(displayName);
   const password = typeof body.password === "string" ? body.password : "";
   const remember = body.remember === true;
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return response.status(400).json({ error: "Enter a valid email address." });
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return response.status(400).json({ error: "Enter a valid email address." });
   if (!isValidUsername(displayName)) return response.status(400).json({ error: "Use 3â€“24 characters with at least one letter. Accents and letters from any language are supported." });
   if (!isValidNewPassword(password)) return response.status(400).json({ error: "Use more than 6 characters, at least one uppercase letter, and at least one number." });
 
@@ -2626,7 +2662,7 @@ app.post("/api/auth/signup", authRateLimit, async (request, response) => {
 app.post("/api/auth/signup/verify", authRateLimit, async (request, response) => {
   const email = typeof request.body?.email === "string" ? request.body.email.trim().toLowerCase() : "";
   const code = typeof request.body?.code === "string" ? request.body.code.trim() : "";
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(code)) {
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(code)) {
     return response.status(400).json({ error: "Enter the email address and six-digit verification code." });
   }
   try {
@@ -2652,7 +2688,6 @@ app.post("/api/auth/signup/verify", authRateLimit, async (request, response) => 
       emailVerified: true,
       username,
       passwordHash,
-      emailVerified: true,
       profile: { name: displayName, faculty: "", department: "", level: "", role: "explorer" }
     });
     await deleteEmailChallenge(email, "signup");
