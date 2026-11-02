@@ -13,6 +13,7 @@ const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
+const { GoogleAuth } = require("google-auth-library");
 const { Server: SocketServer } = require("socket.io");
 const { createAdapter: createSocketRedisAdapter } = require("@socket.io/redis-adapter");
 const { createClient: createRedisClient } = require("redis");
@@ -83,12 +84,55 @@ function getGooglePopupRedirectUri(request) {
 const ALLOWED_CATEGORIES = new Set(["academic", "tech", "social", "religious", "sports", "seminars"]);
 const NOTIFICATION_CATEGORIES = ["academic", "tech", "social", "religious", "sports", "seminars"];
 const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze(Object.fromEntries(NOTIFICATION_CATEGORIES.map((category) => [category, true])));
+const ALLOWED_WEB_PUSH_HOSTS = new Set([
+  "fcm.googleapis.com",
+  "updates.push.services.mozilla.com",
+  "web.push.apple.com"
+]);
 
 function normalizeNotificationPreferences(value) {
   return Object.fromEntries(NOTIFICATION_CATEGORIES.map((category) => [
     category,
     typeof value?.[category] === "boolean" ? value[category] : true
   ]));
+}
+
+function parseCampusDateTime(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value !== "string") {
+    const parsed = new Date(value);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+  const candidate = value.trim();
+  if (!candidate) return null;
+  const localDateTime = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?)?$/.test(candidate);
+  const parsed = new Date(localDateTime
+    ? `${candidate.includes("T") ? candidate : `${candidate}T00:00:00`}+01:00`
+    : candidate);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+function notificationCategory(event) {
+  const category = String(event?.category || "").trim().toLowerCase();
+  return NOTIFICATION_CATEGORIES.includes(category) ? category : "";
+}
+
+function isNotificationProfileEligible(user, event) {
+  const category = notificationCategory(event);
+  return Boolean(category)
+    && user?.emailVerified === true
+    && user?.profile?.hasCompletedTour === true
+    && user?.profile?.notificationPreferences?.[category] !== false;
+}
+
+function notificationEligibilityFilter(event) {
+  const category = notificationCategory(event);
+  if (!category) return null;
+  return {
+    emailVerified: true,
+    "profile.hasCompletedTour": true,
+    [`profile.notificationPreferences.${category}`]: { $ne: false }
+  };
 }
 const USERNAME_PATTERN = /^(?=.*\p{L})[\p{L}\p{M}\p{N}_ .'-]{3,24}$/u;
 
@@ -199,8 +243,8 @@ function validateEvent(event) {
   }
   if (event.status === "Draft") return true;
   const requiredFields = ["title", "category", "activity", "date", "endTime", "venue", "organizerName"];
-  const start = new Date(event.date).getTime();
-  const end = new Date(event.endTime).getTime();
+  const start = parseCampusDateTime(event.date)?.getTime() ?? NaN;
+  const end = parseCampusDateTime(event.endTime)?.getTime() ?? NaN;
   return requiredFields.every((field) => typeof event[field] === "string" && event[field].trim())
     && ALLOWED_CATEGORIES.has(event.category)
     && Array.isArray(event.audience)
@@ -301,8 +345,8 @@ function eventSimilarityScore(first, second) {
 }
 
 function isWithinEventDisplayWindow(event, now = Date.now()) {
-  const startTime = new Date(event.date || event.startTime || "").getTime();
-  const endTime = new Date(event.endTime || "").getTime();
+  const startTime = eventStartDate(event)?.getTime() ?? NaN;
+  const endTime = parseCampusDateTime(event.endTime)?.getTime() ?? NaN;
   return Number.isFinite(startTime)
     && Number.isFinite(endTime)
     && endTime > startTime
@@ -344,8 +388,8 @@ function toPublicEvent(event, viewerId = "") {
     clientRequestFingerprint,
     ...publicEvent
   } = event;
-  const endAt = new Date(event.endTime || "");
-  publicEvent.isEnded = Number.isFinite(endAt.getTime()) && endAt.getTime() <= Date.now();
+  const endAt = parseCampusDateTime(event.endTime);
+  publicEvent.isEnded = Boolean(endAt && endAt.getTime() <= Date.now());
   if (viewerId && String(event.createdByUserId || "") === String(viewerId)) {
     if (Number.isFinite(Number(viewCount))) publicEvent.viewCount = Number(viewCount);
     if (typeof recapPromptDismissed === "boolean") publicEvent.recapPromptDismissed = recapPromptDismissed;
@@ -439,9 +483,10 @@ const RecapPromptDismissal = mongoose.models.FutapulseRecapPromptDismissal
 const pushDeviceSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
   deviceKey: { type: String, required: true, unique: true },
-  platform: { type: String, enum: ["web"], required: true },
-  endpoint: { type: String, required: true },
-  subscription: { type: mongoose.Schema.Types.Mixed, required: true },
+  platform: { type: String, enum: ["web", "fcm"], required: true },
+  endpoint: { type: String, default: "" },
+  token: { type: String, default: "" },
+  subscription: { type: mongoose.Schema.Types.Mixed, default: null },
   enabled: { type: Boolean, default: true, index: true }
 }, { timestamps: true, minimize: false });
 pushDeviceSchema.index({ userId: 1, enabled: 1 });
@@ -457,8 +502,15 @@ const notificationJobSchema = new mongoose.Schema({
   expiresAt: { type: Date, required: true },
   status: { type: String, enum: ["pending", "processing", "sent", "failed", "cancelled", "undeliverable"], default: "pending", index: true },
   attempts: { type: Number, default: 0 },
+  deliveredDeviceKeys: { type: [String], default: [] },
+  socketDelivered: { type: Boolean, default: false },
+  deactivatedDeviceCount: { type: Number, default: 0 },
+  leaseToken: { type: String, default: "" },
   nextAttemptAt: { type: Date, default: Date.now, index: true },
   leaseUntil: { type: Date, default: null, index: true },
+  processingStartedAt: { type: Date, default: null },
+  deliveryLatencyMs: { type: Number, default: null },
+  completedAt: { type: Date, default: null },
   sentAt: { type: Date, default: null },
   lastError: { type: String, default: "" }
 }, { timestamps: true, minimize: false });
@@ -466,9 +518,43 @@ notificationJobSchema.index({ status: 1, nextAttemptAt: 1, dueAt: 1 });
 notificationJobSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 const NotificationJob = mongoose.models.FutapulseNotificationJob
   || mongoose.model("FutapulseNotificationJob", notificationJobSchema, "notification_jobs");
+const notificationOutboxSchema = new mongoose.Schema({
+  outboxKey: { type: String, required: true, unique: true },
+  eventId: { type: String, required: true, index: true },
+  type: { type: String, required: true, index: true },
+  payload: { type: mongoose.Schema.Types.Mixed, required: true },
+  status: { type: String, enum: ["pending", "processing", "completed", "failed"], default: "pending", index: true },
+  attempts: { type: Number, default: 0 },
+  nextAttemptAt: { type: Date, default: Date.now, index: true },
+  leaseUntil: { type: Date, default: null, index: true },
+  leaseToken: { type: String, default: "" },
+  lastError: { type: String, default: "" }
+}, { timestamps: true, minimize: false });
+notificationOutboxSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
+const NotificationOutbox = mongoose.models.FutapulseNotificationOutbox
+  || mongoose.model("FutapulseNotificationOutbox", notificationOutboxSchema, "notification_outbox");
+const notificationDeadLetterSchema = new mongoose.Schema({
+  sourceJobId: { type: mongoose.Schema.Types.ObjectId, required: true, unique: true },
+  idempotencyKey: { type: String, required: true, index: true },
+  recipientUserId: { type: String, required: true, index: true },
+  payload: { type: mongoose.Schema.Types.Mixed, required: true },
+  attempts: { type: Number, required: true },
+  lastError: { type: String, default: "" },
+  failedAt: { type: Date, required: true },
+  replayedAt: { type: Date, default: null },
+  replayCount: { type: Number, default: 0 }
+}, { timestamps: true, minimize: false });
+const NotificationDeadLetter = mongoose.models.FutapulseNotificationDeadLetter
+  || mongoose.model("FutapulseNotificationDeadLetter", notificationDeadLetterSchema, "notification_dead_letters");
 let realtimeServer = null;
 let notificationWorkerTimer = null;
 let notificationWorkerInFlight = false;
+let lastNotificationCleanupAt = 0;
+let firebaseAccessTokenCache = null;
+let activeFcmSendCount = 0;
+const fcmSendWaiters = [];
+const NOTIFICATION_WORKER_CONCURRENCY = 5;
+const FCM_MAX_CONCURRENT_SENDS = 5;
 let socketRedisClients = [];
 
 function notificationEventLink(event) {
@@ -480,7 +566,20 @@ function notificationEventLink(event) {
   return link.toString();
 }
 
-async function enqueueNotification({
+function isAllowedWebPushEndpoint(endpoint) {
+  try {
+    const url = new URL(endpoint);
+    return url.protocol === "https:"
+      && !url.username
+      && !url.password
+      && (!url.port || url.port === "443")
+      && ALLOWED_WEB_PUSH_HOSTS.has(url.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+async function saveNotificationJob({
   idempotencyKey,
   recipientUserId,
   event,
@@ -491,7 +590,7 @@ async function enqueueNotification({
   universal = false,
   reactivateCancelled = false
 }) {
-  if (!isMongoConnected() || !recipientUserId || !event?.id || !idempotencyKey) return null;
+  if (!recipientUserId || !event?.id || !idempotencyKey) return null;
   const now = new Date();
   const due = new Date(dueAt);
   if (!Number.isFinite(due.getTime())) throw new Error("Notification dueAt must be a valid date.");
@@ -518,8 +617,15 @@ async function enqueueNotification({
       expiresAt: new Date(Math.max(now.getTime(), due.getTime()) + (8 * 24 * 60 * 60 * 1000)),
       status: "pending",
       attempts: 0,
+      deliveredDeviceKeys: [],
+      socketDelivered: false,
+      deactivatedDeviceCount: 0,
+      leaseToken: "",
       nextAttemptAt: due,
       leaseUntil: null,
+      processingStartedAt: null,
+      deliveryLatencyMs: null,
+      completedAt: null,
       sentAt: null,
       lastError: ""
     };
@@ -542,11 +648,37 @@ async function enqueueNotification({
   }
 }
 
+async function isNotificationRecipientEligible(recipientUserId, event) {
+  const eligibilityFilter = notificationEligibilityFilter(event);
+  if (!eligibilityFilter || !recipientUserId) return false;
+  const recipient = await User.findOne({
+    _id: recipientUserId,
+    ...eligibilityFilter
+  }).select("_id").lean().exec();
+  return Boolean(recipient);
+}
+
+async function enqueueNotification(details) {
+  if (!isMongoConnected() || !details?.recipientUserId || !details?.event?.id || !details?.idempotencyKey) return null;
+  if (!await isNotificationRecipientEligible(details.recipientUserId, details.event)) return null;
+  return saveNotificationJob(details);
+}
+
 async function enqueueNotifications(userIds, details) {
+  if (!isMongoConnected()) return;
   const uniqueIds = [...new Set((userIds || []).map(String).filter(Boolean))];
+  if (!uniqueIds.length) return;
+  const eligibilityFilter = notificationEligibilityFilter(details.event);
+  if (!eligibilityFilter) return;
+  const eligibleUsers = await User.find({
+    _id: { $in: uniqueIds },
+    ...eligibilityFilter
+  }).select("_id").lean().exec();
+  const eligibleIds = new Set(eligibleUsers.map((user) => String(user._id)));
+  const recipients = uniqueIds.filter((recipientUserId) => eligibleIds.has(recipientUserId));
   const batchSize = 50;
-  for (let index = 0; index < uniqueIds.length; index += batchSize) {
-    await Promise.all(uniqueIds.slice(index, index + batchSize).map((recipientUserId) => enqueueNotification({
+  for (let index = 0; index < recipients.length; index += batchSize) {
+    await Promise.all(recipients.slice(index, index + batchSize).map((recipientUserId) => saveNotificationJob({
       ...details,
       recipientUserId,
       idempotencyKey: `${details.idempotencyKey}:${recipientUserId}`
@@ -560,6 +692,7 @@ async function enqueueCategoryAlert(event, kind = "new-event") {
   if (!NOTIFICATION_CATEGORIES.includes(category)) return;
   const users = await User.find({
     emailVerified: true,
+    "profile.hasCompletedTour": true,
     [`profile.notificationPreferences.${category}`]: { $ne: false }
   }).select("_id").lean().exec();
   const categoryName = ({
@@ -586,12 +719,13 @@ async function scheduleEventEndedRecapPrompt(event) {
     await cancelEventEndedRecapPrompts(eventId);
     return;
   }
-  const endTime = new Date(event.endTime || "");
-  if (!Number.isFinite(endTime.getTime()) || Date.now() - endTime.getTime() > 7 * 24 * 60 * 60_000) {
+  const endTime = parseCampusDateTime(event.endTime);
+  if (!endTime || Date.now() - endTime.getTime() > 7 * 24 * 60 * 60_000) {
     await cancelEventEndedRecapPrompts(eventId);
     return;
   }
   const recipientUserId = String(event.createdByUserId);
+  if (!await isNotificationRecipientEligible(recipientUserId, event)) return;
   const idempotencyKey = `event-ended-recap:${eventId}:${endTime.toISOString()}`;
   const existing = await NotificationJob.findOne({ idempotencyKey }).exec();
   if (existing?.status === "sent") return;
@@ -624,7 +758,14 @@ async function scheduleEventEndedRecapPrompt(event) {
     existing.nextAttemptAt = dueAt;
     existing.status = "pending";
     existing.attempts = 0;
+    existing.deliveredDeviceKeys = [];
+    existing.socketDelivered = false;
+    existing.deactivatedDeviceCount = 0;
+    existing.leaseToken = "";
     existing.leaseUntil = null;
+    existing.processingStartedAt = null;
+    existing.deliveryLatencyMs = null;
+    existing.completedAt = null;
     existing.lastError = "";
     await existing.save();
     return;
@@ -880,7 +1021,33 @@ function describeWebPushFailure(error, endpoint) {
   return `${endpointHost} returned${statusCode}: ${providerMessage}`;
 }
 
+async function mapWithConcurrency(items, concurrency, callback) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(items.length, Math.max(1, concurrency));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await callback(items[index], index);
+    }
+  }));
+  return results;
+}
+
 async function dispatchNotificationJob(job) {
+  const recipient = await User.findById(job.recipientUserId)
+    .select("emailVerified profile")
+    .lean()
+    .exec();
+  if (!isNotificationProfileEligible(recipient, { category: job.payload?.category })) {
+    await NotificationJob.updateOne({ _id: job._id, status: "processing", leaseToken: job.leaseToken }, {
+      $set: { status: "cancelled", leaseUntil: null, lastError: "Recipient is no longer eligible for notifications." }
+    }).exec();
+    return "cancelled";
+  }
+
   const payload = {
     ...job.payload,
     recipientUserId: String(job.recipientUserId),
@@ -891,12 +1058,35 @@ async function dispatchNotificationJob(job) {
     ? await realtimeServer.in(recipientRoom).fetchSockets()
     : [];
   const activeSocketCount = recipientSockets.filter((socket) => socket.data.notificationForeground === true).length;
-  if (realtimeServer) realtimeServer.to(recipientRoom).emit("home-notification", payload);
-  const devices = await PushDevice.find({ userId: job.recipientUserId, platform: "web", enabled: true }).lean().exec();
+  if (realtimeServer && activeSocketCount > 0 && job.socketDelivered !== true) {
+    realtimeServer.to(recipientRoom).emit("home-notification", payload);
+    await NotificationJob.updateOne({ _id: job._id, status: "processing", leaseToken: job.leaseToken }, {
+      $set: { socketDelivered: true }
+    }).exec();
+  }
+  const devices = await PushDevice.find({ userId: job.recipientUserId, platform: { $in: ["web", "fcm"] }, enabled: true }).lean().exec();
   const failures = [];
-  let deliveredToDeviceCount = 0;
+  const deliveredDeviceKeys = new Set(job.deliveredDeviceKeys || []);
+  let deliveredToDeviceCount = deliveredDeviceKeys.size;
   let expiredDeviceCount = 0;
-  await Promise.all(devices.map(async (device) => {
+  await mapWithConcurrency(devices, NOTIFICATION_WORKER_CONCURRENCY, async (device) => {
+    if (deliveredDeviceKeys.has(device.deviceKey)) return;
+    if (device.platform === "web" && !isAllowedWebPushEndpoint(device.endpoint)) {
+      try {
+        await PushDevice.updateOne({ deviceKey: device.deviceKey }, { $set: { enabled: false } }).exec();
+        await NotificationJob.updateOne({ _id: job._id, status: "processing", leaseToken: job.leaseToken }, {
+          $inc: { deactivatedDeviceCount: 1 }
+        }).exec();
+        expiredDeviceCount += 1;
+      } catch (error) {
+        failures.push({
+          statusCode: Number.isInteger(error?.statusCode) ? error.statusCode : null,
+          code: error?.code || "",
+          message: "An invalid Web Push endpoint could not be deactivated."
+        });
+      }
+      return;
+    }
     try {
       if (device.platform === "web") {
         const vapidConfiguration = getVapidConfiguration();
@@ -905,43 +1095,62 @@ async function dispatchNotificationJob(job) {
           configurationError.code = "WEB_PUSH_CONFIGURATION_ERROR";
           throw configurationError;
         }
-        await webPush.sendNotification(device.subscription, JSON.stringify(payload), {
+        await sendWebPushWithRetry(device.subscription, JSON.stringify(payload), {
           TTL: 60 * 60 * 24 * 7,
           urgency: "high",
           topic: crypto.createHash("sha256").update(job.idempotencyKey).digest("base64url").slice(0, 32)
         });
+        await NotificationJob.updateOne({ _id: job._id, status: "processing", leaseToken: job.leaseToken }, {
+          $addToSet: { deliveredDeviceKeys: device.deviceKey }
+        }).exec();
+        deliveredDeviceKeys.add(device.deviceKey);
+        deliveredToDeviceCount += 1;
+      } else if (device.platform === "fcm") {
+        await sendFcmWithinLimit(device.token, payload);
+        await NotificationJob.updateOne({ _id: job._id, status: "processing", leaseToken: job.leaseToken }, {
+          $addToSet: { deliveredDeviceKeys: device.deviceKey }
+        }).exec();
+        deliveredDeviceKeys.add(device.deviceKey);
         deliveredToDeviceCount += 1;
       }
     } catch (error) {
-      if (device.platform === "web" && [404, 410].includes(error.statusCode)) {
-        await PushDevice.updateOne({ deviceKey: device.deviceKey }, { $set: { enabled: false } }).exec();
-        expiredDeviceCount += 1;
+      if (device.platform === "web" && [404, 410].includes(error.statusCode)
+        || device.platform === "fcm" && isInvalidFcmTokenError(error)) {
+        try {
+          await PushDevice.updateOne({ deviceKey: device.deviceKey }, { $set: { enabled: false } }).exec();
+          await NotificationJob.updateOne({ _id: job._id, status: "processing", leaseToken: job.leaseToken }, {
+            $inc: { deactivatedDeviceCount: 1 }
+          }).exec();
+          expiredDeviceCount += 1;
+        } catch (deactivationError) {
+          failures.push({
+            statusCode: Number.isInteger(deactivationError?.statusCode) ? deactivationError.statusCode : null,
+            code: deactivationError?.code || "",
+            message: device.platform === "fcm"
+              ? "An invalid FCM token could not be deactivated."
+              : "An expired Web Push subscription could not be deactivated."
+          });
+        }
       } else {
         failures.push({
           statusCode: Number.isInteger(error?.statusCode) ? error.statusCode : null,
           code: error?.code || "",
-          message: describeWebPushFailure(error, device.endpoint)
+          message: device.platform === "web"
+            ? describeWebPushFailure(error, device.endpoint)
+            : String(error?.message || "FCM delivery failed").slice(0, 300)
         });
       }
     }
-  }));
-  if (activeSocketCount > 0 || deliveredToDeviceCount > 0) {
+  });
+  job.runExpiredDeviceCount = expiredDeviceCount;
+  if (activeSocketCount > 0 || deliveredToDeviceCount > 0 || job.socketDelivered === true) {
     if (failures.length) {
-      console.warn(`Notification ${job.idempotencyKey} reached at least one recipient channel, but ${failures.length} Web Push device(s) failed.`, failures);
+      console.warn(`Notification ${job.idempotencyKey} reached at least one recipient channel, but ${failures.length} push device(s) failed.`);
+      throw createWebPushDispatchError(failures);
     }
-    return;
+    return "sent";
   }
-  if (failures.length) {
-    const error = new Error(failures.map((failure) => failure.message).join("; "));
-    error.code = failures.every((failure) => failure.code === "WEB_PUSH_CONFIGURATION_ERROR")
-      ? "WEB_PUSH_CONFIGURATION_ERROR"
-      : failures.every((failure) => failure.statusCode !== null
-      && failure.statusCode >= 400 && failure.statusCode < 500
-      && ![408, 425, 429].includes(failure.statusCode))
-      ? "WEB_PUSH_PERMANENT_FAILURE"
-      : "WEB_PUSH_RETRYABLE_FAILURE";
-    throw error;
-  }
+  if (failures.length) throw createWebPushDispatchError(failures);
   if (activeSocketCount === 0 && deliveredToDeviceCount === 0) {
     const reason = expiredDeviceCount
       ? `${expiredDeviceCount} expired Web Push subscription(s) were disabled.`
@@ -952,59 +1161,516 @@ async function dispatchNotificationJob(job) {
   }
 }
 
+function createWebPushDispatchError(failures) {
+  const error = new Error(failures.map((failure) => failure.message).join("; "));
+  error.code = failures.every((failure) => ["WEB_PUSH_CONFIGURATION_ERROR", "FCM_CONFIGURATION_ERROR"].includes(failure.code))
+    ? "PUSH_CONFIGURATION_ERROR"
+    : failures.every((failure) => failure.statusCode !== null
+      && failure.statusCode >= 400 && failure.statusCode < 500
+      && ![408, 425, 429].includes(failure.statusCode))
+      ? "WEB_PUSH_PERMANENT_FAILURE"
+      : "WEB_PUSH_RETRYABLE_FAILURE";
+  return error;
+}
+
+function isTransientPushFailure(error) {
+  const statusCode = Number(error?.statusCode || error?.response?.status);
+  if ([408, 425, 429].includes(statusCode) || statusCode >= 500 && statusCode <= 599) return true;
+  const transientCodes = new Set([
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "EAI_AGAIN",
+    "ECONNREFUSED",
+    "ECONNABORTED",
+    "ENETUNREACH",
+    "EHOSTUNREACH",
+    "ENOTFOUND",
+    "EPIPE",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_SOCKET"
+  ]);
+  for (let current = error; current; current = current.cause) {
+    if (transientCodes.has(current.code) || current.name === "AbortError" || current.name === "TimeoutError" || current instanceof TypeError) return true;
+  }
+  return false;
+}
+
+async function sendWebPushWithRetry(subscription, payload, options) {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await webPush.sendNotification(subscription, payload, options);
+    } catch (error) {
+      if (!isTransientPushFailure(error) || attempt === maxAttempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** (attempt - 1))));
+    }
+  }
+}
+
+function getFirebaseConfiguration() {
+  const rawCredentials = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+  if (!rawCredentials) {
+    const error = new Error("Firebase Admin credentials are not configured.");
+    error.code = "FCM_CONFIGURATION_ERROR";
+    throw error;
+  }
+  let credentials;
+  try {
+    credentials = JSON.parse(rawCredentials);
+  } catch (cause) {
+    const error = new Error("FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON.", { cause });
+    error.code = "FCM_CONFIGURATION_ERROR";
+    throw error;
+  }
+  const projectId = String(process.env.FIREBASE_PROJECT_ID || credentials.project_id || "").trim();
+  if (!projectId || !/^[a-z0-9][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId)
+    || typeof credentials.client_email !== "string"
+    || typeof credentials.private_key !== "string"
+    || !credentials.client_email || !credentials.private_key) {
+    const error = new Error("Firebase project ID and service-account credentials are required.");
+    error.code = "FCM_CONFIGURATION_ERROR";
+    throw error;
+  }
+  return { credentials, projectId };
+}
+
+async function getFirebaseAccessToken() {
+  if (typeof app.locals.fcmAccessTokenFactory === "function") {
+    return app.locals.fcmAccessTokenFactory();
+  }
+  const { credentials, projectId } = getFirebaseConfiguration();
+  const cacheKey = crypto.createHash("sha256")
+    .update(`${projectId}:${credentials.client_email}:${credentials.private_key}`)
+    .digest("hex");
+  if (firebaseAccessTokenCache?.cacheKey === cacheKey
+    && firebaseAccessTokenCache.expiresAt > Date.now() + 60_000) {
+    return firebaseAccessTokenCache.token;
+  }
+  const auth = new GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/firebase.messaging"]
+  });
+  const client = await auth.getClient();
+  const tokenResult = await client.getAccessToken();
+  const token = typeof tokenResult === "string" ? tokenResult : tokenResult?.token;
+  if (!token) {
+    const error = new Error("Google authentication did not return an FCM access token.");
+    error.code = "FCM_CONFIGURATION_ERROR";
+    throw error;
+  }
+  firebaseAccessTokenCache = {
+    cacheKey,
+    token,
+    expiresAt: Number(client.credentials?.expiry_date) || Date.now() + (45 * 60_000)
+  };
+  return token;
+}
+
+function isInvalidFcmTokenError(error) {
+  return ["UNREGISTERED", "SENDER_ID_MISMATCH"].includes(String(error?.providerCode || error?.code || ""));
+}
+
+async function sendFcmOnce(token, payload) {
+  const { projectId } = getFirebaseConfiguration();
+  const accessToken = await getFirebaseAccessToken();
+  const data = Object.fromEntries(Object.entries(payload).map(([key, value]) => [
+    key,
+    typeof value === "string" ? value : JSON.stringify(value)
+  ]));
+  const fetcher = app.locals.fcmApiFetch || fetch;
+  let response;
+  try {
+    response = await fetcher(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/messages:send`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        message: {
+          token,
+          notification: { title: payload.title, body: payload.message },
+          data,
+          android: {
+            priority: "HIGH",
+            notification: { tag: String(payload.notificationId || "") }
+          },
+          webpush: {
+            headers: { TTL: "604800" },
+            notification: { title: payload.title, body: payload.message, tag: String(payload.notificationId || "") }
+          }
+        }
+      }),
+      signal: AbortSignal.timeout(15_000)
+    });
+  } catch (cause) {
+    const error = new Error("The connection to Firebase Cloud Messaging failed.", { cause });
+    error.code = "FCM_RETRYABLE_FAILURE";
+    throw error;
+  }
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = result.error || {};
+    const providerCode = detail.details?.find((item) => item.errorCode)?.errorCode || detail.status || "";
+    const error = new Error(`Firebase Cloud Messaging rejected the message (HTTP ${response.status}${providerCode ? `, ${providerCode}` : ""}).`);
+    error.statusCode = response.status;
+    error.providerCode = providerCode;
+    error.code = providerCode === "UNREGISTERED" || providerCode === "SENDER_ID_MISMATCH"
+      ? providerCode
+      : response.status === 401 || response.status === 403
+        ? "FCM_CONFIGURATION_ERROR"
+        : "FCM_DELIVERY_FAILED";
+    throw error;
+  }
+  if (!result.name) {
+    const error = new Error("Firebase Cloud Messaging did not confirm message acceptance.");
+    error.code = "FCM_RETRYABLE_FAILURE";
+    throw error;
+  }
+  return result;
+}
+
+async function sendFcmWithRetry(token, payload) {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await sendFcmOnce(token, payload);
+    } catch (error) {
+      if (isInvalidFcmTokenError(error) || error.code === "FCM_CONFIGURATION_ERROR"
+        || !isTransientPushFailure(error) && error.statusCode < 500 && ![408, 425, 429].includes(error.statusCode)
+        || attempt === maxAttempts) {
+        throw error;
+      }
+      const base = 500 * (2 ** (attempt - 1));
+      await new Promise((resolve) => setTimeout(resolve, Math.round(base * (0.8 + Math.random() * 0.4))));
+    }
+  }
+}
+
+async function sendFcmWithinLimit(token, payload) {
+  if (activeFcmSendCount >= FCM_MAX_CONCURRENT_SENDS) {
+    await new Promise((resolve) => fcmSendWaiters.push(resolve));
+  } else {
+    activeFcmSendCount += 1;
+  }
+  try {
+    return await sendFcmWithRetry(token, payload);
+  } finally {
+    const nextWaiter = fcmSendWaiters.shift();
+    if (nextWaiter) nextWaiter();
+    else activeFcmSendCount -= 1;
+  }
+}
+
 async function claimDueNotificationJob(now = new Date()) {
+  const leaseToken = crypto.randomUUID();
   return NotificationJob.findOneAndUpdate({
     dueAt: { $lte: now },
+    nextAttemptAt: { $lte: now },
+    expiresAt: { $gt: now },
+    $or: [
+      { status: "pending" },
+      { status: "processing", leaseUntil: { $lte: now } }
+    ]
+  }, {
+    $set: {
+      status: "processing",
+      leaseUntil: new Date(now.getTime() + 60_000),
+      leaseToken,
+      processingStartedAt: now
+    },
+    $inc: { attempts: 1 }
+  }, { new: true, sort: { dueAt: 1, createdAt: 1 } }).exec();
+}
+
+async function finalizeNotificationJobWithDeadLetter(job, {
+  status,
+  attempts,
+  lastError,
+  expiresAt
+}) {
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const update = await NotificationJob.updateOne({
+        _id: job._id,
+        status: "processing",
+        leaseToken: job.leaseToken
+      }, {
+        $set: {
+          status,
+          leaseUntil: null,
+          leaseToken: "",
+          lastError,
+          ...(expiresAt ? { expiresAt } : {})
+        }
+      }, { session }).exec();
+      if (!update.matchedCount) throw new Error("Notification job lease was lost before dead-letter state could be saved.");
+      await NotificationDeadLetter.updateOne({ sourceJobId: job._id       }, {
+        $set: { attempts, lastError, failedAt: new Date() },
+        $setOnInsert: {
+          sourceJobId: job._id,
+          idempotencyKey: job.idempotencyKey,
+          recipientUserId: job.recipientUserId,
+          payload: job.payload
+        }
+      }, { upsert: true, session }).exec();
+    });
+  } finally {
+    await session.endSession();
+  }
+}
+
+async function processClaimedNotificationJob(job) {
+  const leaseInterval = setInterval(() => {
+    void NotificationJob.updateOne({
+      _id: job._id,
+      status: "processing",
+      leaseToken: job.leaseToken
+    }, { $set: { leaseUntil: new Date(Date.now() + 60_000) } }).exec()
+      .catch((error) => console.error(`Notification lease renewal failed for ${job.idempotencyKey}.`, error));
+  }, 15_000);
+  leaseInterval.unref?.();
+  try {
+    const result = await dispatchNotificationJob(job);
+    if (result === "cancelled") return result;
+    const completedAt = new Date();
+    const completion = await NotificationJob.updateOne({ _id: job._id, status: "processing", leaseToken: job.leaseToken }, {
+      $set: {
+        status: "sent",
+        sentAt: completedAt,
+        completedAt,
+        deliveryLatencyMs: Math.max(0, completedAt.getTime() - new Date(job.createdAt || completedAt).getTime()),
+        leaseUntil: null,
+        leaseToken: "",
+        lastError: ""
+      }
+    }).exec();
+    if (!completion.matchedCount) throw new Error("Notification job lease was lost before completion.");
+    return "sent";
+  } catch (error) {
+    const attempts = Number(job.attempts) || 1;
+    const permanentFailure = ["WEB_PUSH_PERMANENT_FAILURE", "PUSH_CONFIGURATION_ERROR"].includes(error.code);
+    const exhausted = permanentFailure || attempts >= 8;
+    const baseRetryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
+    const retryDelay = Math.round(baseRetryDelay * (0.8 + Math.random() * 0.4));
+    console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
+    if (error.code === "NO_NOTIFICATION_DELIVERY_CHANNEL") {
+      await finalizeNotificationJobWithDeadLetter(job, {
+        status: "undeliverable",
+        attempts,
+        lastError: String(error.message || error).slice(0, 500),
+        expiresAt: new Date(Date.now() + (30 * 24 * 60 * 60_000))
+      });
+      return "undeliverable";
+    }
+
+    if (exhausted) {
+      await finalizeNotificationJobWithDeadLetter(job, {
+        status: "failed",
+        attempts,
+        lastError: String(error.message || error).slice(0, 500),
+        expiresAt: new Date(Date.now() + (30 * 24 * 60 * 60_000))
+      });
+      console.error(`Notification ${job.idempotencyKey} moved to the dead-letter queue after ${attempts} attempts.`);
+      return "failed";
+    }
+
+    const update = await NotificationJob.updateOne({ _id: job._id, status: "processing", leaseToken: job.leaseToken }, {
+      $set: {
+        status: "pending",
+        nextAttemptAt: new Date(Date.now() + retryDelay),
+        leaseUntil: null,
+        leaseToken: "",
+        lastError: String(error.message || error).slice(0, 500)
+      }
+    }).exec();
+    if (!update.matchedCount) throw new Error("Notification job lease was lost before retry state could be saved.");
+    return "retried";
+  } finally {
+    clearInterval(leaseInterval);
+  }
+}
+
+async function cleanupStaleNotificationJobs(now = new Date()) {
+  const cleanupIntervalMs = 5 * 60_000;
+  if (now.getTime() - lastNotificationCleanupAt < cleanupIntervalMs) {
+    return { purged: 0, cancelled: 0 };
+  }
+  lastNotificationCleanupAt = now.getTime();
+  const purged = await NotificationJob.deleteMany({ expiresAt: { $lte: now } }).exec();
+  const reminderKinds = ["rsvp-reminder-1h", "rsvp-reminder-30m", "rsvp-reminder-start", "custom-reminder"];
+  const staleCandidates = await NotificationJob.find({
+    kind: { $in: reminderKinds },
+    status: { $in: ["pending", "processing"] },
+    dueAt: { $lte: now }
+  }).select("eventId").limit(500).lean().exec();
+  const candidateEventIds = [...new Set(staleCandidates.map((job) => job.eventId).filter(Boolean))];
+  let cancelled = 0;
+  if (candidateEventIds.length) {
+    const endedEventIds = await EventRecord.find({
+      eventId: { $in: candidateEventIds },
+      status: { $in: ["Published", "Live"] },
+      endsAt: { $lte: now }
+    }).distinct("eventId").exec();
+    if (endedEventIds.length) {
+      const result = await NotificationJob.updateMany({
+        eventId: { $in: endedEventIds },
+        kind: { $in: reminderKinds },
+        status: { $in: ["pending", "processing"] }
+      }, { $set: { status: "cancelled", leaseUntil: null, lastError: "Event has ended; reminder is stale." } }).exec();
+      cancelled = result.modifiedCount || 0;
+    }
+  }
+  return { purged: purged.deletedCount || 0, cancelled };
+}
+
+async function claimDueNotificationOutbox(now = new Date()) {
+  const leaseToken = crypto.randomUUID();
+  return NotificationOutbox.findOneAndUpdate({
     nextAttemptAt: { $lte: now },
     $or: [
       { status: "pending" },
       { status: "processing", leaseUntil: { $lte: now } }
     ]
   }, {
-    $set: { status: "processing", leaseUntil: new Date(now.getTime() + 60_000) },
+    $set: { status: "processing", leaseUntil: new Date(now.getTime() + 60_000), leaseToken },
     $inc: { attempts: 1 }
-  }, { new: true, sort: { dueAt: 1, createdAt: 1 } }).exec();
+  }, { new: true, sort: { createdAt: 1 } }).exec();
 }
 
-async function processClaimedNotificationJob(job) {
-  try {
-    await dispatchNotificationJob(job);
-    await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
-      $set: { status: "sent", sentAt: new Date(), leaseUntil: null, lastError: "" }
-    }).exec();
-    return "sent";
-  } catch (error) {
-    const attempts = Number(job.attempts) || 1;
-    const permanentFailure = ["WEB_PUSH_PERMANENT_FAILURE", "WEB_PUSH_CONFIGURATION_ERROR"].includes(error.code);
-    const exhausted = permanentFailure || attempts >= 8;
-    const retryDelay = Math.min(60 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 7)));
-    console.error(`Notification delivery failed for ${job.idempotencyKey}.`, error);
-    if (error.code === "NO_NOTIFICATION_DELIVERY_CHANNEL") {
-      await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
-        $set: {
-          status: "undeliverable",
-          leaseUntil: null,
-          lastError: String(error.message || error).slice(0, 500)
-        }
+async function processNotificationOutboxEntry(entry) {
+  const { event, previous } = entry.payload || {};
+  if (!event?.id) throw new Error("Notification outbox entry is missing its event snapshot.");
+  switch (entry.type) {
+    case "new-event":
+      await enqueueCategoryAlert(event);
+      await scheduleEventEndedRecapPrompt(event);
+      break;
+    case "event-critical-update":
+      await notifyCriticalEventUpdate(previous || {}, event);
+      await scheduleEventEndedRecapPrompt(event);
+      break;
+    case "event-state-changed":
+      if (["Published", "Live"].includes(event.status)) await scheduleEventEndedRecapPrompt(event);
+      else await cancelEventEndedRecapPrompts(event.id);
+      break;
+    case "event-cancelled": {
+      await cancelEventEndedRecapPrompts(event.id);
+      await NotificationJob.updateMany({
+        eventId: String(event.id),
+        status: { $in: ["pending", "processing"] },
+        kind: { $in: ["rsvp-reminder-1h", "rsvp-reminder-30m", "rsvp-reminder-start", "custom-reminder"] }
+      }, {
+        $set: { status: "cancelled", leaseUntil: null, leaseToken: "", lastError: "Event was cancelled." }
       }).exec();
-      return "undeliverable";
+      const recipients = await getEventNotificationAudience(event, true);
+      await enqueueNotifications(recipients, {
+        idempotencyKey: `event-cancelled:${event.id}`,
+        event,
+        kind: "event-cancellation",
+        title: "Event cancellation notice",
+        message: `⚠️ CANCELLATION NOTICE: ${event.title} has been called off. Tap to view details.`
+      });
+      break;
     }
+    case "event-recap-published": {
+      const recipients = await User.find({ emailVerified: true }).select("_id").lean().exec();
+      await enqueueNotifications(recipients.map((recipient) => recipient._id), {
+        idempotencyKey: `event-recap:${event.id}`,
+        event,
+        kind: "event-recap",
+        title: "Relive the vibe!",
+        message: `Relive the vibe! Photos from ${event.title} are now live. Tap to check out the recap.`,
+        universal: true
+      });
+      break;
+    }
+    default:
+      throw new Error(`Unknown notification outbox type: ${entry.type}`);
+  }
+}
 
-    await NotificationJob.updateOne({ _id: job._id, status: "processing" }, {
+async function processClaimedNotificationOutbox(entry) {
+  const leaseToken = entry.leaseToken;
+  const leaseInterval = setInterval(() => {
+    void NotificationOutbox.updateOne({
+      _id: entry._id,
+      status: "processing",
+      leaseToken
+    }, { $set: { leaseUntil: new Date(Date.now() + 60_000) } }).exec()
+      .catch((error) => console.error(`Notification outbox lease renewal failed for ${entry.outboxKey}.`, error));
+  }, 15_000);
+  leaseInterval.unref?.();
+  try {
+    await processNotificationOutboxEntry(entry);
+    const updated = await NotificationOutbox.updateOne({
+      _id: entry._id,
+      status: "processing",
+      leaseToken
+    }, { $set: { status: "completed", leaseUntil: null, leaseToken: "", lastError: "" } }).exec();
+    if (!updated.matchedCount) throw new Error("Notification outbox lease was lost before completion.");
+    return "completed";
+  } catch (error) {
+    const attempts = Number(entry.attempts) || 1;
+    const failed = attempts >= 10;
+    const delay = Math.min(60 * 60_000, 10_000 * (2 ** Math.min(attempts - 1, 7)));
+    const jitteredDelay = Math.round(delay * (0.8 + Math.random() * 0.4));
+    await NotificationOutbox.updateOne({
+      _id: entry._id,
+      status: "processing",
+      leaseToken
+    }, {
       $set: {
-        status: exhausted ? "failed" : "pending",
-        nextAttemptAt: new Date(Date.now() + retryDelay),
+        status: failed ? "failed" : "pending",
+        nextAttemptAt: new Date(Date.now() + jitteredDelay),
         leaseUntil: null,
+        leaseToken: "",
         lastError: String(error.message || error).slice(0, 500)
       }
     }).exec();
-    return exhausted ? "failed" : "retried";
+    console.error(`Notification outbox ${entry.outboxKey} ${failed ? "exhausted retries" : "will retry"}.`, error);
+    return failed ? "failed" : "retried";
+  } finally {
+    clearInterval(leaseInterval);
   }
+}
+
+async function getOldestNotificationAgeMs(now = new Date()) {
+  const oldest = await NotificationJob.findOne({
+    status: { $in: ["pending", "processing"] },
+    dueAt: { $lte: now },
+    nextAttemptAt: { $lte: now },
+    expiresAt: { $gt: now }
+  }).sort({ dueAt: 1 }).select("dueAt").lean().exec();
+  return oldest ? Math.max(0, now.getTime() - new Date(oldest.dueAt).getTime()) : 0;
 }
 
 async function runNotificationWorker({ limit = 20 } = {}) {
   if (!isMongoConnected()) return { processed: 0, sent: 0, retried: 0, failed: 0, undeliverable: 0, hasMore: false, unavailable: true };
+  let cleanup = { purged: 0, cancelled: 0 };
+  let cleanupFailed = false;
+  try {
+    cleanup = await cleanupStaleNotificationJobs();
+  } catch (error) {
+    cleanupFailed = true;
+    console.error("Notification job cleanup failed; dispatch will continue.", error);
+  }
   const batchLimit = Math.min(50, Math.max(1, Number.isInteger(limit) ? limit : 1));
+  const outboxEntries = [];
+  while (outboxEntries.length < batchLimit) {
+    const entry = await claimDueNotificationOutbox();
+    if (!entry) break;
+    outboxEntries.push(entry);
+  }
+  const outboxResults = await mapWithConcurrency(outboxEntries, NOTIFICATION_WORKER_CONCURRENCY, async (entry) => {
+    try {
+      return await processClaimedNotificationOutbox(entry);
+    } catch (error) {
+      console.error(`Notification outbox ${entry.outboxKey} processing crashed.`, error);
+      return "failed";
+    }
+  });
   const claimedJobs = [];
   while (claimedJobs.length < batchLimit) {
     const job = await claimDueNotificationJob();
@@ -1012,21 +1678,58 @@ async function runNotificationWorker({ limit = 20 } = {}) {
     claimedJobs.push(job);
   }
 
-  const outcomes = await Promise.all(claimedJobs.map(processClaimedNotificationJob));
+  const outcomes = await mapWithConcurrency(claimedJobs, NOTIFICATION_WORKER_CONCURRENCY, async (job) => {
+    try {
+      return await processClaimedNotificationJob(job);
+    } catch (error) {
+      console.error(`Notification job ${job.idempotencyKey} could not be finalized; its lease will allow recovery.`, error);
+      return "failed";
+    }
+  });
   const sent = outcomes.filter((outcome) => outcome === "sent").length;
   const retried = outcomes.filter((outcome) => outcome === "retried").length;
   const failed = outcomes.filter((outcome) => outcome === "failed").length;
   const undeliverable = outcomes.filter((outcome) => outcome === "undeliverable").length;
   const now = new Date();
-  const hasMore = Boolean(await NotificationJob.exists({
+  const jobsRemain = Boolean(await NotificationJob.exists({
     dueAt: { $lte: now },
+    nextAttemptAt: { $lte: now },
+    expiresAt: { $gt: now },
+    $or: [
+      { status: "pending" },
+      { status: "processing", leaseUntil: { $lte: now } }
+    ]
+  }).exec());
+  const outboxRemains = Boolean(await NotificationOutbox.exists({
     nextAttemptAt: { $lte: now },
     $or: [
       { status: "pending" },
       { status: "processing", leaseUntil: { $lte: now } }
     ]
   }).exec());
-  return { processed: claimedJobs.length, sent, retried, failed, undeliverable, hasMore, unavailable: false };
+  const hasMore = jobsRemain || outboxRemains;
+  const cancelled = outcomes.filter((outcome) => outcome === "cancelled").length;
+  const oldestDueAgeMs = await getOldestNotificationAgeMs(now);
+  if (oldestDueAgeMs >= 5 * 60_000) {
+    console.warn(`Notification queue lag is ${Math.round(oldestDueAgeMs / 1000)} seconds.`);
+  }
+  return {
+    processed: claimedJobs.length,
+    outboxProcessed: outboxEntries.length,
+    outboxRetried: outboxResults.filter((result) => result === "retried").length,
+    outboxFailed: outboxResults.filter((result) => result === "failed").length,
+    sent,
+    retried,
+    failed,
+    undeliverable,
+    cancelled: cancelled + cleanup.cancelled,
+    purged: cleanup.purged,
+    cleanupFailed,
+    expiredDevicesDeactivated: claimedJobs.reduce((total, job) => total + (Number(job.runExpiredDeviceCount) || 0), 0),
+    oldestDueAgeMs,
+    hasMore,
+    unavailable: false
+  };
 }
 
 const eventReportSchema = new mongoose.Schema({
@@ -1067,15 +1770,15 @@ function buildFacultyTurnoutBreakdown(attendees, facultyByUserId = new Map()) {
 }
 
 function eventDocumentFromRecord(event) {
-  const startsAt = new Date(event.date || event.startTime || "");
-  const endsAt = new Date(event.endTime || "");
+  const startsAt = eventStartDate(event);
+  const endsAt = parseCampusDateTime(event.endTime);
   return {
     eventId: String(event.id),
     ownerUserId: String(event.createdByUserId || ""),
     status: String(event.status || "Draft"),
     category: String(event.category || ""),
-    startsAt: Number.isFinite(startsAt.getTime()) ? startsAt : null,
-    endsAt: Number.isFinite(endsAt.getTime()) ? endsAt : null,
+    startsAt,
+    endsAt,
     record: event
   };
 }
@@ -1222,16 +1925,61 @@ function getEventSubmissionFingerprint(payload) {
   return crypto.createHash("sha256").update(JSON.stringify(submission)).digest("hex");
 }
 
-async function storeEvent(event) {
+function createNotificationOutboxIntent(type, event, details = {}) {
+  const version = details.version || event.updatedAt || event.createdAt || "initial";
+  const outboxKey = details.outboxKey || `${type}:${event.id}:${version}`;
+  return {
+    outboxKey,
+    eventId: String(event.id),
+    type,
+    payload: { event, ...details.payload }
+  };
+}
+
+async function storeEvent(event, notificationIntents = []) {
   if (!isMongoConnected()) {
     const database = readDatabase();
     const index = database.events.findIndex((item) => String(item.id) === String(event.id));
     if (index < 0) database.events.push(event);
     else database.events[index] = event;
+    if (notificationIntents.length) {
+      database.notificationOutbox = Array.isArray(database.notificationOutbox) ? database.notificationOutbox : [];
+      const knownKeys = new Set(database.notificationOutbox.map((item) => item.outboxKey));
+      for (const intent of notificationIntents) {
+        if (knownKeys.has(intent.outboxKey)) continue;
+        database.notificationOutbox.push({
+          ...intent,
+          status: "pending",
+          attempts: 0,
+          nextAttemptAt: new Date().toISOString(),
+          createdAt: new Date().toISOString()
+        });
+      }
+    }
     writeDatabase(database);
     return event;
   }
-  await EventRecord.updateOne({ eventId: String(event.id) }, { $set: eventDocumentFromRecord(event) }, { upsert: true }).exec();
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      await EventRecord.updateOne(
+        { eventId: String(event.id) },
+        { $set: eventDocumentFromRecord(event) },
+        { upsert: true, session }
+      ).exec();
+      if (notificationIntents.length) {
+        await NotificationOutbox.bulkWrite(notificationIntents.map((intent) => ({
+          updateOne: {
+            filter: { outboxKey: intent.outboxKey },
+            update: { $setOnInsert: { ...intent, status: "pending", attempts: 0, nextAttemptAt: new Date() } },
+            upsert: true
+          }
+        })), { session, ordered: true });
+      }
+    });
+  } finally {
+    await session.endSession();
+  }
   return event;
 }
 
@@ -1942,16 +2690,83 @@ app.get("/api/config/google", (request, response) => {
 app.get("/api/notifications/config", (request, response) => {
   const recapUploadMissingVariables = getMissingCloudinaryVariables();
   const vapidConfiguration = getVapidConfiguration();
+  let fcmConfigured = false;
+  let fcmConfigurationError = "";
+  try {
+    getFirebaseConfiguration();
+    fcmConfigured = true;
+  } catch (error) {
+    fcmConfigurationError = error.message;
+  }
   response.json({
     durableSchedulingAvailable: isMongoConnected(),
     webPushConfigured: vapidConfiguration.valid,
     webPushPublicKey: vapidConfiguration.valid ? process.env.WEB_PUSH_PUBLIC_KEY.trim() : null,
     webPushConfigurationError: vapidConfiguration.valid ? "" : vapidConfiguration.error,
+    fcmConfigured,
+    fcmConfigurationError,
     eventImageStorageConfigured: recapUploadMissingVariables.length === 0,
     eventImageStorageMissingVariables: recapUploadMissingVariables,
     recapUploadConfigured: recapUploadMissingVariables.length === 0,
     recapUploadMissingVariables
   });
+});
+
+app.post("/api/internal/notifications/dead-letter/:id/replay", async (request, response) => {
+  const expectedSecret = process.env.CRON_SECRET_KEY || "";
+  const providedSecret = request.get("x-cron-secret") || "";
+  if (!expectedSecret) return response.status(503).json({ error: "Background notification trigger is not configured." });
+  const expectedBuffer = Buffer.from(expectedSecret);
+  const providedBuffer = Buffer.from(providedSecret);
+  if (expectedBuffer.length !== providedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, providedBuffer)) {
+    return response.status(401).json({ error: "Background notification trigger is unauthorized." });
+  }
+  if (!/^[a-f0-9]{24}$/i.test(request.params.id)) {
+    return response.status(400).json({ error: "Dead-letter ID is invalid." });
+  }
+  if (!isMongoConnected()) return response.status(503).json({ error: "Dead-letter replay requires the MongoDB queue." });
+
+  const session = await mongoose.startSession();
+  try {
+    let replayed = false;
+    await session.withTransaction(async () => {
+      const deadLetter = await NotificationDeadLetter.findById(request.params.id).session(session).exec();
+      if (!deadLetter) return;
+      const replayedJob = await NotificationJob.findOneAndUpdate({
+        _id: deadLetter.sourceJobId,
+        status: { $in: ["failed", "undeliverable"] }
+      }, {
+        $set: {
+          status: "pending",
+          attempts: 0,
+          deliveredDeviceKeys: [],
+          socketDelivered: false,
+          deactivatedDeviceCount: 0,
+          leaseToken: "",
+          nextAttemptAt: new Date(),
+          leaseUntil: null,
+          processingStartedAt: null,
+          completedAt: null,
+          sentAt: null,
+          lastError: ""
+        }
+      }, { new: true, session }).exec();
+      if (!replayedJob) throw Object.assign(new Error("This dead-letter entry no longer has a replayable failed job."), { code: "DEAD_LETTER_NOT_REPLAYABLE" });
+      deadLetter.replayedAt = new Date();
+      deadLetter.replayCount = Number(deadLetter.replayCount || 0) + 1;
+      await deadLetter.save({ session });
+      replayed = true;
+    });
+    if (!replayed) return response.status(404).json({ error: "Dead-letter entry was not found." });
+    console.info(`Notification dead-letter ${request.params.id} was replayed.`);
+    return response.json({ replayed: true });
+  } catch (error) {
+    if (error.code === "DEAD_LETTER_NOT_REPLAYABLE") return response.status(409).json({ error: error.message });
+    console.error("Notification dead-letter replay failed.", error);
+    return response.status(500).json({ error: "Unable to replay this notification." });
+  } finally {
+    await session.endSession();
+  }
 });
 
 app.post("/api/internal/notifications/worker", async (request, response) => {
@@ -1975,8 +2790,11 @@ app.post("/api/internal/notifications/worker", async (request, response) => {
     : 20;
   try {
     const result = await runNotificationWorker({ limit });
-    if (result.failed > 0) {
+    if (result.failed > 0 || result.outboxFailed > 0) {
       return response.status(502).json({ ok: false, ...result, error: "One or more notification jobs exhausted their delivery retries." });
+    }
+    if (result.cleanupFailed) {
+      return response.status(502).json({ ok: false, ...result, error: "Notifications were processed, but stale notification cleanup failed." });
     }
     return response.json({ ok: true, ...result });
   } catch (error) {
@@ -1990,12 +2808,22 @@ app.get("/api/notifications/status", async (request, response) => {
     const user = await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Authentication required." });
     const requestedPlatform = String(request.query.platform || "");
-    if (requestedPlatform !== "web") {
-      return response.status(400).json({ error: "Notification platform must be web." });
+    if (!["web", "fcm"].includes(requestedPlatform)) {
+      return response.status(400).json({ error: "Notification platform must be web or fcm." });
     }
     const userId = String(user._id || user.id);
-    const vapidConfiguration = getVapidConfiguration();
-    const pushConfigured = vapidConfiguration.valid;
+    const vapidConfiguration = requestedPlatform === "web" ? getVapidConfiguration() : null;
+    let fcmConfigured = false;
+    let fcmConfigurationError = "";
+    if (requestedPlatform === "fcm") {
+      try {
+        getFirebaseConfiguration();
+        fcmConfigured = true;
+      } catch (error) {
+        fcmConfigurationError = error.message;
+      }
+    }
+    const pushConfigured = requestedPlatform === "web" ? vapidConfiguration.valid : fcmConfigured;
     const requestedDeviceKey = String(request.query.deviceKey || "");
     if (requestedDeviceKey && !/^[a-f0-9]{64}$/.test(requestedDeviceKey)) {
       return response.status(400).json({ error: "Device key must be a SHA-256 hex digest." });
@@ -2018,7 +2846,7 @@ app.get("/api/notifications/status", async (request, response) => {
     return response.json({
       durableSchedulingAvailable: isMongoConnected(),
       pushConfigured,
-      pushConfigurationError: pushConfigured ? "" : vapidConfiguration.error,
+      pushConfigurationError: pushConfigured ? "" : requestedPlatform === "web" ? vapidConfiguration.error : fcmConfigurationError,
       deviceRegistered
     });
   } catch (error) {
@@ -2044,8 +2872,10 @@ app.post("/api/notifications/devices/web", async (request, response) => {
     } catch {
       return response.status(400).json({ error: "A valid browser push subscription is required." });
     }
-    if (endpointUrl.protocol !== "https:" || typeof subscription?.keys?.p256dh !== "string" || typeof subscription?.keys?.auth !== "string") {
-      return response.status(400).json({ error: "The browser push subscription is incomplete or insecure." });
+    if (!isAllowedWebPushEndpoint(endpointUrl.toString())
+      || typeof subscription?.keys?.p256dh !== "string"
+      || typeof subscription?.keys?.auth !== "string") {
+      return response.status(400).json({ error: "The browser push subscription is incomplete or uses an unsupported push service." });
     }
     const vapidConfiguration = getVapidConfiguration();
     if (!vapidConfiguration.valid) {
@@ -2108,14 +2938,68 @@ app.post("/api/notifications/devices/web", async (request, response) => {
   }
 });
 
+app.post("/api/notifications/devices/fcm", async (request, response) => {
+  let authenticatedUserId = "";
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Authentication required." });
+    authenticatedUserId = String(user._id || user.id);
+    const token = typeof request.body?.token === "string" ? request.body.token.trim() : "";
+    if (token.length < 32 || token.length > 4096 || /\s/.test(token)) {
+      return response.status(400).json({ error: "A valid Firebase registration token is required." });
+    }
+    try {
+      getFirebaseConfiguration();
+    } catch (error) {
+      return response.status(503).json({ error: `FCM is not configured correctly: ${error.message}` });
+    }
+    const deviceKey = crypto.createHash("sha256").update(`fcm:${token}`).digest("hex");
+    if (isMongoConnected()) {
+      await PushDevice.findOneAndUpdate(
+        { deviceKey },
+        { $set: { userId: authenticatedUserId, platform: "fcm", token, endpoint: "", subscription: null, enabled: true } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      ).exec();
+    } else {
+      const database = readDatabase();
+      database.pushDevices = (database.pushDevices || []).filter((device) => device.deviceKey !== deviceKey);
+      database.pushDevices.push({
+        userId: authenticatedUserId,
+        deviceKey,
+        platform: "fcm",
+        token,
+        enabled: true
+      });
+      writeDatabase(database);
+    }
+    return response.status(201).json({ registered: true });
+  } catch (error) {
+    if (error.code === 11000) return response.status(409).json({ error: "This FCM device could not be connected to the signed-in account. Please try again." });
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
+    console.error("FCM device registration failed.", error);
+    return response.status(500).json({ error: "Unable to register this device for notifications." });
+  }
+});
+
 app.delete("/api/notifications/devices/:deviceKey", async (request, response) => {
   try {
     const user = await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Authentication required." });
-    await PushDevice.updateOne({
+    const deviceFilter = {
       deviceKey: String(request.params.deviceKey),
       userId: String(user._id || user.id)
-    }, { $set: { enabled: false } }).exec();
+    };
+    if (isMongoConnected()) {
+      await PushDevice.updateOne(deviceFilter, { $set: { enabled: false } }).exec();
+    } else {
+      const database = readDatabase();
+      database.pushDevices = (database.pushDevices || []).map((device) =>
+        device.deviceKey === deviceFilter.deviceKey && String(device.userId) === deviceFilter.userId
+          ? { ...device, enabled: false }
+          : device
+      );
+      writeDatabase(database);
+    }
     return response.json({ removed: true });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) return response.status(401).json({ error: "Session is no longer valid." });
@@ -2970,7 +3854,7 @@ app.get("/api/events", async (request, response) => {
     const category = request.query.category;
     let events = storedEvents.filter((event) => {
       const isOwnerDraft = Boolean(user && event.status === "Draft" && String(event.createdByUserId || "") === String(user._id || user.id));
-      const endedAt = new Date(event.endTime || "").getTime();
+      const endedAt = parseCampusDateTime(event.endTime)?.getTime() ?? NaN;
       const isOwnerRecentEndedEvent = Boolean(user
         && event.status !== "Cancelled"
         && String(event.createdByUserId || "") === String(user._id || user.id)
@@ -3052,7 +3936,7 @@ app.post("/api/events/:eventId/recap-prompt-dismissal", async (request, response
     if (!event || String(event.createdByUserId || "") !== userId) {
       return response.status(404).json({ error: "This event is not available in your organizer profile." });
     }
-    const endedAt = new Date(event.endTime || "").getTime();
+    const endedAt = parseCampusDateTime(event.endTime)?.getTime() ?? NaN;
     if (!Number.isFinite(endedAt) || endedAt > Date.now() || Date.now() - endedAt > 7 * 24 * 60 * 60_000) {
       return response.status(409).json({ error: "The recap prompt can only be dismissed during the seven days after an event ends." });
     }
@@ -3098,9 +3982,9 @@ app.get("/api/events/engagement", async (request, response) => {
           && (event.status === "Cancelled"
             ? Number.isFinite(new Date(event.cancelledAt || "").getTime())
               && Date.now() - new Date(event.cancelledAt).getTime() <= 7 * 24 * 60 * 60_000
-            : Number.isFinite(new Date(event.endTime || "").getTime())
-              && new Date(event.endTime).getTime() <= Date.now()
-              && Date.now() - new Date(event.endTime).getTime() <= 7 * 24 * 60 * 60_000)));
+            : Number.isFinite(parseCampusDateTime(event.endTime)?.getTime())
+              && parseCampusDateTime(event.endTime).getTime() <= Date.now()
+              && Date.now() - parseCampusDateTime(event.endTime).getTime() <= 7 * 24 * 60 * 60_000)));
     const ownerEvents = viewerId
       ? eligibleEvents.filter((event) => String(event.createdByUserId || "") === viewerId)
       : [];
@@ -3205,8 +4089,7 @@ function eventStartDate(event) {
   const candidate = /^\d{1,2}:\d{2}(:\d{2})?$/.test(time) && event?.date
     ? `${String(event.date).slice(0, 10)}T${time.length === 5 ? `${time}:00` : time}`
     : time || event?.date || "";
-  const parsed = new Date(candidate);
-  return Number.isFinite(parsed.getTime()) ? parsed : null;
+  return parseCampusDateTime(candidate);
 }
 
 function escapeRegex(value) {
@@ -3389,6 +4272,7 @@ async function getEventNotificationAudience(event, includeCategoryFollowers = tr
     includeCategoryFollowers && NOTIFICATION_CATEGORIES.includes(String(event.category || "").toLowerCase())
       ? User.find({
         emailVerified: true,
+        "profile.hasCompletedTour": true,
         [`profile.notificationPreferences.${String(event.category).toLowerCase()}`]: { $ne: false }
       }).select("_id").lean().exec()
       : Promise.resolve([])
@@ -3402,7 +4286,8 @@ function buildCriticalEventUpdateDetails(previous, event) {
   const scheduleChanged = ["date", "startTime"].some((key) => String(previous[key] || "") !== String(event[key] || ""));
   const changedFields = [
     ["title", "title"],
-    ["venue", "venue"]
+    ["venue", "venue"],
+    ["endTime", "end time"]
   ].filter(([key]) => String(previous[key] || "") !== String(event[key] || "")).map(([, label]) => label);
   if (scheduleChanged) changedFields.unshift("start time");
   if (!changedFields.length) return null;
@@ -3504,8 +4389,6 @@ app.post("/api/events", async (request, response) => {
           error: "This event was already published, but the details changed after the last request. Refresh your events and edit the published event to apply those changes."
         });
       }
-      void enqueueCategoryAlert(existing).catch((error) => console.error("New-event notifications could not be queued.", error));
-      void scheduleEventEndedRecapPrompt(existing).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
       return response.json({ event: toPublicEvent(existing), similarEvents: [] });
     }
     const now = new Date().toISOString();
@@ -3548,9 +4431,9 @@ app.post("/api/events", async (request, response) => {
         });
       }
       event = await externalizeEventBanners(event);
-      await storeEvent(event);
-      void enqueueCategoryAlert(event).catch((error) => console.error("New-event notifications could not be queued.", error));
-      void scheduleEventEndedRecapPrompt(event).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
+      await storeEvent(event, [
+        createNotificationOutboxIntent("new-event", event, { version: event.updatedAt })
+      ]);
       return response.status(201).json({ event: toPublicEvent(event), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
     event = await externalizeEventBanners(event);
@@ -3624,20 +4507,22 @@ app.patch("/api/events/:eventId", async (request, response) => {
         });
       }
       updated = await externalizeEventBanners(updated);
-      await storeEvent(updated);
-      if (["Published", "Live"].includes(updated.status)) {
-        void scheduleEventEndedRecapPrompt(updated).catch((error) => console.error("Event-end recap notification could not be scheduled.", error));
-        if (current.status === "Draft") {
-          void enqueueCategoryAlert(updated).catch((error) => console.error("New-event notifications could not be queued.", error));
-        } else {
-          const changedCriticalField = ["title", "date", "startTime", "venue"].some((key) => String(current[key] || "") !== String(updated[key] || ""));
-          if (changedCriticalField) {
-            void notifyCriticalEventUpdate(current, updated).catch((error) => console.error("Event update notifications could not be queued.", error));
-          }
-        }
-      } else {
-        void cancelEventEndedRecapPrompts(updated.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
-      }
+      const becamePublished = !["Published", "Live"].includes(current.status)
+        && ["Published", "Live"].includes(updated.status);
+      const criticalUpdate = ["Published", "Live"].includes(current.status)
+        && ["Published", "Live"].includes(updated.status)
+        && Boolean(buildCriticalEventUpdateDetails(current, updated));
+      const notificationIntents = becamePublished
+        ? [createNotificationOutboxIntent("new-event", updated, { version: updated.updatedAt })]
+        : criticalUpdate
+          ? [createNotificationOutboxIntent("event-critical-update", updated, {
+            version: updated.updatedAt,
+            payload: { previous: current }
+          })]
+          : current.status !== updated.status
+            ? [createNotificationOutboxIntent("event-state-changed", updated, { version: updated.updatedAt })]
+            : [];
+      await storeEvent(updated, notificationIntents);
       return response.json({ event: toPublicEvent(updated), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
     updated = await externalizeEventBanners(updated);
@@ -3668,8 +4553,7 @@ app.delete("/api/events/:eventId", async (request, response) => {
     if (String(event.createdByUserId || "") !== String(user._id || user.id)) {
       return response.status(403).json({ error: "Only the account that created this event can delete it." });
     }
-    const eventEnded = Number.isFinite(new Date(event.endTime || "").getTime())
-      && new Date(event.endTime).getTime() <= Date.now();
+    const eventEnded = (parseCampusDateTime(event.endTime)?.getTime() ?? NaN) <= Date.now();
     if (["Published", "Live"].includes(event.status) && !eventEnded) {
       const cancelledAt = new Date();
       const cancelledEvent = {
@@ -3679,7 +4563,9 @@ app.delete("/api/events/:eventId", async (request, response) => {
         cancellationExpiresAt: new Date(cancelledAt.getTime() + (7 * 24 * 60 * 60_000)).toISOString(),
         updatedAt: cancelledAt.toISOString()
       };
-      await storeEvent(cancelledEvent);
+      await storeEvent(cancelledEvent, [
+        createNotificationOutboxIntent("event-cancelled", cancelledEvent, { version: cancelledEvent.updatedAt })
+      ]);
       void cancelEventEndedRecapPrompts(event.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
       if (isMongoConnected()) {
         await NotificationJob.updateMany({
@@ -3688,17 +4574,19 @@ app.delete("/api/events/:eventId", async (request, response) => {
           kind: { $in: ["rsvp-reminder-1h", "rsvp-reminder-30m", "rsvp-reminder-start", "custom-reminder"] }
         }, { $set: { status: "cancelled", leaseUntil: null } }).exec();
       }
-      try {
-        const recipients = await getEventNotificationAudience(cancelledEvent, true);
-        await enqueueNotifications(recipients, {
-          idempotencyKey: `event-cancelled:${event.id}`,
-          event: cancelledEvent,
-          kind: "event-cancellation",
-          title: "Event cancellation notice",
-          message: `⚠️ CANCELLATION NOTICE: ${event.title} has been called off. Tap to view details.`
-        });
-      } catch (error) {
-        console.error("Event cancellation was saved, but audience notifications could not be queued.", error);
+      if (!isMongoConnected()) {
+        try {
+          const recipients = await getEventNotificationAudience(cancelledEvent, true);
+          await enqueueNotifications(recipients, {
+            idempotencyKey: `event-cancelled:${event.id}`,
+            event: cancelledEvent,
+            kind: "event-cancellation",
+            title: "Event cancellation notice",
+            message: `⚠️ CANCELLATION NOTICE: ${event.title} has been called off. Tap to view details.`
+          });
+        } catch (error) {
+          console.error("Event cancellation was saved, but audience notifications could not be queued.", error);
+        }
       }
       return response.json({ message: "Cancellation notice sent. The event is no longer in the public feed and remains in your profile for seven days.", cancelled: true });
     }
@@ -3790,8 +4678,8 @@ app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
     if (String(event.createdByUserId || "") !== String(user._id || user.id)) {
       return response.status(403).json({ error: "Only the event organizer can upload recap photos." });
     }
-    const eventEnd = new Date(event.endTime || "");
-    if (!Number.isFinite(eventEnd.getTime()) || eventEnd.getTime() > Date.now()
+    const eventEnd = parseCampusDateTime(event.endTime);
+    if (!eventEnd || eventEnd.getTime() > Date.now()
       || Date.now() - eventEnd.getTime() > 7 * 24 * 60 * 60_000) {
       return response.status(409).json({ error: "Recap photos can be uploaded after the event ends and for up to seven days." });
     }
@@ -3825,18 +4713,22 @@ app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
       recapPublishedAt,
       updatedAt: new Date().toISOString()
     };
-    await storeEvent(updated);
+    await storeEvent(updated, currentPhotos.length === 0
+      ? [createNotificationOutboxIntent("event-recap-published", updated, { version: updated.updatedAt })]
+      : []);
     if (currentPhotos.length === 0) {
       try {
-        const recipients = await User.find({ emailVerified: true }).select("_id").lean().exec();
-        await enqueueNotifications(recipients.map((recipient) => recipient._id), {
-          idempotencyKey: `event-recap:${event.id}`,
-          event: updated,
-          kind: "event-recap",
-          title: "Relive the vibe!",
-          message: `Relive the vibe! Photos from ${event.title} are now live. Tap to check out the recap.`,
-          universal: true
-        });
+        if (!isMongoConnected()) {
+          const recipients = await User.find({ emailVerified: true }).select("_id").lean().exec();
+          await enqueueNotifications(recipients.map((recipient) => recipient._id), {
+            idempotencyKey: `event-recap:${event.id}`,
+            event: updated,
+            kind: "event-recap",
+            title: "Relive the vibe!",
+            message: `Relive the vibe! Photos from ${event.title} are now live. Tap to check out the recap.`,
+            universal: true
+          });
+        }
       } catch (error) {
         console.error("Recap photos were saved, but the universal recap notification could not be queued.", error);
       }
@@ -4257,7 +5149,7 @@ app.get("/api/events/:eventId", async (request, response) => {
     const event = await findStoredEvent(request.params.eventId);
     if (!event) return response.status(404).json({ error: "Event not found." });
     const isOwner = Boolean(viewerId && String(event.createdByUserId || "") === viewerId);
-    const eventEnd = new Date(event.endTime || "").getTime();
+    const eventEnd = parseCampusDateTime(event.endTime)?.getTime() ?? NaN;
     const ownerEndedRecently = isOwner && Number.isFinite(eventEnd)
       && event.status !== "Cancelled"
       && eventEnd <= Date.now()
@@ -4402,7 +5294,7 @@ async function startServer() {
       await Promise.all([
         User.init(), EmailChallenge.init(), EventRecord.init(), EngagementAction.init(), EventReport.init(),
         EventView.init(), RecapPromptDismissal.init(),
-        PushDevice.init(), NotificationJob.init()
+        PushDevice.init(), NotificationJob.init(), NotificationOutbox.init(), NotificationDeadLetter.init()
       ]);
       databaseBackend = "mongodb";
       console.log("FUTApulse connected to MongoDB and verified indexes.");
@@ -4423,10 +5315,18 @@ if (require.main === module) {
 module.exports = {
   app,
   startServer,
-  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob },
+  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob, NotificationOutbox, NotificationDeadLetter },
   buildFacultyTurnoutBreakdown,
   buildRsvpReminderSchedule,
   buildCriticalEventUpdateDetails,
+  parseCampusDateTime,
+  isNotificationProfileEligible,
+  isAllowedWebPushEndpoint,
+  isTransientPushFailure,
+  sendWebPushWithRetry,
+  getFirebaseConfiguration,
+  sendFcmWithRetry,
+  isInvalidFcmTokenError,
   describeWebPushFailure,
   validateVapidCredentials
 };

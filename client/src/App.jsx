@@ -10,6 +10,7 @@ import BrandHeart from './components/BrandHeart'
 import AppTour from './components/AppTour'
 import { API_BASE_URL, SOCKET_BASE_URL } from './config/api'
 import { isPublicRecapVisible, matchesProfileAudience } from './utils/eventVisibility'
+import { formatCampusDateTime, parseCampusDateTime } from './utils/campusTime'
 import { io } from 'socket.io-client'
 
 const EventCard = lazy(() => import('./components/EventCard'))
@@ -36,6 +37,7 @@ const NAV_ITEMS = [
   { id: 'profile', label: 'Profile', Icon: User },
 ]
 const FUTAPULSE_ADMIN_EMAIL = 'immanuelidowu1@gmail.com'
+const HANDLED_NOTIFICATION_STORAGE_KEY = 'futapulse-handled-notification-ids'
 const EVENT_LIST_PAGE_SIZE = 12
 const MAX_CACHED_EVENTS = 40
 const MAX_EVENT_CACHE_CHARACTERS = 360_000
@@ -62,6 +64,23 @@ function readStoredValue(key, fallback = '') {
     return localStorage.getItem(key) ?? fallback
   } catch {
     return fallback
+  }
+}
+
+function readHandledNotificationIds() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(HANDLED_NOTIFICATION_STORAGE_KEY) || '[]')
+    return Array.isArray(stored) ? stored.filter((id) => typeof id === 'string').slice(-200) : []
+  } catch {
+    return []
+  }
+}
+
+function persistHandledNotificationIds(ids) {
+  try {
+    localStorage.setItem(HANDLED_NOTIFICATION_STORAGE_KEY, JSON.stringify(ids.slice(-200)))
+  } catch (error) {
+    console.warn('Could not persist notification deduplication state.', error)
   }
 }
 
@@ -251,13 +270,13 @@ function getStartTime(event) {
 }
 
 function hasEventEnded(event, now = Date.now()) {
-  const endTime = Date.parse(event?.endTime || '')
+  const endTime = parseCampusDateTime(event?.endTime || '')?.getTime() ?? NaN
   return Number.isFinite(endTime) && endTime <= now
 }
 
 function isWithinEventDisplayWindow(event, now = Date.now()) {
-  const startTime = Date.parse(getStartTime(event) || '')
-  const endTime = Date.parse(event?.endTime || '')
+  const startTime = parseCampusDateTime(getStartTime(event) || '')?.getTime() ?? NaN
+  const endTime = parseCampusDateTime(event?.endTime || '')?.getTime() ?? NaN
   return Number.isFinite(startTime)
     && Number.isFinite(endTime)
     && endTime > startTime
@@ -265,14 +284,14 @@ function isWithinEventDisplayWindow(event, now = Date.now()) {
 }
 
 function formatEventTimeRange(event) {
-  const start = new Date(getStartTime(event))
-  const end = new Date(event.endTime)
-  if (!Number.isFinite(start.getTime())) return ''
-  const dateLabel = start.toLocaleDateString([], { month: 'short', day: 'numeric' })
-  const startLabel = start.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-  if (!Number.isFinite(end.getTime())) return `${dateLabel} · ${startLabel}`
-  const endDateLabel = end.toLocaleDateString([], { month: 'short', day: 'numeric' })
-  const endLabel = end.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  const start = parseCampusDateTime(getStartTime(event) || '')
+  const end = parseCampusDateTime(event.endTime || '')
+  if (!start) return ''
+  const dateLabel = formatCampusDateTime(start, { year: undefined, dateStyle: undefined, timeStyle: undefined, month: 'short', day: 'numeric' })
+  const startLabel = formatCampusDateTime(start, { dateStyle: undefined, timeStyle: undefined, hour: 'numeric', minute: '2-digit' })
+  if (!end) return `${dateLabel} · ${startLabel}`
+  const endDateLabel = formatCampusDateTime(end, { year: undefined, dateStyle: undefined, timeStyle: undefined, month: 'short', day: 'numeric' })
+  const endLabel = formatCampusDateTime(end, { dateStyle: undefined, timeStyle: undefined, hour: 'numeric', minute: '2-digit' })
   return `${dateLabel} · ${startLabel}–${dateLabel === endDateLabel ? endLabel : `${endDateLabel} · ${endLabel}`}`
 }
 
@@ -525,7 +544,7 @@ function FutaPulseApp() {
   const [activeEventAlert, setActiveEventAlert] = useState(null)
   const [homeAnnouncement, setHomeAnnouncement] = useState(null)
   const [highlightedNotificationEventId, setHighlightedNotificationEventId] = useState('')
-  const handledNotificationIds = useRef(new Set())
+  const handledNotificationIds = useRef(new Set(readHandledNotificationIds()))
   const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [settingsPage, setSettingsPage] = useState('menu')
   const [cloudinaryCheck, setCloudinaryCheck] = useState(null)
@@ -630,12 +649,14 @@ function FutaPulseApp() {
 
   const receiveNotification = useCallback((payload) => {
     if (payload?.recipientUserId && String(payload.recipientUserId) !== String(user?.id || '')) return
-    if (!payload?.notificationId || handledNotificationIds.current.has(payload.notificationId)) return
+    if (!payload?.notificationId || handledNotificationIds.current.has(payload.notificationId)
+      || readHandledNotificationIds().includes(payload.notificationId)) return
     window.clearTimeout(toastTimer.current)
     handledNotificationIds.current.add(payload.notificationId)
     if (handledNotificationIds.current.size > 250) {
       handledNotificationIds.current = new Set([...handledNotificationIds.current].slice(-150))
     }
+    persistHandledNotificationIds([...handledNotificationIds.current])
     if (payload.kind === 'new-event') setToast({ message: payload.title || payload.message || 'A new campus event is available.', type: 'info', notification: payload })
     else setToast({ message: payload.message || payload.title || 'There is a new event update.', type: 'info', notification: payload })
     if (payload.kind === 'trending-spike') setHomeAnnouncement(payload)
@@ -1273,7 +1294,7 @@ function FutaPulseApp() {
       setReminderClock(now)
       const nextExpiry = feedExpiryEventsRef.current
         .flatMap((event) => {
-          const endTime = Date.parse(event.endTime || '')
+          const endTime = parseCampusDateTime(event.endTime || '')?.getTime() ?? NaN
           const recapPublishedAt = Date.parse(event.recapPublishedAt || '')
           return [
             ...(Number.isFinite(endTime) ? [endTime, endTime + (30 * 60 * 1000)] : []),
@@ -1699,7 +1720,7 @@ function FutaPulseApp() {
     if (notifications.reminders !== false) {
       goingIds.forEach((eventId) => {
         const event = events.find((item) => String(getEventId(item)) === eventId)
-        const startAt = Date.parse(getStartTime(event || {}))
+        const startAt = parseCampusDateTime(getStartTime(event || {}) || '')?.getTime() ?? NaN
         const reminderAt = manualReminderTimes.get(eventId)
         if (!event || !Number.isFinite(startAt) || startAt <= now || (Number.isFinite(reminderAt) && reminderAt > now)) return
 
@@ -2522,7 +2543,7 @@ function FutaPulseApp() {
     if (!reminderTarget) return
     primeAlarmAudio()
     const event = events.find((item) => String(getEventId(item)) === String(reminderTarget))
-    const eventStart = new Date(getStartTime(event || {})).getTime()
+    const eventStart = parseCampusDateTime(getStartTime(event || {}) || '')?.getTime() ?? NaN
     if (!event || !Number.isFinite(eventStart)) {
       notify('Unable to schedule a reminder for this event.', 'error')
       setReminderTarget(null)
@@ -2574,8 +2595,8 @@ function FutaPulseApp() {
   const autosaveEventDraft = async (eventData, banner) => {
     if (!profile || !session?.token) throw new Error('Sign in and complete your profile to save an event draft.')
     const editing = Boolean(eventData.id)
-    const startAt = eventData.date ? new Date(eventData.date) : null
-    const endAt = eventData.endDateTime ? new Date(eventData.endDateTime) : null
+    const startAt = eventData.date ? parseCampusDateTime(eventData.date) : null
+    const endAt = eventData.endDateTime ? parseCampusDateTime(eventData.endDateTime) : null
     const validStart = Boolean(startAt && Number.isFinite(startAt.getTime()))
     const validEnd = Boolean(endAt && Number.isFinite(endAt.getTime()))
     const payload = {
@@ -2668,9 +2689,9 @@ function FutaPulseApp() {
     const eventId = eventData.id || ''
     const allowSimilar = eventData.allowSimilar === true
     try {
-      const startAt = eventData.date ? new Date(eventData.date) : null
+      const startAt = eventData.date ? parseCampusDateTime(eventData.date) : null
       const validStart = Boolean(startAt && Number.isFinite(startAt.getTime()))
-      const endAt = eventData.endDateTime ? new Date(eventData.endDateTime) : null
+      const endAt = eventData.endDateTime ? parseCampusDateTime(eventData.endDateTime) : null
       const status = eventData.status || 'Draft'
       if (status === 'Published') {
         if (!validStart) throw new Error('Choose a valid event start date and time before publishing.')
@@ -3213,8 +3234,8 @@ function FutaPulseApp() {
                   <p className="organizer-swipe-hint">Swipe left or right to switch between Events and Drafts.</p>
                   {organizerEvents.length ? <div className="profile-events-list">
                     {organizerEvents.slice(0, visibleOrganizerCount).map((event) => {
-                      const startAt = Date.parse(getStartTime(event))
-                      const endAt = Date.parse(event.endTime || '')
+                      const startAt = parseCampusDateTime(getStartTime(event) || '')?.getTime() ?? NaN
+                      const endAt = parseCampusDateTime(event.endTime || '')?.getTime() ?? NaN
                       const isEnded = Number.isFinite(endAt) && endAt <= clockNow
                       const isUpcoming = Number.isFinite(startAt) && startAt > clockNow && !isEnded
                       const isLive = Number.isFinite(startAt) && startAt <= clockNow && Number.isFinite(endAt) && endAt > clockNow
@@ -3242,7 +3263,7 @@ function FutaPulseApp() {
                                 <strong>{event.title}</strong>
                                 {organizerTab === 'events' && isUpcoming && isActiveEvent && <span className="profile-event-view-count" title="Unique signed-in viewers"><Eye size={13} aria-hidden="true" /> {Number(event.viewCount) || 0} {Number(event.viewCount) === 1 ? 'view' : 'views'}</span>}
                               </div>
-                              <span>{event.venue || 'Venue not set'} · {event.date ? new Date(event.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'Date not set'}</span>
+                              <span>{event.venue || 'Venue not set'} · {event.date ? formatCampusDateTime(event.date) : 'Date not set'}</span>
                             </div>
                           </div>
                           {organizerTab === 'events' && recapWindowOpen && !event.recapPromptDismissed && (
@@ -3676,7 +3697,7 @@ function FutaPulseApp() {
                           <article key={item.eventId} className="event-report-review-card">
                             <strong>{item.event.title}</strong>
                             <span>{item.event.organizerName || 'Campus Organizer'} · {item.event.category} · {item.event.venue}</span>
-                            <span>{new Date(item.event.date).toLocaleString()} – {new Date(item.event.endTime).toLocaleString()}</span>
+                            <span>{formatCampusDateTime(item.event.date)} – {formatCampusDateTime(item.event.endTime)}</span>
                             <p>{item.event.activity}</p>
                             <button type="button" className="event-report-open" onClick={() => { setProfileMenuOpen(false); setDetailEvent(item.event) }}>Open full event</button>
                             <div className="event-report-reasons"><strong>{item.reporterIds.length} reports</strong>{item.reports.map((report, index) => <span key={`${item.eventId}-${report.reporterUserId}`}>{index + 1}. {REPORT_REASON_LABELS[report.reason] || REPORT_REASON_LABELS.other}{report.details ? ` — ${report.details}` : ''}</span>)}</div>
@@ -3702,15 +3723,15 @@ function FutaPulseApp() {
         <div className="modal-backdrop event-delete-backdrop" role="presentation" onMouseDown={(event) => { if (!eventDeleting && event.target === event.currentTarget) setEventDeleteTarget(null) }}>
           <section className="event-delete-modal glass-panel" role="dialog" aria-modal="true" aria-labelledby="delete-event-title">
             <span className="event-delete-icon"><Trash2 size={22} /></span>
-            <h2 id="delete-event-title">{eventDeleteTarget.status === 'Draft' ? 'Delete this draft?' : eventDeleteTarget.status === 'Cancelled' || Date.parse(eventDeleteTarget.endTime || '') <= clockNow ? 'Remove this event?' : 'Cancel this event?'}</h2>
+            <h2 id="delete-event-title">{eventDeleteTarget.status === 'Draft' ? 'Delete this draft?' : eventDeleteTarget.status === 'Cancelled' || (parseCampusDateTime(eventDeleteTarget.endTime || '')?.getTime() ?? NaN) <= clockNow ? 'Remove this event?' : 'Cancel this event?'}</h2>
             <p><strong>{eventDeleteTarget.title || 'Untitled draft'}</strong>{eventDeleteTarget.status === 'Draft'
               ? ' will be permanently deleted.'
-              : eventDeleteTarget.status === 'Cancelled' || Date.parse(eventDeleteTarget.endTime || '') <= clockNow
+              : eventDeleteTarget.status === 'Cancelled' || (parseCampusDateTime(eventDeleteTarget.endTime || '')?.getTime() ?? NaN) <= clockNow
                 ? ' will be permanently removed from your profile. This cannot be undone.'
                 : ' will be removed from the public feed immediately. Attendees will be notified, and you can refer to it in your profile for seven days.'}</p>
             <div className="event-delete-actions">
               <button type="button" className="profile-edit-pill" onClick={() => setEventDeleteTarget(null)} disabled={eventDeleting}>Keep it</button>
-              <button type="button" className="delete-account-submit" onClick={() => { void deleteOwnedEvent(eventDeleteTarget) }} disabled={eventDeleting}>{eventDeleting ? 'Saving…' : eventDeleteTarget.status === 'Draft' || eventDeleteTarget.status === 'Cancelled' || Date.parse(eventDeleteTarget.endTime || '') <= clockNow ? 'Remove permanently' : 'Cancel event'}</button>
+              <button type="button" className="delete-account-submit" onClick={() => { void deleteOwnedEvent(eventDeleteTarget) }} disabled={eventDeleting}>{eventDeleting ? 'Saving…' : eventDeleteTarget.status === 'Draft' || eventDeleteTarget.status === 'Cancelled' || (parseCampusDateTime(eventDeleteTarget.endTime || '')?.getTime() ?? NaN) <= clockNow ? 'Remove permanently' : 'Cancel event'}</button>
             </div>
           </section>
         </div>

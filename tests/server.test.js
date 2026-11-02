@@ -20,6 +20,13 @@ const {
   buildFacultyTurnoutBreakdown,
   buildRsvpReminderSchedule,
   buildCriticalEventUpdateDetails,
+  parseCampusDateTime,
+  isNotificationProfileEligible,
+  isAllowedWebPushEndpoint,
+  isTransientPushFailure,
+  sendWebPushWithRetry,
+  sendFcmWithRetry,
+  isInvalidFcmTokenError,
   describeWebPushFailure,
   validateVapidCredentials
 } = require("../server");
@@ -130,6 +137,116 @@ test("Phase 2 Mongo models define event lookup and per-account action uniqueness
   assert.ok(viewIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && options.unique));
   assert.ok(recapDismissalIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && options.unique));
   assert.ok(notificationIndexes.some(([fields, options]) => fields.idempotencyKey === 1 && options.unique));
+  assert.ok(notificationIndexes.some(([fields, options]) => fields.expiresAt === 1 && options.expireAfterSeconds === 0));
+  assert.equal(models.NotificationJob.schema.path("deliveredDeviceKeys").defaultValue.length, 0);
+});
+
+test("notification eligibility requires a verified account, completed tour, and enabled event category", () => {
+  const event = { category: "academic" };
+  const baseUser = {
+    emailVerified: true,
+    profile: { hasCompletedTour: true, notificationPreferences: { academic: true } }
+  };
+  assert.equal(isNotificationProfileEligible(baseUser, event), true);
+  assert.equal(isNotificationProfileEligible({ ...baseUser, profile: { ...baseUser.profile, hasCompletedTour: false } }, event), false);
+  assert.equal(isNotificationProfileEligible({ ...baseUser, profile: { ...baseUser.profile, notificationPreferences: { academic: false } } }, event), false);
+  assert.equal(isNotificationProfileEligible({ ...baseUser, emailVerified: false }, event), false);
+  assert.equal(isNotificationProfileEligible(baseUser, { category: "unsupported" }), false);
+});
+
+test("notification scheduling interprets campus-local timestamps as WAT and preserves explicit offsets", () => {
+  assert.equal(parseCampusDateTime("2026-10-25T10:00").toISOString(), "2026-10-25T09:00:00.000Z");
+  assert.equal(parseCampusDateTime("2026-10-25T10:00:00Z").toISOString(), "2026-10-25T10:00:00.000Z");
+  assert.equal(parseCampusDateTime("2026-10-25").toISOString(), "2026-10-24T23:00:00.000Z");
+
+  const schedule = buildRsvpReminderSchedule(
+    { id: "wat-reminder-plan", title: "Campus meetup", date: "2026-10-25T10:00" },
+    { now: Date.UTC(2026, 9, 25, 7) }
+  );
+  assert.deepEqual(schedule.map(({ suffix, dueAt }) => [suffix, dueAt.toISOString()]), [
+    ["1h", "2026-10-25T08:00:00.000Z"],
+    ["30m", "2026-10-25T08:30:00.000Z"],
+    ["start", "2026-10-25T09:00:00.000Z"]
+  ]);
+});
+
+test("Web Push accepts known provider hosts and rejects arbitrary HTTPS endpoints", () => {
+  assert.equal(isAllowedWebPushEndpoint("https://fcm.googleapis.com/fcm/send/subscription"), true);
+  assert.equal(isAllowedWebPushEndpoint("https://updates.push.services.mozilla.com/wpush/v2/subscription"), true);
+  assert.equal(isAllowedWebPushEndpoint("https://127.0.0.1/admin"), false);
+  assert.equal(isAllowedWebPushEndpoint("https://push.attacker.example/subscription"), false);
+  assert.equal(isAllowedWebPushEndpoint("https://user:pass@fcm.googleapis.com/path"), false);
+});
+
+test("Web Push retries temporary provider failures with exponential backoff", async () => {
+  const originalSendNotification = webPush.sendNotification;
+  let attempts = 0;
+  webPush.sendNotification = async () => {
+    attempts += 1;
+    if (attempts < 3) {
+      const error = new Error("Temporary provider failure.");
+      error.statusCode = 503;
+      throw error;
+    }
+    return { statusCode: 201 };
+  };
+
+  try {
+    const result = await sendWebPushWithRetry({}, "payload", {});
+    assert.equal(result.statusCode, 201);
+    assert.equal(attempts, 3);
+    assert.equal(isTransientPushFailure({ statusCode: 429 }), true);
+    assert.equal(isTransientPushFailure({ statusCode: 403 }), false);
+  } finally {
+    webPush.sendNotification = originalSendNotification;
+  }
+});
+
+test("native FCM dispatch uses a distinct token adapter and preserves notification IDs", async () => {
+  const previousCredentials = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const previousProject = process.env.FIREBASE_PROJECT_ID;
+  const previousTokenFactory = app.locals.fcmAccessTokenFactory;
+  const previousFetch = app.locals.fcmApiFetch;
+  let capturedUrl = "";
+  let capturedRequest;
+  process.env.FIREBASE_PROJECT_ID = "futapulse-test";
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON = JSON.stringify({
+    project_id: "futapulse-test",
+    client_email: "push-service@example.test",
+    private_key: "test-key"
+  });
+  app.locals.fcmAccessTokenFactory = async () => "test-access-token";
+  app.locals.fcmApiFetch = async (url, request) => {
+    capturedUrl = url;
+    capturedRequest = request;
+    return { ok: true, json: async () => ({ name: "projects/futapulse-test/messages/message-1" }) };
+  };
+  try {
+    const result = await sendFcmWithRetry("device-registration-token", {
+      notificationId: "event-alert:event-1:user-1",
+      title: "Event update",
+      message: "The event details changed.",
+      eventId: "event-1",
+      category: "social"
+    });
+    assert.equal(result.name, "projects/futapulse-test/messages/message-1");
+    assert.match(capturedUrl, /projects\/futapulse-test\/messages:send$/);
+    assert.equal(capturedRequest.headers.Authorization, "Bearer test-access-token");
+    const body = JSON.parse(capturedRequest.body);
+    assert.equal(body.message.token, "device-registration-token");
+    assert.equal(body.message.data.notificationId, "event-alert:event-1:user-1");
+    assert.equal(isInvalidFcmTokenError({ providerCode: "UNREGISTERED" }), true);
+    assert.equal(isInvalidFcmTokenError({ providerCode: "INVALID_ARGUMENT" }), false);
+  } finally {
+    if (previousCredentials === undefined) delete process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    else process.env.FIREBASE_SERVICE_ACCOUNT_JSON = previousCredentials;
+    if (previousProject === undefined) delete process.env.FIREBASE_PROJECT_ID;
+    else process.env.FIREBASE_PROJECT_ID = previousProject;
+    if (previousTokenFactory === undefined) delete app.locals.fcmAccessTokenFactory;
+    else app.locals.fcmAccessTokenFactory = previousTokenFactory;
+    if (previousFetch === undefined) delete app.locals.fcmApiFetch;
+    else app.locals.fcmApiFetch = previousFetch;
+  }
 });
 
 test("notification category preferences default enabled and persist as user-profile metadata", async () => {
@@ -186,7 +303,7 @@ test("push registration reassigns one browser device to the currently signed-in 
   try {
     const firstAccount = await createVerifiedAccount(baseUrl, "push-device-first@futa.edu.ng", "push_device_first");
     const secondAccount = await createVerifiedAccount(baseUrl, "push-device-second@futa.edu.ng", "push_device_second");
-    const endpoint = "https://push.example.test/device-subscription-123";
+    const endpoint = "https://fcm.googleapis.com/device-subscription-123";
     const deviceKey = require("node:crypto").createHash("sha256").update(endpoint).digest("hex");
     const subscription = {
       endpoint,
@@ -197,6 +314,12 @@ test("push registration reassigns one browser device to the currently signed-in 
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${account.token}` },
       body: JSON.stringify({ subscription })
     });
+    const unsupported = await fetch(`${baseUrl}/api/notifications/devices/web`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${firstAccount.token}` },
+      body: JSON.stringify({ subscription: { ...subscription, endpoint: "https://127.0.0.1/admin" } })
+    });
+    assert.equal(unsupported.status, 400);
     const status = (account) => fetch(`${baseUrl}/api/notifications/status?platform=web&deviceKey=${deviceKey}`, {
       headers: { Authorization: `Bearer ${account.token}` }
     }).then((response) => response.json());
@@ -253,6 +376,27 @@ test("background notification worker trigger is POST-only and requires its confi
   }
 });
 
+test("dead-letter replay is secret-protected and validates IDs before database access", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const originalSecret = process.env.CRON_SECRET_KEY;
+  process.env.CRON_SECRET_KEY = "test-cron-secret-with-sufficient-length";
+  try {
+    const unauthorized = await fetch(`${baseUrl}/api/internal/notifications/dead-letter/0123456789abcdef01234567/replay`, {
+      method: "POST",
+      headers: { "x-cron-secret": "wrong-secret" }
+    });
+    assert.equal(unauthorized.status, 401);
+    const malformedId = await fetch(`${baseUrl}/api/internal/notifications/dead-letter/not-an-object-id/replay`, {
+      method: "POST",
+      headers: { "x-cron-secret": process.env.CRON_SECRET_KEY }
+    });
+    assert.equal(malformedId.status, 400);
+  } finally {
+    if (originalSecret === undefined) delete process.env.CRON_SECRET_KEY;
+    else process.env.CRON_SECRET_KEY = originalSecret;
+  }
+});
+
 test("faculty turnout groups attendance and recovers faculty from the attendee account when an action has no snapshot", () => {
   const turnout = buildFacultyTurnoutBreakdown([
     { userId: "attendee-one", faculty: "" },
@@ -290,8 +434,8 @@ test("RSVP reminders use default intervals or the custom override while retainin
   assert.deepEqual(buildRsvpReminderSchedule(event, { now: startsAt }), []);
 });
 
-test("critical event update details identify title, venue, and postponement changes accurately", () => {
-  const original = { title: "Campus meetup", venue: "Old hall", date: "2026-10-25T10:00:00.000Z" };
+test("critical event update details identify title, venue, end-time, and postponement changes accurately", () => {
+  const original = { title: "Campus meetup", venue: "Old hall", date: "2026-10-25T10:00:00.000Z", endTime: "2026-10-25T11:00:00.000Z" };
   assert.deepEqual(buildCriticalEventUpdateDetails(original, { ...original, title: "Campus social" }), {
     postponed: false,
     message: "The title for Campus social has changed. Tap to check it out."
@@ -299,6 +443,10 @@ test("critical event update details identify title, venue, and postponement chan
   assert.deepEqual(buildCriticalEventUpdateDetails(original, { ...original, venue: "New hall" }), {
     postponed: false,
     message: "The venue for Campus meetup has changed. Tap to check it out."
+  });
+  assert.deepEqual(buildCriticalEventUpdateDetails(original, { ...original, endTime: "2026-10-25T12:00:00.000Z" }), {
+    postponed: false,
+    message: "The end time for Campus meetup has changed. Tap to check it out."
   });
   assert.deepEqual(buildCriticalEventUpdateDetails(original, { ...original, date: "2026-10-26T10:00:00.000Z" }), {
     postponed: true,

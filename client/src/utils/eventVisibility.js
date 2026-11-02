@@ -1,3 +1,5 @@
+import { parseCampusDateTime } from './campusTime'
+
 const RECAP_DISPLAY_WINDOW_MS = 30 * 60_000
 
 function normalizeAudienceLevel(value) {
@@ -5,7 +7,7 @@ function normalizeAudienceLevel(value) {
 }
 
 export function isPublicRecapVisible(event, now = Date.now()) {
-  const endAt = Date.parse(event?.endTime || '')
+  const endAt = parseCampusDateTime(event?.endTime || '')?.getTime() ?? NaN
   const publishedAt = Date.parse(event?.recapPublishedAt || '')
   return ['Published', 'Live'].includes(event?.status)
     && Number.isFinite(endAt)

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CalendarDays, Clock3, Sparkles, X } from 'lucide-react'
+import { formatCampusDateTime, getCampusDateTimeParts, parseCampusDateTime } from '../utils/campusTime'
 
 const MAX_LOCAL_DRAFT_CHARACTERS = 3_500_000
 const MAX_EVENT_BANNERS = 5
@@ -36,13 +37,7 @@ function getEventId(event) {
   return event.id ?? event._id
 }
 function toLocalDateAndTime(value) {
-  const date = new Date(value)
-  if (!Number.isFinite(date.getTime())) return { date: '', time: '' }
-  const pad = (number) => String(number).padStart(2, '0')
-  return {
-    date: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
-    time: `${pad(date.getHours())}:${pad(date.getMinutes())}`,
-  }
+  return getCampusDateTimeParts(value) || { date: '', time: '' }
 }
 
 function formatDateForEntry(value) {
@@ -482,7 +477,7 @@ function EventEditor({
       const startDateTime = submitForm.date && submitForm.startClock ? `${submitForm.date}T${submitForm.startClock}` : ''
       const endDateTime = submitForm.endDateTime && submitForm.endClock ? `${submitForm.endDateTime}T${submitForm.endClock}` : ''
       if (status === 'Published' && (!startDateTime || !endDateTime)) throw new Error('Choose both the event start and end date and time.')
-      if (status === 'Published' && new Date(endDateTime).getTime() <= new Date(startDateTime).getTime()) {
+      if (status === 'Published' && parseCampusDateTime(endDateTime)?.getTime() <= parseCampusDateTime(startDateTime)?.getTime()) {
         throw new Error('The event end time must be later than the start time.')
       }
       persistLocalDraft({ ...submitForm, status: 'Draft', banner: submitBanner, bannerImages: submitForm.bannerImages || [] }, submitBanner)
@@ -593,7 +588,7 @@ function EventEditor({
               <div className="event-duplicate-matches">
                 {duplicateState.matches.map(({ event: match, score }) => (
                 <button key={getEventId(match)} type="button" className="event-duplicate-match" disabled={saving || bannerProcessing} onClick={() => onOpenDuplicate?.(match)}>
-                    <span><strong>{match.title}</strong><small>{match.category} · {match.venue}</small><small>{new Date(match.date || match.startTime).toLocaleString()} – {new Date(match.endTime).toLocaleString()}</small><small>{match.activity}</small></span>
+                    <span><strong>{match.title}</strong><small>{match.category} · {match.venue}</small><small>{formatCampusDateTime(match.date || match.startTime)} – {formatCampusDateTime(match.endTime)}</small><small>{match.activity}</small></span>
                     <b>{score}%</b>
                   </button>
                 ))}

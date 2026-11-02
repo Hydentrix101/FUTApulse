@@ -1,3 +1,40 @@
+const NOTIFICATION_DEDUPE_CACHE = 'futapulse-push-notification-ids-v1'
+
+function notificationLedgerRequest(notificationId) {
+  return new Request(new URL(`/__futapulse_notifications/${encodeURIComponent(notificationId)}`, self.location.origin))
+}
+
+async function hasDisplayedNotification(notificationId) {
+  if (!notificationId) return false
+  try {
+    const cache = await caches.open(NOTIFICATION_DEDUPE_CACHE)
+    const now = Date.now()
+    for (const request of await cache.keys()) {
+      const cachedResponse = await cache.match(request)
+      const { recordedAt } = await cachedResponse.json()
+      if (now - recordedAt > 30 * 24 * 60 * 60 * 1000) await cache.delete(request)
+    }
+    const response = await cache.match(notificationLedgerRequest(notificationId))
+    if (!response) return false
+    return true
+  } catch (error) {
+    console.warn('Push notification deduplication lookup failed.', error)
+  }
+  return false
+}
+
+async function recordDisplayedNotification(notificationId) {
+  if (!notificationId) return
+  try {
+    const cache = await caches.open(NOTIFICATION_DEDUPE_CACHE)
+    await cache.put(notificationLedgerRequest(notificationId), new Response(JSON.stringify({ recordedAt: Date.now() }), {
+      headers: { 'Content-Type': 'application/json' },
+    }))
+  } catch (error) {
+    console.warn('Push notification deduplication state could not be saved.', error)
+  }
+}
+
 self.addEventListener('push', (event) => {
   let payload = {}
   try {
@@ -7,6 +44,8 @@ self.addEventListener('push', (event) => {
   }
 
   event.waitUntil((async () => {
+    const notificationId = String(payload.notificationId || '')
+    if (notificationId && await hasDisplayedNotification(notificationId)) return
     const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
     for (const client of clients.filter((item) => item.visibilityState === 'visible')) {
       const accepted = await new Promise((resolve) => {
@@ -28,16 +67,20 @@ self.addEventListener('push', (event) => {
           resolve(false)
         }
       })
-      if (accepted) return
+      if (accepted) {
+        await recordDisplayedNotification(notificationId)
+        return
+      }
     }
     await self.registration.showNotification(payload.title || 'FUTApulse event update', {
       body: payload.message || 'Tap to view the latest campus event update.',
-      tag: payload.notificationId || undefined,
+      tag: notificationId || undefined,
       data: { url: payload.url || '/' },
       icon: '/icon-192.png',
       badge: '/favicon-32x32.png',
       renotify: false,
     })
+    await recordDisplayedNotification(notificationId)
   })())
 })
 

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Bell, Building2, CircleHelp, Clock3, ExternalLink, Flame, MapPin, Share2, TriangleAlert, X } from 'lucide-react'
 import CountdownPill from './CountdownPill'
 import { isPublicRecapVisible } from '../utils/eventVisibility'
+import { formatCampusDateTime, parseCampusDateTime } from '../utils/campusTime'
 
 const categoryStyles = {
   tech: 'tech-badge',
@@ -149,13 +150,16 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
       return total + count
     }, 0)
     : 0
-  const startDate = new Date(event.startTime || event.date)
-  const endDate = new Date(event.endTime)
-  const endDateLabel = Number.isFinite(endDate.getTime())
-    ? endDate.toLocaleDateString([], { month: 'short', day: 'numeric' })
+  const startDate = parseCampusDateTime(event.startTime || event.date)
+  const endDate = parseCampusDateTime(event.endTime)
+  const endDateLabel = endDate
+    ? formatCampusDateTime(endDate, { year: undefined, dateStyle: undefined, timeStyle: undefined, month: 'short', day: 'numeric' })
     : ''
-  const timeRange = Number.isFinite(startDate.getTime())
-    ? `${startDate.toLocaleDateString([], { month: 'short', day: 'numeric' })} · ${startDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}${endDateLabel ? `–${endDateLabel === startDate.toLocaleDateString([], { month: 'short', day: 'numeric' }) ? '' : `${endDateLabel} · `}${endDate.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : ''}`
+  const startDateLabel = startDate
+    ? formatCampusDateTime(startDate, { year: undefined, dateStyle: undefined, timeStyle: undefined, month: 'short', day: 'numeric' })
+    : ''
+  const timeRange = startDate
+    ? `${startDateLabel} · ${formatCampusDateTime(startDate, { dateStyle: undefined, timeStyle: undefined, hour: 'numeric', minute: '2-digit' })}${endDateLabel ? `–${endDateLabel === startDateLabel ? '' : `${endDateLabel} · `}${formatCampusDateTime(endDate, { dateStyle: undefined, timeStyle: undefined, hour: 'numeric', minute: '2-digit' })}` : ''}`
     : ''
   const eventState = Number.isFinite(endDate.getTime()) && currentTime >= endDate.getTime()
     ? 'participated'

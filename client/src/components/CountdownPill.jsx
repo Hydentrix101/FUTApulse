@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
+import { parseCampusDateTime } from '../utils/campusTime'
 
 const DAY_IN_MS = 24 * 60 * 60 * 1000
 const MAX_TIMEOUT = 2_147_000_000
 
 function toTimestamp(value) {
   if (value instanceof Date) return value.getTime()
-  if (typeof value === 'number' || typeof value === 'string') return new Date(value).getTime()
+  if (typeof value === 'number') return value
+  if (typeof value === 'string') return parseCampusDateTime(value)?.getTime() ?? Number.NaN
   return Number.NaN
 }
 
