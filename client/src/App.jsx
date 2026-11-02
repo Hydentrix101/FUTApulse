@@ -463,7 +463,7 @@ function App() {
 function FutaPulseApp() {
   const initialSearchParams = new URLSearchParams(window.location.search)
   const requestedAuthMode = initialSearchParams.get('auth')
-  const bypassLaunchSequence = initialSearchParams.has('auth') || initialSearchParams.has('event') || !hasRememberedSession()
+  const bypassLaunchSequence = initialSearchParams.has('auth') || initialSearchParams.has('event')
   const [launchVisible, setLaunchVisible] = useState(!bypassLaunchSequence)
   const [launchSequenceReady, setLaunchSequenceReady] = useState(bypassLaunchSequence)
   const [session, setSession] = useState(null)
