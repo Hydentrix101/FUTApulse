@@ -39,6 +39,7 @@ const NAV_ITEMS = [
 const FUTAPULSE_ADMIN_EMAIL = 'immanuelidowu1@gmail.com'
 const HANDLED_NOTIFICATION_STORAGE_KEY = 'futapulse-handled-notification-ids'
 const EVENT_LIST_PAGE_SIZE = 12
+const SERVER_EVENT_PAGE_SIZE = 30
 const MAX_CACHED_EVENTS = 40
 const MAX_EVENT_CACHE_CHARACTERS = 360_000
 const EVENT_VIEW_THRESHOLDS = Array.from({ length: 101 }, (_, index) => index / 100)
@@ -164,6 +165,17 @@ function safeSetStored(key, value) {
     }
     return false
   }
+}
+
+function mergeEventSnapshots(existing, incoming, prepend = false) {
+  const existingById = new Map(existing.map((event) => [String(getEventId(event)), event]))
+  const incomingIds = new Set(incoming.map((event) => String(getEventId(event))))
+  const mergedIncoming = incoming.map((event) => ({
+    ...(existingById.get(String(getEventId(event))) || {}),
+    ...event,
+  }))
+  const retained = existing.filter((event) => !incomingIds.has(String(getEventId(event))))
+  return prepend ? [...mergedIncoming, ...retained] : [...retained, ...mergedIncoming]
 }
 
 function hasRememberedSession() {
@@ -483,6 +495,11 @@ function FutaPulseApp() {
   const [events, setEvents] = useState(readInitialEventCache)
   const eventFeedRequestVersionRef = useRef(0)
   const eventFeedAppliedVersionRef = useRef(0)
+  const eventFeedCursorRef = useRef(null)
+  const eventFeedHasMoreRef = useRef(false)
+  const eventFeedPageLoadingRef = useRef(false)
+  const [eventFeedHasMore, setEventFeedHasMore] = useState(false)
+  const [eventFeedPageLoading, setEventFeedPageLoading] = useState(false)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [theme, setTheme] = useState(() => readStoredValue('futapulse-theme') || readStoredValue('futapulse-client-theme') || 'light')
@@ -1245,20 +1262,27 @@ function FutaPulseApp() {
     const controller = new AbortController()
     const loadEvents = async () => {
       const requestVersion = ++eventFeedRequestVersionRef.current
+      eventFeedCursorRef.current = null
+      eventFeedHasMoreRef.current = false
+      setEventFeedHasMore(false)
       setLoading(true)
       setLoadError('')
       try {
-        const response = await fetch(`${API_BASE_URL}/api/events`, {
+        const query = new URLSearchParams({ limit: String(SERVER_EVENT_PAGE_SIZE) })
+        const response = await fetch(`${API_BASE_URL}/api/events?${query}`, {
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]),
           headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
           cache: 'no-cache',
         })
         if (!response.ok) throw new Error(`Could not load events (${response.status}).`)
         const data = await response.json()
-        if (!Array.isArray(data.events)) throw new Error('The events endpoint returned an invalid response.')
+        if (!Array.isArray(data.events) || typeof data.hasMore !== 'boolean') throw new Error('The events endpoint returned an invalid response.')
         if (requestVersion < eventFeedAppliedVersionRef.current) return
         eventFeedAppliedVersionRef.current = requestVersion
         const serverEvents = data.events
+        eventFeedCursorRef.current = data.nextCursor || null
+        eventFeedHasMoreRef.current = data.hasMore
+        setEventFeedHasMore(data.hasMore)
         startTransition(() => setEvents(serverEvents))
         const serverGoingIds = serverEvents.filter((event) => event.isGoing).map((event) => String(getEventId(event)))
         setGoingIds((current) => current.join('|') === serverGoingIds.join('|') ? current : serverGoingIds)
@@ -1355,22 +1379,26 @@ function FutaPulseApp() {
     let cancelled = false
     let refreshing = false
     const refreshFeed = async () => {
-      if (refreshing) return
+      if (refreshing || eventFeedPageLoadingRef.current) return
       refreshing = true
       const requestVersion = ++eventFeedRequestVersionRef.current
       try {
-        const response = await fetch(`${API_BASE_URL}/api/events`, {
+        const query = new URLSearchParams({ limit: String(SERVER_EVENT_PAGE_SIZE) })
+        const response = await fetch(`${API_BASE_URL}/api/events?${query}`, {
           headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
           signal: AbortSignal.timeout(20000),
           cache: 'no-cache',
         })
         if (!response.ok) return
         const data = await response.json()
-        if (cancelled || !Array.isArray(data.events)) return
+        if (cancelled || !Array.isArray(data.events) || typeof data.hasMore !== 'boolean') return
         if (requestVersion < eventFeedAppliedVersionRef.current) return
         eventFeedAppliedVersionRef.current = requestVersion
+        eventFeedCursorRef.current = data.nextCursor || null
+        eventFeedHasMoreRef.current = data.hasMore
+        setEventFeedHasMore(data.hasMore)
         setLoadError('')
-        startTransition(() => setEvents(data.events))
+        startTransition(() => setEvents((current) => mergeEventSnapshots(current, data.events, true)))
         setGoingIds(data.events.filter((event) => event.isGoing).map((event) => String(getEventId(event))))
         setReminderIds(data.events.filter((event) => event.isReminded).map((event) => String(getEventId(event))))
       } catch {
@@ -2434,6 +2462,68 @@ function FutaPulseApp() {
     setVisibleSearchCount(EVENT_LIST_PAGE_SIZE)
   }
 
+  const loadMoreEvents = async () => {
+    if (!networkOnline || !eventFeedHasMoreRef.current || eventFeedPageLoadingRef.current) return false
+    const cursor = eventFeedCursorRef.current
+    if (!cursor) {
+      notify('The next event page is unavailable. Refresh the feed and try again.', 'error')
+      return false
+    }
+    eventFeedPageLoadingRef.current = true
+    setEventFeedPageLoading(true)
+    const requestVersion = ++eventFeedRequestVersionRef.current
+    try {
+      const query = new URLSearchParams({
+        limit: String(SERVER_EVENT_PAGE_SIZE),
+        cursor,
+      })
+      const response = await fetch(`${API_BASE_URL}/api/events?${query}`, {
+        headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
+        signal: AbortSignal.timeout(20_000),
+        cache: 'no-cache',
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}))
+        throw new Error(body.error || `Could not load more events (${response.status}).`)
+      }
+      const data = await response.json()
+      if (!Array.isArray(data.events) || typeof data.hasMore !== 'boolean') {
+        throw new Error('The events endpoint returned an invalid page.')
+      }
+      if (requestVersion < eventFeedAppliedVersionRef.current) return false
+      eventFeedCursorRef.current = data.nextCursor || null
+      eventFeedHasMoreRef.current = data.hasMore
+      setEventFeedHasMore(data.hasMore)
+      eventFeedAppliedVersionRef.current = requestVersion
+      startTransition(() => setEvents((current) => mergeEventSnapshots(current, data.events)))
+      setGoingIds((current) => {
+        const next = new Set(current)
+        data.events.forEach((event) => {
+          const id = String(getEventId(event))
+          if (event.isGoing) next.add(id)
+          else next.delete(id)
+        })
+        return [...next]
+      })
+      setReminderIds((current) => {
+        const next = new Set(current)
+        data.events.forEach((event) => {
+          const id = String(getEventId(event))
+          if (event.isReminded) next.add(id)
+          else next.delete(id)
+        })
+        return [...next]
+      })
+      return true
+    } catch (error) {
+      notify(error.message || 'Unable to load more events right now.', 'error')
+      return false
+    } finally {
+      eventFeedPageLoadingRef.current = false
+      setEventFeedPageLoading(false)
+    }
+  }
+
   const changeOrganizerTab = (tab) => {
     setOrganizerTab(tab)
     setVisibleOrganizerCount(EVENT_LIST_PAGE_SIZE)
@@ -2600,18 +2690,22 @@ function FutaPulseApp() {
     const validStart = Boolean(startAt && Number.isFinite(startAt.getTime()))
     const validEnd = Boolean(endAt && Number.isFinite(endAt.getTime()))
     const payload = {
-      ...Object.fromEntries(Object.entries(eventData).filter(([key]) => !['allowSimilar', 'createdByUserId'].includes(key))),
-      ...(editing ? { id: String(eventData.id) } : {}),
+      title: eventData.title || '',
+      category: eventData.category || '',
+      activity: eventData.activity || '',
       date: validStart ? startAt.toISOString() : '',
       startTime: validStart ? startAt.toISOString() : '',
       endTime: validEnd ? endAt.toISOString() : '',
+      venue: eventData.venue || '',
       banner: banner || eventData.banner || eventData.bannerImages?.[0] || '',
       bannerImages: Array.isArray(eventData.bannerImages) ? eventData.bannerImages : [],
       audience: eventData.audience?.length ? eventData.audience : ['all'],
       venueLandmark: eventData.venueLandmark || '',
-      turnoutCount: Number(eventData.turnoutCount) || 0,
-      turnoutBreakdown: Array.isArray(eventData.turnoutBreakdown) ? eventData.turnoutBreakdown : [],
+      meetingUrl: eventData.meetingUrl || '',
+      infoUrl: eventData.infoUrl || '',
       status: 'Draft',
+      ...(eventData.clientRequestId ? { clientRequestId: eventData.clientRequestId } : {}),
+      ...(editing ? { expectedRevision: eventData.revision } : {}),
     }
     const response = await apiRequest(`/api/events${editing ? `/${encodeURIComponent(eventData.id)}` : ''}`, {
       method: editing ? 'PATCH' : 'POST',
@@ -2699,19 +2793,23 @@ function FutaPulseApp() {
         if (endAt.getTime() <= startAt.getTime()) throw new Error('The event end time must be later than the start time.')
       }
       const savedEvent = {
-        ...Object.fromEntries(Object.entries(eventData).filter(([key]) => !['allowSimilar', 'createdByUserId'].includes(key))),
-        ...(editing ? { id: eventId } : {}),
+        title: eventData.title || '',
+        category: eventData.category || '',
+        activity: eventData.activity || '',
         date: validStart ? startAt.toISOString() : '',
         startTime: validStart ? startAt.toISOString() : '',
         endTime: endAt && Number.isFinite(endAt.getTime()) ? endAt.toISOString() : '',
+        venue: eventData.venue || '',
         banner: banner || eventData.banner || eventData.bannerImages?.[0] || '',
         bannerImages: Array.isArray(eventData.bannerImages) ? eventData.bannerImages : [],
         audience: eventData.audience?.length ? eventData.audience : ['all'],
         venueLandmark: eventData.venueLandmark || '',
-        turnoutCount: Number(eventData.turnoutCount) || 0,
-        turnoutBreakdown: Array.isArray(eventData.turnoutBreakdown) ? eventData.turnoutBreakdown : [],
+        meetingUrl: eventData.meetingUrl || '',
+        infoUrl: eventData.infoUrl || '',
         status,
         allowSimilar,
+        ...(eventData.clientRequestId ? { clientRequestId: eventData.clientRequestId } : {}),
+        ...(editing ? { expectedRevision: eventData.revision } : {}),
       }
       const response = await apiRequest(`/api/events${editing ? `/${encodeURIComponent(eventId)}` : ''}`, {
         method: editing ? 'PATCH' : 'POST',
@@ -2986,7 +3084,10 @@ function FutaPulseApp() {
                           <LazyEventCard isHot={event.isHot === true} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
                         </div>
                         {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <AdSlot placement="category-full-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
-                      </Fragment>)}{visibleFullFeedCount < fullEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleFullFeedCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more events</button>}</> : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon"><Search size={30} aria-hidden="true" /></span><strong>No Upcoming Events in this Category</strong><span>Try another category to explore campus activity.</span></div></>
+                      </Fragment>)}{(visibleFullFeedCount < fullEvents.length || eventFeedHasMore) && <button type="button" className="feed-load-more" disabled={eventFeedPageLoading} onClick={() => {
+                        if (visibleFullFeedCount < fullEvents.length) setVisibleFullFeedCount((count) => count + EVENT_LIST_PAGE_SIZE)
+                        else void loadMoreEvents()
+                      }}>{eventFeedPageLoading ? 'Loading events…' : 'Load more events'}</button>}</> : loading ? <p className="feed-state">Loading events…</p> : <><div className="filter-empty"><span className="filter-empty-icon"><Search size={30} aria-hidden="true" /></span><strong>No Upcoming Events in this Category</strong><span>Try another category to explore campus activity.</span></div>{eventFeedHasMore && <button type="button" className="feed-load-more" disabled={eventFeedPageLoading} onClick={() => { void loadMoreEvents() }}>{eventFeedPageLoading ? 'Loading events…' : 'Load more events'}</button>}</>
                       })()}
                   </section>
                 )}
@@ -3061,9 +3162,13 @@ function FutaPulseApp() {
                         />
                       ))}
                     </div>
-                    {visibleSearchCount < searchEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleSearchCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more results</button>}
+                    {(visibleSearchCount < searchEvents.length || eventFeedHasMore) && <button type="button" className="feed-load-more" disabled={eventFeedPageLoading} onClick={() => {
+                      if (visibleSearchCount < searchEvents.length) setVisibleSearchCount((count) => count + EVENT_LIST_PAGE_SIZE)
+                      else void loadMoreEvents()
+                    }}>{eventFeedPageLoading ? 'Loading events…' : 'Load more results'}</button>}
                     </>
                   ) : <div className="explore-search-empty" role="status"><Search size={28} aria-hidden="true" /><strong>{loadError ? 'Unable to Search Events' : 'No Search Results Found'}</strong><span>{loadError || `No events or organizers match “${search.trim()}”. Try another keyword.`}</span></div>}
+                  {!searchEvents.length && eventFeedHasMore && <button type="button" className="feed-load-more" disabled={eventFeedPageLoading} onClick={() => { void loadMoreEvents() }}>{eventFeedPageLoading ? 'Loading events…' : 'Search older events'}</button>}
                   {loadError && searchEvents.length > 0 && <p className="feed-error" role="status">Showing saved events while offline.</p>}
                 </section>
               )}
@@ -3302,7 +3407,10 @@ function FutaPulseApp() {
                         </article>
                       )
                     })}
-                    {visibleOrganizerCount < organizerEvents.length && <button type="button" className="feed-load-more" onClick={() => setVisibleOrganizerCount((count) => count + EVENT_LIST_PAGE_SIZE)}>Load more</button>}
+                    {(visibleOrganizerCount < organizerEvents.length || eventFeedHasMore) && <button type="button" className="feed-load-more" disabled={eventFeedPageLoading} onClick={() => {
+                      if (visibleOrganizerCount < organizerEvents.length) setVisibleOrganizerCount((count) => count + EVENT_LIST_PAGE_SIZE)
+                      else void loadMoreEvents()
+                    }}>{eventFeedPageLoading ? 'Loading events…' : 'Load more'}</button>}
                   </div> : <p className="profile-events-empty">{organizerTab === 'events' ? 'No uploaded events yet. Create your first campus event!' : 'No saved drafts. All your events have been published.'}</p>}
               </section>
             </div>

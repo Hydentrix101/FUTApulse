@@ -7,7 +7,7 @@ require("express-async-errors");
 const cors = require("cors");
 const compression = require("compression");
 const helmet = require("helmet");
-const { rateLimit } = require("express-rate-limit");
+const { rateLimit, ipKeyGenerator } = require("express-rate-limit");
 const morgan = require("morgan");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
@@ -82,6 +82,12 @@ function getGooglePopupRedirectUri(request) {
 }
 
 const ALLOWED_CATEGORIES = new Set(["academic", "tech", "social", "religious", "sports", "seminars"]);
+const ALLOWED_EVENT_AUDIENCE = new Set(["all", "100", "200", "300", "400", "500"]);
+const EVENT_EDITABLE_FIELDS = new Set([
+  "title", "category", "activity", "date", "startTime", "endTime", "venue",
+  "venueLandmark", "meetingUrl", "infoUrl", "audience", "status", "banner",
+  "bannerImages", "clientRequestId", "expectedRevision", "allowSimilar"
+]);
 const NOTIFICATION_CATEGORIES = ["academic", "tech", "social", "religious", "sports", "seminars"];
 const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze(Object.fromEntries(NOTIFICATION_CATEGORIES.map((category) => [category, true])));
 const ALLOWED_WEB_PUSH_HOSTS = new Set([
@@ -218,40 +224,82 @@ function isValidNewPassword(password) {
 }
 
 function validateEvent(event) {
-  if (typeof event.organizerName !== "string" || !event.organizerName.trim()) return false;
-  if (typeof event.venue === "string" && event.venue.length > 120) return false;
-  if (typeof event.venueLandmark === "string" && event.venueLandmark.length > 240) return false;
-  const meetingUrl = typeof event.meetingUrl === "string" ? event.meetingUrl.trim() : "";
-  if (meetingUrl) {
-    if (meetingUrl.length > 2048) return false;
-    try {
-      const parsedMeetingUrl = new URL(meetingUrl);
-      if (!["http:", "https:"].includes(parsedMeetingUrl.protocol) || parsedMeetingUrl.username || parsedMeetingUrl.password) return false;
-    } catch {
-      return false;
+  const textLimits = {
+    title: 120,
+    category: 40,
+    activity: 3000,
+    venue: 120,
+    venueLandmark: 240
+  };
+  for (const [field, maximum] of Object.entries(textLimits)) {
+    if (event[field] !== undefined && (typeof event[field] !== "string" || event[field].length > maximum)) {
+      return `${field} must be a string no longer than ${maximum} characters.`;
     }
   }
-  const infoUrl = typeof event.infoUrl === "string" ? event.infoUrl.trim() : "";
-  if (infoUrl) {
-    if (infoUrl.length > 2048) return false;
-    try {
-      const parsedInfoUrl = new URL(infoUrl);
-      if (!["http:", "https:"].includes(parsedInfoUrl.protocol) || parsedInfoUrl.username || parsedInfoUrl.password) return false;
-    } catch {
-      return false;
+  if (event.category && !ALLOWED_CATEGORIES.has(event.category)) return "Choose a supported event category.";
+  if (event.status !== "Draft" && !["Published", "Live"].includes(event.status)) return "Choose Draft or a publishable event status.";
+  for (const field of ["date", "startTime", "endTime"]) {
+    if (event[field] !== undefined && event[field] !== ""
+      && (typeof event[field] !== "string" || !parseCampusDateTime(event[field]))) {
+      return `The event ${field === "endTime" ? "end" : "start"} time is invalid.`;
     }
   }
-  if (event.status === "Draft") return true;
-  const requiredFields = ["title", "category", "activity", "date", "endTime", "venue", "organizerName"];
-  const start = parseCampusDateTime(event.date)?.getTime() ?? NaN;
+  if (event.audience !== undefined) {
+    if (!Array.isArray(event.audience) || event.audience.length > ALLOWED_EVENT_AUDIENCE.size
+      || event.audience.some((level) => typeof level !== "string"
+        || !ALLOWED_EVENT_AUDIENCE.has(level.trim().toLowerCase().replace(/^(\d+)l$/, "$1")))
+      || new Set(event.audience.map((level) => String(level).trim().toLowerCase().replace(/^(\d+)l$/, "$1"))).size !== event.audience.length) {
+      return "Choose one or more valid audience levels.";
+    }
+  }
+  for (const field of ["meetingUrl", "infoUrl"]) {
+    const value = event[field] === undefined ? "" : event[field];
+    if (typeof value !== "string" || value.length > 2048) return `${field} must be a URL no longer than 2048 characters.`;
+    if (!value.trim()) continue;
+    try {
+      const parsed = new URL(value.trim());
+      if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+        return `${field} must be a safe HTTP or HTTPS URL.`;
+      }
+    } catch {
+      return `${field} must be a valid HTTP or HTTPS URL.`;
+    }
+  }
+  const banners = event.bannerImages === undefined ? [] : event.bannerImages;
+  if (!Array.isArray(banners) || banners.length > 5
+    || banners.some((image) => typeof image !== "string" || image.length > 2_500_000
+      || image && !image.startsWith("data:image/") && !image.startsWith("/")
+        && !/^https?:\/\//i.test(image))) {
+    return "An event may contain at most five valid banner images.";
+  }
+  if (event.banner !== undefined && (typeof event.banner !== "string" || event.banner.length > 2_500_000
+    || event.banner && !event.banner.startsWith("data:image/") && !event.banner.startsWith("/")
+      && !/^https?:\/\//i.test(event.banner))) {
+    return "The event banner is invalid.";
+  }
+  if (event.clientRequestId !== undefined
+    && (typeof event.clientRequestId !== "string" || !/^[a-zA-Z0-9_-]{12,128}$/.test(event.clientRequestId))) {
+    return "The event submission identifier is invalid.";
+  }
+  if (event.status === "Draft") return null;
+  const requiredFields = ["title", "category", "activity", "date", "endTime", "venue"];
+  if (!requiredFields.every((field) => typeof event[field] === "string" && event[field].trim())) {
+    return "Published events require a title, category, activity, start time, end time, and venue.";
+  }
+  if (!Array.isArray(event.audience) || event.audience.length === 0) return "Choose at least one target audience level.";
+  const start = parseCampusDateTime(event.startTime || event.date)?.getTime() ?? NaN;
   const end = parseCampusDateTime(event.endTime)?.getTime() ?? NaN;
-  return requiredFields.every((field) => typeof event[field] === "string" && event[field].trim())
-    && ALLOWED_CATEGORIES.has(event.category)
-    && Array.isArray(event.audience)
-    && event.audience.length > 0
-    && Number.isFinite(start)
-    && Number.isFinite(end)
-    && end > start;
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return "Published events require valid start and end times.";
+  if (end <= start) return "The event end time must be later than the start time.";
+  return null;
+}
+
+function getUnsupportedEventFields(payload) {
+  return Object.keys(payload || {}).filter((field) => !EVENT_EDITABLE_FIELDS.has(field));
+}
+
+function isValidEventRevision(value) {
+  return Number.isSafeInteger(value) && value > 0;
 }
 
 function getCurrentOrganizerMetadata(user) {
@@ -439,6 +487,7 @@ emailChallengeSchema.index({ email: 1, purpose: 1 }, { unique: true });
 const EmailChallenge = mongoose.models.FutapulseEmailChallenge || mongoose.model("FutapulseEmailChallenge", emailChallengeSchema);
 const eventRecordSchema = new mongoose.Schema({
   eventId: { type: String, required: true, unique: true },
+  revision: { type: Number, default: 1 },
   ownerUserId: { type: String, required: true, index: true },
   status: { type: String, required: true, index: true },
   category: { type: String, required: true, index: true },
@@ -449,6 +498,7 @@ const eventRecordSchema = new mongoose.Schema({
 }, { timestamps: true, minimize: false });
 eventRecordSchema.index({ status: 1, endsAt: 1 });
 eventRecordSchema.index({ category: 1, status: 1, startsAt: 1 });
+eventRecordSchema.index({ createdAt: -1, eventId: -1 });
 const EventRecord = mongoose.models.FutapulseEvent || mongoose.model("FutapulseEvent", eventRecordSchema, "events");
 
 const engagementActionSchema = new mongoose.Schema({
@@ -1743,6 +1793,15 @@ const eventReportSchema = new mongoose.Schema({
 eventReportSchema.index({ status: 1, updatedAt: -1 });
 const EventReport = mongoose.models.FutapulseEventReport
   || mongoose.model("FutapulseEventReport", eventReportSchema, "event_reports");
+const apiRateLimitBucketSchema = new mongoose.Schema({
+  _id: { type: String, required: true },
+  keyHash: { type: String, required: true },
+  totalHits: { type: Number, required: true },
+  expiresAt: { type: Date, required: true }
+}, { versionKey: false, collection: "api_rate_limit_buckets" });
+apiRateLimitBucketSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+const ApiRateLimitBucket = mongoose.models.FutapulseApiRateLimitBucket
+  || mongoose.model("FutapulseApiRateLimitBucket", apiRateLimitBucketSchema);
 
 // Production remains gated until the local migration has been applied and the
 // Mongo-backed auth, events, reports, and engagement paths have been smoke-tested.
@@ -1751,6 +1810,77 @@ const OPERATIONAL_MONGO_CUTOVER_COMPLETE = process.env.FUTAPULSE_MONGO_CUTOVER_C
 
 function isMongoConnected() {
   return mongoose.connection.readyState === 1;
+}
+
+class MongoAwareRateLimitStore {
+  constructor() {
+    this.windowMs = 60_000;
+    this.memoryBuckets = new Map();
+    this.incrementCount = 0;
+  }
+
+  init(options) {
+    this.windowMs = options.windowMs;
+  }
+
+  async increment(key) {
+    const now = Date.now();
+    const windowStart = Math.floor(now / this.windowMs) * this.windowMs;
+    const resetTime = new Date(windowStart + this.windowMs);
+    const keyHash = crypto.createHash("sha256").update(String(key)).digest("hex");
+    const bucketId = `${windowStart}:${keyHash}`;
+
+    if (isMongoConnected()) {
+      try {
+        await ApiRateLimitBucket.updateOne({ _id: bucketId }, {
+          $inc: { totalHits: 1 },
+          $setOnInsert: { keyHash, expiresAt: new Date(resetTime.getTime() + this.windowMs) }
+        }, { upsert: true }).exec();
+      } catch (error) {
+        if (error.code !== 11000) throw error;
+        await ApiRateLimitBucket.updateOne({ _id: bucketId }, { $inc: { totalHits: 1 } }).exec();
+      }
+      const bucket = await ApiRateLimitBucket.findById(bucketId).select("totalHits").lean().exec();
+      if (!bucket) throw new Error("Rate-limit counter was not persisted.");
+      return { totalHits: bucket.totalHits, resetTime };
+    }
+
+    const existing = this.memoryBuckets.get(bucketId);
+    const totalHits = (existing?.totalHits || 0) + 1;
+    this.memoryBuckets.set(bucketId, { totalHits, resetTime });
+    this.incrementCount += 1;
+    if (this.incrementCount % 256 === 0) {
+      for (const [id, bucket] of this.memoryBuckets) {
+        if (bucket.resetTime.getTime() <= now) this.memoryBuckets.delete(id);
+      }
+    }
+    return { totalHits, resetTime };
+  }
+
+  async decrement(key) {
+    return this.updateHits(key, -1);
+  }
+
+  async resetKey(key) {
+    const keyHash = crypto.createHash("sha256").update(String(key)).digest("hex");
+    this.memoryBuckets.forEach((_, id) => {
+      if (id.endsWith(`:${keyHash}`)) this.memoryBuckets.delete(id);
+    });
+    if (isMongoConnected()) await ApiRateLimitBucket.deleteMany({ keyHash }).exec();
+  }
+
+  async updateHits(key, amount) {
+    const now = Date.now();
+    const windowStart = Math.floor(now / this.windowMs) * this.windowMs;
+    const keyHash = crypto.createHash("sha256").update(String(key)).digest("hex");
+    const bucketId = `${windowStart}:${keyHash}`;
+    if (isMongoConnected()) {
+      await ApiRateLimitBucket.updateOne({ _id: bucketId }, { $inc: { totalHits: amount } }).exec();
+      return;
+    }
+    const bucket = this.memoryBuckets.get(bucketId);
+    if (bucket) bucket.totalHits = Math.max(0, bucket.totalHits + amount);
+  }
 }
 
 mongoose.connection.on("disconnected", () => {
@@ -1774,6 +1904,7 @@ function eventDocumentFromRecord(event) {
   const endsAt = parseCampusDateTime(event.endTime);
   return {
     eventId: String(event.id),
+    revision: isValidEventRevision(event.revision) ? event.revision : 1,
     ownerUserId: String(event.createdByUserId || ""),
     status: String(event.status || "Draft"),
     category: String(event.category || ""),
@@ -1783,18 +1914,92 @@ function eventDocumentFromRecord(event) {
   };
 }
 
-async function listStoredEvents(viewerId = "", onlyVisible = false) {
-  if (!isMongoConnected()) return readDatabase().events;
+function parseEventPageCursor(value) {
+  if (typeof value !== "string" || value.length > 512) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    const createdAt = new Date(parsed.createdAt);
+    if (!Number.isFinite(createdAt.getTime()) || typeof parsed.eventId !== "string" || !parsed.eventId) return null;
+    return { createdAt, eventId: parsed.eventId };
+  } catch {
+    return null;
+  }
+}
+
+function createEventPageCursor(record) {
+  return Buffer.from(JSON.stringify({
+    createdAt: new Date(record.createdAt).toISOString(),
+    eventId: String(record.eventId)
+  })).toString("base64url");
+}
+
+function isEventVisibleToFeed(event, viewerId, now = Date.now()) {
+  const isOwnerDraft = Boolean(viewerId && event.status === "Draft" && String(event.createdByUserId || "") === String(viewerId));
+  const endedAt = parseCampusDateTime(event.endTime)?.getTime() ?? NaN;
+  const isOwnerRecentEndedEvent = Boolean(viewerId
+    && event.status !== "Cancelled"
+    && String(event.createdByUserId || "") === String(viewerId)
+    && Number.isFinite(endedAt)
+    && endedAt <= now
+    && now - endedAt <= 7 * 24 * 60 * 60_000);
+  const cancelledAt = new Date(event.cancelledAt || "").getTime();
+  const isOwnerRecentCancellation = Boolean(viewerId
+    && event.status === "Cancelled"
+    && String(event.createdByUserId || "") === String(viewerId)
+    && Number.isFinite(cancelledAt)
+    && now - cancelledAt <= 7 * 24 * 60 * 60_000);
+  return isOwnerDraft
+    || isOwnerRecentEndedEvent
+    || isOwnerRecentCancellation
+    || ["Published", "Live"].includes(event.status)
+      && (isWithinEventDisplayWindow(event, now) || isPublicRecapVisible(event, now));
+}
+
+async function listStoredEvents(viewerId = "", onlyVisible = false, pageOptions = null) {
+  if (!isMongoConnected()) {
+    const localEvents = readDatabase().events;
+    if (!pageOptions) return localEvents;
+    const selected = localEvents
+      .filter((event) => !pageOptions.category || pageOptions.category === "all" || event.category === pageOptions.category)
+      .filter((event) => !onlyVisible || isEventVisibleToFeed(event, viewerId))
+      .map((event) => ({
+        event,
+        createdAt: new Date(event.createdAt || event.updatedAt || 0),
+        eventId: String(event.id)
+      }))
+      .sort((first, second) => second.createdAt.getTime() - first.createdAt.getTime()
+        || second.eventId.localeCompare(first.eventId));
+    const afterCursor = pageOptions.cursor
+      ? selected.filter((item) => item.createdAt < pageOptions.cursor.createdAt
+        || item.createdAt.getTime() === pageOptions.cursor.createdAt.getTime()
+          && item.eventId.localeCompare(pageOptions.cursor.eventId) < 0)
+      : selected;
+    const page = afterCursor.slice(0, pageOptions.limit);
+    return {
+      events: page.map((item) => ({ ...item.event, revision: isValidEventRevision(item.event.revision) ? item.event.revision : 1 })),
+      nextCursor: afterCursor.length > pageOptions.limit && page.length
+        ? createEventPageCursor({ createdAt: page.at(-1).createdAt, eventId: page.at(-1).eventId })
+        : null,
+      hasMore: afterCursor.length > pageOptions.limit
+    };
+  }
   let filter = {};
   if (onlyVisible) {
     const now = Date.now();
     const visibleEventStart = new Date(now - (30 * 60_000));
     const recentOwnerHistoryStart = new Date(now - (7 * 24 * 60 * 60_000));
     const visibilityFilters = [
-      { status: { $in: ["Published", "Live"] }, endsAt: { $gt: visibleEventStart } },
+      {
+        status: { $in: ["Published", "Live"] },
+        startsAt: { $ne: null },
+        endsAt: { $gt: visibleEventStart },
+        $expr: { $gt: ["$endsAt", "$startsAt"] }
+      },
       {
         status: { $in: ["Published", "Live"] },
         endsAt: { $lte: new Date(now) },
+        startsAt: { $ne: null },
+        $expr: { $gt: ["$endsAt", "$startsAt"] },
         "record.recapPhotos.0": { $exists: true },
         "record.recapPublishedAt": { $gte: new Date(now - (30 * 60_000)).toISOString(), $lte: new Date(now).toISOString() }
       }
@@ -1802,15 +2007,46 @@ async function listStoredEvents(viewerId = "", onlyVisible = false) {
     if (viewerId) {
       visibilityFilters.push(
         { ownerUserId: String(viewerId), status: "Draft" },
-        { ownerUserId: String(viewerId), status: { $ne: "Cancelled" }, endsAt: { $gt: recentOwnerHistoryStart, $lte: new Date(now) } },
+        { ownerUserId: String(viewerId), status: { $ne: "Cancelled" }, startsAt: { $ne: null }, endsAt: { $gt: recentOwnerHistoryStart, $lte: new Date(now) }, $expr: { $gt: ["$endsAt", "$startsAt"] } },
         { ownerUserId: String(viewerId), status: "Cancelled", "record.cancelledAt": { $gte: recentOwnerHistoryStart.toISOString() } }
       );
     }
     filter = { $or: visibilityFilters };
   }
-  const records = await EventRecord.find(filter).lean().exec();
-  const events = records.map((item) => item.record).filter(Boolean);
-  if (!events.length) return events;
+  let records;
+  let pageResult = null;
+  if (pageOptions) {
+    const conditions = [filter];
+    if (pageOptions.category && pageOptions.category !== "all") conditions.push({ category: pageOptions.category });
+    if (pageOptions.cursor) {
+      conditions.push({
+        $or: [
+          { createdAt: { $lt: pageOptions.cursor.createdAt } },
+          { createdAt: pageOptions.cursor.createdAt, eventId: { $lt: pageOptions.cursor.eventId } }
+        ]
+      });
+    }
+    const candidates = await EventRecord.find(conditions.length > 1 ? { $and: conditions } : filter)
+      .sort({ createdAt: -1, eventId: -1 })
+      .limit(pageOptions.limit + 1)
+      .lean()
+      .exec();
+    const hasMore = candidates.length > pageOptions.limit;
+    records = candidates.slice(0, pageOptions.limit);
+    pageResult = {
+      nextCursor: hasMore && records.length ? createEventPageCursor(records[records.length - 1]) : null,
+      hasMore
+    };
+  } else {
+    records = await EventRecord.find(filter).lean().exec();
+  }
+  const events = records.map((item) => item.record && ({
+    ...item.record,
+    revision: isValidEventRevision(item.revision) ? item.revision : isValidEventRevision(item.record.revision) ? item.record.revision : 1
+  })).filter(Boolean);
+  if (!events.length) return pageOptions
+    ? { events: [], ...pageResult }
+    : events;
   const eventIds = events.map((event) => String(event.id));
   const actions = await EngagementAction.find({ eventId: { $in: eventIds } })
     .select("eventId userId type faculty department")
@@ -1836,7 +2072,7 @@ async function listStoredEvents(viewerId = "", onlyVisible = false) {
       if (faculty) facultyByUserId.set(String(attendee._id), faculty);
     }
   }
-  return events.map((event) => {
+  const decoratedEvents = events.map((event) => {
     const eventActions = actionsByEvent.get(String(event.id)) || [];
     const matching = (type) => eventActions.filter((action) => action.type === type);
     const attendees = matching("rsvp");
@@ -1854,6 +2090,9 @@ async function listStoredEvents(viewerId = "", onlyVisible = false) {
       reminderUserIds: viewerId && reminders.some((action) => String(action.userId) === String(viewerId)) ? [String(viewerId)] : []
     };
   });
+  return pageOptions
+    ? { events: decoratedEvents, ...pageResult }
+    : decoratedEvents;
 }
 
 async function getEventViewCounts(eventIds) {
@@ -1921,7 +2160,7 @@ function getIdempotentEventId(ownerUserId, clientRequestId) {
 }
 
 function getEventSubmissionFingerprint(payload) {
-  const { allowSimilar, ...submission } = payload || {};
+  const { allowSimilar, expectedRevision, ...submission } = payload || {};
   return crypto.createHash("sha256").update(JSON.stringify(submission)).digest("hex");
 }
 
@@ -1936,10 +2175,22 @@ function createNotificationOutboxIntent(type, event, details = {}) {
   };
 }
 
-async function storeEvent(event, notificationIntents = []) {
+async function storeEvent(event, notificationIntents = [], { expectedRevision } = {}) {
   if (!isMongoConnected()) {
     const database = readDatabase();
     const index = database.events.findIndex((item) => String(item.id) === String(event.id));
+    if (expectedRevision !== undefined) {
+      const currentRevision = isValidEventRevision(database.events[index]?.revision) ? database.events[index].revision : 1;
+      if (index < 0 || currentRevision !== expectedRevision) {
+        const conflict = new Error("This event changed after you opened it. Reload the latest version before saving again.");
+        conflict.code = "EVENT_VERSION_CONFLICT";
+        conflict.currentRevision = currentRevision;
+        throw conflict;
+      }
+    }
+    event.revision = expectedRevision === undefined
+      ? isValidEventRevision(event.revision) ? event.revision : 1
+      : expectedRevision + 1;
     if (index < 0) database.events.push(event);
     else database.events[index] = event;
     if (notificationIntents.length) {
@@ -1959,14 +2210,30 @@ async function storeEvent(event, notificationIntents = []) {
     writeDatabase(database);
     return event;
   }
+  event.revision = expectedRevision === undefined
+    ? isValidEventRevision(event.revision) ? event.revision : 1
+    : expectedRevision + 1;
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
-      await EventRecord.updateOne(
-        { eventId: String(event.id) },
+      const eventFilter = expectedRevision === undefined
+        ? { eventId: String(event.id) }
+        : {
+          eventId: String(event.id),
+          ...(expectedRevision === 1
+            ? { $or: [{ revision: expectedRevision }, { revision: { $exists: false } }] }
+            : { revision: expectedRevision })
+        };
+      const eventWrite = await EventRecord.updateOne(
+        eventFilter,
         { $set: eventDocumentFromRecord(event) },
-        { upsert: true, session }
+        { upsert: expectedRevision === undefined, session }
       ).exec();
+      if (expectedRevision !== undefined && !eventWrite.matchedCount) {
+        const conflict = new Error("This event changed after you opened it. Reload the latest version before saving again.");
+        conflict.code = "EVENT_VERSION_CONFLICT";
+        throw conflict;
+      }
       if (notificationIntents.length) {
         await NotificationOutbox.bulkWrite(notificationIntents.map((intent) => ({
           updateOne: {
@@ -2645,9 +2912,51 @@ app.use(express.json({ limit: "4mb" }));
 const authRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
+  store: new MongoAwareRateLimitStore(),
   standardHeaders: "draft-8",
   legacyHeaders: false,
   message: { error: "Too many sign-in attempts. Please wait a few minutes and try again." }
+});
+
+function createAccountRateLimit({ limit, message }) {
+  const limiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit,
+    store: new MongoAwareRateLimitStore(),
+    keyGenerator: (request) => request.rateLimitUserId
+      ? `user:${request.rateLimitUserId}`
+      : ipKeyGenerator(request.ip),
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: message }
+  });
+  return async (request, response, next) => {
+    try {
+      const user = await getAuthenticatedUser(request);
+      if (user) {
+        request.rateLimitUserId = String(user._id || user.id);
+        request.rateLimitUser = user;
+      }
+    } catch (error) {
+      if (!(error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError)) {
+        return next(error);
+      }
+    }
+    return limiter(request, response, next);
+  };
+}
+
+const eventMutationRateLimit = createAccountRateLimit({
+  limit: 120,
+  message: "Too many event changes. Please wait before trying again."
+});
+const eventReportRateLimit = createAccountRateLimit({
+  limit: 10,
+  message: "Too many event reports. Please wait before reporting again."
+});
+const recapUploadRateLimit = createAccountRateLimit({
+  limit: 10,
+  message: "Too many recap uploads. Please wait before uploading again."
 });
 
 app.get("/api/health", (request, response) => {
@@ -2665,15 +2974,16 @@ app.get("/api/health", (request, response) => {
 });
 
 app.get("/api/ready", (request, response) => {
-  const storageReady = databaseBackend === "mongodb"
-    ? isMongoConnected()
-    : !process.env.MONGO_URI;
-  const ready = storageReady && (process.env.NODE_ENV !== "production" || OPERATIONAL_MONGO_CUTOVER_COMPLETE);
-  return response.status(ready ? 200 : 503).json({
-    ready,
-    database: isMongoConnected() ? "mongodb" : "local-fallback",
-    operationalMongoCutover: OPERATIONAL_MONGO_CUTOVER_COMPLETE
-  });
+  const expectedSecret = process.env.CRON_SECRET_KEY || "";
+  const providedSecret = request.get("x-cron-secret") || "";
+  if (expectedSecret) {
+    const expectedBuffer = Buffer.from(expectedSecret);
+    const providedBuffer = Buffer.from(providedSecret);
+    if (expectedBuffer.length !== providedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, providedBuffer)) {
+      return response.status(401).json({ error: "Health check request is unauthorized." });
+    }
+  }
+  return response.status(200).json({ ok: true, timestamp: Date.now() });
 });
 
 app.use("/api", (request, response, next) => {
@@ -3849,29 +4159,26 @@ app.get("/api/events", async (request, response) => {
     if (authorization.startsWith("Bearer ") && !user) return response.status(401).json({ error: "Session is no longer valid." });
     const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
     const viewerId = user ? String(user._id || user.id) : "";
-    const storedEvents = await listStoredEvents(viewerId, true);
+    const rawLimit = request.query.limit === undefined ? "30" : String(request.query.limit);
+    if (!/^\d{1,3}$/.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 100) {
+      return response.status(400).json({ error: "Event page limit must be a whole number between 1 and 100." });
+    }
+    const cursor = request.query.cursor === undefined ? null : parseEventPageCursor(String(request.query.cursor));
+    if (request.query.cursor !== undefined && !cursor) {
+      return response.status(400).json({ error: "Event page cursor is invalid. Refresh the feed and try again." });
+    }
     const level = request.query.level;
     const category = request.query.category;
-    let events = storedEvents.filter((event) => {
-      const isOwnerDraft = Boolean(user && event.status === "Draft" && String(event.createdByUserId || "") === String(user._id || user.id));
-      const endedAt = parseCampusDateTime(event.endTime)?.getTime() ?? NaN;
-      const isOwnerRecentEndedEvent = Boolean(user
-        && event.status !== "Cancelled"
-        && String(event.createdByUserId || "") === String(user._id || user.id)
-        && Number.isFinite(endedAt)
-        && endedAt <= Date.now()
-        && Date.now() - endedAt <= 7 * 24 * 60 * 60_000);
-      const cancelledAt = new Date(event.cancelledAt || "").getTime();
-      const isOwnerRecentCancellation = Boolean(user
-        && event.status === "Cancelled"
-        && String(event.createdByUserId || "") === String(user._id || user.id)
-        && Number.isFinite(cancelledAt)
-        && Date.now() - cancelledAt <= 7 * 24 * 60 * 60_000);
-      return isOwnerDraft
-        || isOwnerRecentEndedEvent
-        || isOwnerRecentCancellation
-        || (["Published", "Live"].includes(event.status) && (isWithinEventDisplayWindow(event) || isPublicRecapVisible(event)));
+    if (category && category !== "all" && !ALLOWED_CATEGORIES.has(String(category))) {
+      return response.status(400).json({ error: "Choose a supported event category." });
+    }
+    const page = await listStoredEvents(viewerId, true, {
+      limit: Number(rawLimit),
+      cursor,
+      category: category ? String(category) : ""
     });
+    const storedEvents = page.events;
+    let events = storedEvents.filter((event) => isEventVisibleToFeed(event, viewerId));
     if (level) events = events.filter((event) => eventAudienceMatchesLevel(event, level));
     if (category && category !== "all") events = events.filter((event) => event.category === category);
     const hotEligibleUserCount = await getHotEligibleUserCount(database);
@@ -3879,7 +4186,11 @@ app.get("/api/events", async (request, response) => {
     events = await decorateEventsWithCurrentOrganizers(events, database);
     events = await decorateOwnerEventViews(events, viewerId);
     events = await decorateOwnerRecapDismissals(events, viewerId);
-    return response.json({ events: events.map((event) => toPublicEvent(event, viewerId)) });
+    return response.json({
+      events: events.map((event) => toPublicEvent(event, viewerId)),
+      nextCursor: page.nextCursor,
+      hasMore: page.hasMore
+    });
   } catch (error) {
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
       return response.status(401).json({ error: "Session is no longer valid." });
@@ -4355,14 +4666,23 @@ app.get("/api/events/hot", async (request, response) => {
     });
 });
 
-app.post("/api/events", async (request, response) => {
+app.post("/api/events", eventMutationRateLimit, async (request, response) => {
   try {
-    const user = await getAuthenticatedUser(request);
+    const user = request.rateLimitUser || await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in before publishing a campus event." });
     const profile = user.profile || {};
     if (!validateProfile(profile)) return response.status(403).json({ error: "Complete your campus profile before publishing an event." });
     const payload = request.body || {};
+    const unsupportedFields = getUnsupportedEventFields(payload);
+    if (unsupportedFields.length) {
+      return response.status(400).json({ error: `Unsupported event field(s): ${unsupportedFields.join(", ")}.` });
+    }
     const { allowSimilar, ...eventPayload } = payload;
+    const expectedRevision = eventPayload.expectedRevision;
+    delete eventPayload.expectedRevision;
+    if (expectedRevision !== undefined && !isValidEventRevision(expectedRevision)) {
+      return response.status(400).json({ error: "Expected event revision must be a positive whole number." });
+    }
     const requestedStatus = payload.status || "Draft";
     if (!["Draft", "Published", "Live"].includes(requestedStatus)) {
       return response.status(400).json({ error: "Events can only be saved as drafts or published events." });
@@ -4391,6 +4711,16 @@ app.post("/api/events", async (request, response) => {
       }
       return response.json({ event: toPublicEvent(existing), similarEvents: [] });
     }
+    if (existing && expectedRevision === undefined) {
+      const fingerprint = getEventSubmissionFingerprint(payload);
+      if (existing.clientRequestFingerprint === fingerprint) {
+        return response.json({ event: toPublicEvent(existing), similarEvents: [] });
+      }
+      return response.status(428).json({
+        code: "EVENT_VERSION_REQUIRED",
+        error: "Reload the saved draft before changing it so the latest revision can be protected."
+      });
+    }
     const now = new Date().toISOString();
     let event = {
       ...(existing || {}),
@@ -4403,13 +4733,15 @@ app.post("/api/events", async (request, response) => {
       venueLandmark: typeof payload.venueLandmark === "string" ? payload.venueLandmark.trim().slice(0, 240) : "",
       meetingUrl: typeof payload.meetingUrl === "string" ? payload.meetingUrl.trim() : "",
       infoUrl: typeof payload.infoUrl === "string" ? payload.infoUrl.trim() : "",
-      turnoutCount: typeof payload.turnoutCount === "number" ? payload.turnoutCount : (Number(payload.turnoutCount) || 0),
-      turnoutBreakdown: Array.isArray(payload.turnoutBreakdown) ? payload.turnoutBreakdown : [],
+      turnoutCount: existing ? Number(existing.turnoutCount) || 0 : 0,
+      turnoutBreakdown: existing && Array.isArray(existing.turnoutBreakdown) ? existing.turnoutBreakdown : [],
       status: requestedStatus,
+      revision: existing ? existing.revision || 1 : 1,
       createdAt: existing?.createdAt || now,
       updatedAt: now
     };
-    if (!validateEvent(event)) return response.status(400).json({ error: "Event is missing required fields." });
+    const validationError = validateEvent(event);
+    if (validationError) return response.status(400).json({ error: validationError });
     const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
     const storedEvents = await listStoredEvents();
     if (event.status !== "Draft") {
@@ -4433,11 +4765,11 @@ app.post("/api/events", async (request, response) => {
       event = await externalizeEventBanners(event);
       await storeEvent(event, [
         createNotificationOutboxIntent("new-event", event, { version: event.updatedAt })
-      ]);
+      ], existing ? { expectedRevision } : {});
       return response.status(201).json({ event: toPublicEvent(event), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
     event = await externalizeEventBanners(event);
-    await storeEvent(event);
+    await storeEvent(event, [], existing ? { expectedRevision } : {});
     void cancelEventEndedRecapPrompts(event.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
     return response.status(201).json({ event: toPublicEvent(event), similarEvents: [] });
   } catch (error) {
@@ -4455,9 +4787,9 @@ app.post("/api/events", async (request, response) => {
   }
 });
 
-app.patch("/api/events/:eventId", async (request, response) => {
+app.patch("/api/events/:eventId", eventMutationRateLimit, async (request, response) => {
   try {
-    const user = await getAuthenticatedUser(request);
+    const user = request.rateLimitUser || await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in before editing an event." });
     const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
     const current = await findStoredEvent(request.params.eventId);
@@ -4465,15 +4797,36 @@ app.patch("/api/events/:eventId", async (request, response) => {
     if (!current.createdByUserId || String(current.createdByUserId) !== String(user._id || user.id)) {
       return response.status(403).json({ error: "Only the account that originally published this event can edit it." });
     }
+    const body = request.body || {};
+    const unsupportedFields = getUnsupportedEventFields(body);
+    if (unsupportedFields.length) {
+      return response.status(400).json({ error: `Unsupported event field(s): ${unsupportedFields.join(", ")}.` });
+    }
+    const expectedRevision = body.expectedRevision;
+    if (!isValidEventRevision(expectedRevision)) {
+      return response.status(428).json({
+        code: "EVENT_VERSION_REQUIRED",
+        error: "Reload the latest event before saving your changes."
+      });
+    }
+    const currentRevision = isValidEventRevision(current.revision) ? current.revision : 1;
+    if (expectedRevision !== currentRevision) {
+      return response.status(409).json({
+        code: "EVENT_VERSION_CONFLICT",
+        currentRevision,
+        error: "This event changed after you opened it. Reload the latest version before saving again."
+      });
+    }
     if (["Published", "Live"].includes(current.status) && request.body?.status === "Draft") {
       return response.status(409).json({ error: "Published events cannot be changed back into drafts." });
     }
-    const { allowSimilar, ...changes } = request.body || {};
+    const { allowSimilar, expectedRevision: ignoredRevision, ...changes } = body;
     let updated = {
       ...current,
       ...changes,
       id: current.id,
       createdByUserId: current.createdByUserId,
+      revision: currentRevision + 1,
       ...getCurrentOrganizerMetadata(user),
       venue: typeof changes.venue === "string" ? changes.venue.trim().slice(0, 120) : current.venue,
       venueLandmark: typeof changes.venueLandmark === "string" ? changes.venueLandmark.trim().slice(0, 240) : current.venueLandmark || "",
@@ -4487,7 +4840,8 @@ app.patch("/api/events/:eventId", async (request, response) => {
     if (updated.status !== "Draft" && new Date(user.postingBanUntil || 0).getTime() > Date.now()) {
       return response.status(403).json({ error: `Your event-posting access is paused until ${new Date(user.postingBanUntil).toLocaleString()}.` });
     }
-    if (!validateEvent(updated)) return response.status(400).json({ error: "Published events require a start and end time, title, category, activity, venue, and target audience." });
+    const validationError = validateEvent(updated);
+    if (validationError) return response.status(400).json({ error: validationError });
     if (updated.status !== "Draft") {
       const matches = getEventDuplicateMatches({ events: await listStoredEvents() }, updated, current.id);
       const blockingMatches = matches.filter((match) => match.score === 100);
@@ -4522,14 +4876,17 @@ app.patch("/api/events/:eventId", async (request, response) => {
           : current.status !== updated.status
             ? [createNotificationOutboxIntent("event-state-changed", updated, { version: updated.updatedAt })]
             : [];
-      await storeEvent(updated, notificationIntents);
+      await storeEvent(updated, notificationIntents, { expectedRevision });
       return response.json({ event: toPublicEvent(updated), similarEvents: advisoryMatches.map(({ event: match, score }) => ({ event: toPublicEvent(match), score })) });
     }
     updated = await externalizeEventBanners(updated);
-    await storeEvent(updated);
+    await storeEvent(updated, [], { expectedRevision });
     void cancelEventEndedRecapPrompts(updated.id).catch((error) => console.error("Event-end recap notification could not be cancelled.", error));
     return response.json({ event: toPublicEvent(updated), similarEvents: [] });
   } catch (error) {
+    if (error.code === "EVENT_VERSION_CONFLICT") {
+      return response.status(409).json({ code: error.code, error: error.message });
+    }
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
       return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
     }
@@ -4604,9 +4961,9 @@ app.delete("/api/events/:eventId", async (request, response) => {
   }
 });
 
-app.post("/api/events/:eventId/announcements", async (request, response) => {
+app.post("/api/events/:eventId/announcements", eventMutationRateLimit, async (request, response) => {
   try {
-    const user = await getAuthenticatedUser(request);
+    const user = request.rateLimitUser || await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in before sending an event announcement." });
     if (!isMongoConnected()) return response.status(503).json({ error: "Organizer broadcasts require the shared MongoDB notification queue." });
     const event = await findStoredEvent(request.params.eventId);
@@ -4652,7 +5009,7 @@ app.post("/api/events/:eventId/announcements", async (request, response) => {
   }
 });
 
-app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
+app.post("/api/events/:eventId/recap-photos", recapUploadRateLimit, (request, response, next) => {
   recapImageUpload.array("photos", 5)(request, response, (error) => {
     if (error) {
       const message = error.code === "LIMIT_FILE_SIZE"
@@ -4665,7 +5022,7 @@ app.post("/api/events/:eventId/recap-photos", (request, response, next) => {
 }, async (request, response) => {
   const uploadedAssets = [];
   try {
-    const user = await getAuthenticatedUser(request);
+    const user = request.rateLimitUser || await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in before uploading event recap photos." });
     if (!isMongoConnected()) return response.status(503).json({ error: "Recap uploads require the shared MongoDB database." });
     if (!configureCloudinary()) {
@@ -4804,9 +5161,9 @@ app.get("/api/admin/cloudinary/verify", async (request, response) => {
   }
 });
 
-app.post("/api/events/:eventId/report", async (request, response) => {
+app.post("/api/events/:eventId/report", eventReportRateLimit, async (request, response) => {
   try {
-    const user = await getAuthenticatedUser(request);
+    const user = request.rateLimitUser || await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in before reporting an event." });
     const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
     const event = await findStoredEvent(request.params.eventId);
@@ -5294,7 +5651,8 @@ async function startServer() {
       await Promise.all([
         User.init(), EmailChallenge.init(), EventRecord.init(), EngagementAction.init(), EventReport.init(),
         EventView.init(), RecapPromptDismissal.init(),
-        PushDevice.init(), NotificationJob.init(), NotificationOutbox.init(), NotificationDeadLetter.init()
+        PushDevice.init(), NotificationJob.init(), NotificationOutbox.init(), NotificationDeadLetter.init(),
+        ApiRateLimitBucket.init()
       ]);
       databaseBackend = "mongodb";
       console.log("FUTApulse connected to MongoDB and verified indexes.");
@@ -5315,7 +5673,7 @@ if (require.main === module) {
 module.exports = {
   app,
   startServer,
-  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob, NotificationOutbox, NotificationDeadLetter },
+  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob, NotificationOutbox, NotificationDeadLetter, ApiRateLimitBucket },
   buildFacultyTurnoutBreakdown,
   buildRsvpReminderSchedule,
   buildCriticalEventUpdateDetails,

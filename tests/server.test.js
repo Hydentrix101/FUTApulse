@@ -128,6 +128,7 @@ test("Phase 2 Mongo models define event lookup and per-account action uniqueness
   const viewIndexes = models.EventView.schema.indexes();
   const recapDismissalIndexes = models.RecapPromptDismissal.schema.indexes();
   const notificationIndexes = models.NotificationJob.schema.indexes();
+  const rateLimitIndexes = models.ApiRateLimitBucket.schema.indexes();
 
   assert.ok(eventIndexes.some(([fields]) => fields.eventId === 1));
   assert.ok(eventIndexes.some(([fields]) => fields.status === 1 && fields.endsAt === 1));
@@ -138,6 +139,7 @@ test("Phase 2 Mongo models define event lookup and per-account action uniqueness
   assert.ok(recapDismissalIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && options.unique));
   assert.ok(notificationIndexes.some(([fields, options]) => fields.idempotencyKey === 1 && options.unique));
   assert.ok(notificationIndexes.some(([fields, options]) => fields.expiresAt === 1 && options.expireAfterSeconds === 0));
+  assert.ok(rateLimitIndexes.some(([fields, options]) => fields.expiresAt === 1 && options.expireAfterSeconds === 0));
   assert.equal(models.NotificationJob.schema.path("deliveredDeviceKeys").defaultValue.length, 0);
 });
 
@@ -486,7 +488,7 @@ test("VAPID configuration validates P-256 key points and matching key pairs", ()
   assert.match(malformed.error, /base64url/);
 });
 
-test("health and readiness clearly report the local development storage mode", async () => {
+test("health exposes diagnostics while the readiness endpoint stays small and optionally secret-protected", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const healthResponse = await fetch(`${baseUrl}/api/health`);
   const readinessResponse = await fetch(`${baseUrl}/api/ready`);
@@ -500,8 +502,28 @@ test("health and readiness clearly report the local development storage mode", a
   assert.equal(health.socketRedisConfigured, false);
   assert.equal(health.socketRedisConnected, false);
   assert.equal(readinessResponse.status, 200);
-  assert.equal(readiness.ready, true);
-  assert.equal(readiness.operationalMongoCutover, false);
+  assert.deepEqual(Object.keys(readiness).sort(), ["ok", "timestamp"]);
+  assert.equal(readiness.ok, true);
+  assert.equal(typeof readiness.timestamp, "number");
+
+  const originalSecret = process.env.CRON_SECRET_KEY;
+  process.env.CRON_SECRET_KEY = "test-readiness-secret";
+  try {
+    const unauthorized = await fetch(`${baseUrl}/api/ready`);
+    assert.equal(unauthorized.status, 401);
+    const wrongSecret = await fetch(`${baseUrl}/api/ready`, {
+      headers: { "x-cron-secret": "wrong-secret" }
+    });
+    assert.equal(wrongSecret.status, 401);
+    const authorized = await fetch(`${baseUrl}/api/ready`, {
+      headers: { "x-cron-secret": process.env.CRON_SECRET_KEY }
+    });
+    assert.equal(authorized.status, 200);
+    assert.deepEqual(Object.keys(await authorized.json()).sort(), ["ok", "timestamp"]);
+  } finally {
+    if (originalSecret === undefined) delete process.env.CRON_SECRET_KEY;
+    else process.env.CRON_SECRET_KEY = originalSecret;
+  }
 });
 
 test("notification configuration reports recap upload availability without exposing secrets", async () => {
@@ -1272,11 +1294,12 @@ test("event creation retries reuse the original event after a lost response", as
   assert.equal(firstResponse.status, 201);
   const firstEvent = (await firstResponse.json()).event;
   assert.equal(firstEvent.clientRequestId, undefined, "internal retry identifiers must not be exposed publicly");
+  assert.equal(firstEvent.revision, 1);
 
   const draftRetryResponse = await fetch(`${baseUrl}/api/events`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ ...payload, activity: "Updated details after draft sync retry" })
+    body: JSON.stringify({ ...payload, expectedRevision: firstEvent.revision, activity: "Updated details after draft sync retry" })
   });
   assert.equal(draftRetryResponse.status, 201);
   const draftRetryEvent = (await draftRetryResponse.json()).event;
@@ -1286,7 +1309,7 @@ test("event creation retries reuse the original event after a lost response", as
   const publishResponse = await fetch(`${baseUrl}/api/events`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ ...payload, status: "Published", activity: "Updated details after draft sync retry" })
+    body: JSON.stringify({ ...payload, expectedRevision: draftRetryEvent.revision, status: "Published", activity: "Updated details after draft sync retry" })
   });
   assert.equal(publishResponse.status, 201);
   assert.equal((await publishResponse.json()).event.id, firstEvent.id);
@@ -1303,6 +1326,109 @@ test("event creation retries reuse the original event after a lost response", as
   const ownerEvents = await fetch(`${baseUrl}/api/events`, { headers });
   const matchingEvents = (await ownerEvents.json()).events.filter((event) => event.title === payload.title);
   assert.equal(matchingEvents.length, 1);
+});
+
+test("event edits enforce allowlisted fields, revision conflicts, shared validation, and cursor pages", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const owner = await createVerifiedAccount(baseUrl, "event-edit-safety@futa.edu.ng", "event_edit_safety");
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${owner.token}` };
+  const profile = await fetch(`${baseUrl}/api/profile/setup`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ username: "event_edit_safety", displayName: "Event Edit Safety", faculty: "SEET", department: "EEE", level: "300", role: "explorer" })
+  });
+  assert.equal(profile.status, 200);
+
+  const created = await fetch(`${baseUrl}/api/events`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ title: "Safe event draft", category: "academic", activity: "Original", status: "Draft" })
+  });
+  assert.equal(created.status, 201);
+  const original = (await created.json()).event;
+
+  const missingVersion = await fetch(`${baseUrl}/api/events/${original.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ title: "Missing version" })
+  });
+  assert.equal(missingVersion.status, 428);
+
+  const protectedField = await fetch(`${baseUrl}/api/events/${original.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedRevision: original.revision, createdByUserId: owner.user.id })
+  });
+  assert.equal(protectedField.status, 400);
+
+  const invalidCategory = await fetch(`${baseUrl}/api/events/${original.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedRevision: original.revision, category: "unrecognized" })
+  });
+  assert.equal(invalidCategory.status, 400);
+
+  const updatedResponse = await fetch(`${baseUrl}/api/events/${original.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedRevision: original.revision, title: "Updated safe event draft" })
+  });
+  assert.equal(updatedResponse.status, 200);
+  const updated = (await updatedResponse.json()).event;
+  assert.equal(updated.revision, original.revision + 1);
+  assert.equal(updated.createdByUserId, owner.user.id);
+
+  const staleEdit = await fetch(`${baseUrl}/api/events/${original.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedRevision: original.revision, title: "Stale overwrite" })
+  });
+  assert.equal(staleEdit.status, 409);
+
+  const tooLongTitle = await fetch(`${baseUrl}/api/events`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ title: "x".repeat(121), status: "Draft" })
+  });
+  assert.equal(tooLongTitle.status, 400);
+
+  const expectedDraftIds = new Set([original.id]);
+  for (const title of ["Second safe draft", "Third safe draft"]) {
+    const additional = await fetch(`${baseUrl}/api/events`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ title, status: "Draft" })
+    });
+    assert.equal(additional.status, 201);
+    expectedDraftIds.add((await additional.json()).event.id);
+  }
+
+  const firstPageResponse = await fetch(`${baseUrl}/api/events?limit=1`, { headers });
+  assert.equal(firstPageResponse.status, 200);
+  const firstPage = await firstPageResponse.json();
+  assert.equal(firstPage.events.length, 1);
+  assert.equal(firstPage.hasMore, true);
+  const ids = new Set(firstPage.events.map((event) => event.id));
+  let cursor = firstPage.nextCursor;
+  let hasMore = firstPage.hasMore;
+  while (hasMore) {
+    const pageResponse = await fetch(`${baseUrl}/api/events?limit=1&cursor=${encodeURIComponent(cursor)}`, { headers });
+    assert.equal(pageResponse.status, 200);
+    const page = await pageResponse.json();
+    assert.equal(page.events.length, 1);
+    for (const event of page.events) {
+      assert.equal(ids.has(event.id), false, "cursor pages must not repeat events");
+      ids.add(event.id);
+    }
+    cursor = page.nextCursor;
+    hasMore = page.hasMore;
+  }
+  for (const id of expectedDraftIds) assert.equal(ids.has(id), true);
+
+  const invalidLimit = await fetch(`${baseUrl}/api/events?limit=101`, { headers });
+  assert.equal(invalidLimit.status, 400);
+  const invalidCursor = await fetch(`${baseUrl}/api/events?cursor=not-a-cursor`, { headers });
+  assert.equal(invalidCursor.status, 400);
 });
 
 test("drafts are private and only their owner can permanently delete them", async () => {
@@ -1504,6 +1630,7 @@ test("account deletion removes events owned by that account", async () => {
     headers,
     body: JSON.stringify({ username: "delete_owner", displayName: "Delete Owner", faculty: "SEET", department: "EEE", level: "300", role: "explorer" })
   });
+
   assert.equal(setup.status, 200);
   const start = new Date(Date.now() + 86400000);
   const createdResponse = await fetch(`${baseUrl}/api/events`, {
@@ -1544,6 +1671,26 @@ test("account deletion removes events owned by that account", async () => {
   assert.deepEqual(afterDeletion.pushDevices, []);
   assert.deepEqual(afterDeletion.engagementActions, []);
   assert.deepEqual(afterDeletion.notificationJobs, []);
+});
+
+test("event reports are rate-limited by client IP when the caller is not authenticated", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const headers = { "Content-Type": "application/json", "X-Forwarded-For": "198.51.100.220" };
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const response = await fetch(`${baseUrl}/api/events/unknown-event/report`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ reason: "other" })
+    });
+    assert.equal(response.status, 401);
+  }
+  const limitedResponse = await fetch(`${baseUrl}/api/events/unknown-event/report`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ reason: "other" })
+  });
+  assert.equal(limitedResponse.status, 429);
+  assert.match((await limitedResponse.json()).error, /Too many event reports/);
 });
 
 test("account security supports email/password changes and confirmed deletion", async () => {

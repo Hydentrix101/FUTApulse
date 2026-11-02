@@ -9,7 +9,8 @@
     "start": "node server.js",
     "dev": "node server.js",
     "migrate:local": "node scripts/migrate-local-to-mongo.js",
-    "test": "node --test"
+    "test": "node --test",
+    "test:integration": "node --test tests/mongo.integration.test.js"
   },
   "dependencies": {
     "@socket.io/redis-adapter": "^8.3.0",

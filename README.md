@@ -87,7 +87,7 @@ Production delivery requires all of the following:
 - `WEB_PUSH_PUBLIC_KEY` and `WEB_PUSH_PRIVATE_KEY` configured on the API host; optionally set `WEB_PUSH_SUBJECT` to a valid `mailto:` or HTTPS contact.
 - The user explicitly allows notifications and registers that browser/device from the FUTApulse notification settings.
 - A running server-side worker. The API runs an internal due-job poller while MongoDB is connected. The scheduled GitHub Actions workflow is a backup trigger, not a guaranteed real-time scheduler; GitHub may delay scheduled jobs. It calls **`POST /api/internal/notifications/worker`** with the `x-cron-secret` header and processes up to 50 due jobs per request.
-- Set `CRON_SECRET_KEY` in the Render API environment and set the same value as the GitHub Actions repository secret named `CRON_SECRET_KEY`. The endpoint returns 503 when the secret or MongoDB-backed queue is unavailable and rejects requests without the secret. Do not use `/api/ready` as a notification trigger; it is only a health/readiness check.
+- Set `CRON_SECRET_KEY` in the Render API environment and set the same value as the GitHub Actions repository secret named `CRON_SECRET_KEY`. The endpoint returns 503 when the secret or MongoDB-backed queue is unavailable and rejects requests without the secret. Do not use `/api/ready` as a notification trigger; it is only a keep-alive check that returns a small `{ ok, timestamp }` payload and requires the `x-cron-secret` header whenever `CRON_SECRET_KEY` is configured.
 - Monitor the worker response fields `oldestDueAgeMs`, `retried`, `failed`, `outboxRetried`, `outboxFailed`, and `expiredDevicesDeactivated`; completed jobs store delivery latency. Queue lag over five minutes is logged as a warning. A dead-letter can be replayed after its cause is corrected with `POST /api/internal/notifications/dead-letter/:id/replay` and the same `x-cron-secret`; replay is transactionally recorded and reuses the original notification ID.
 
 For reliable production timing, keep the Render API/worker continuously running or move the poller to a dedicated always-on Render Background Worker. The five-minute GitHub schedule is only a recovery/fallback path and should not be used to keep a sleeping free web service alive. On iPhone/iPad, Web Push generally requires FUTApulse to be added to the Home Screen and notification permission granted; browser and operating-system settings can still suppress or delay alerts. Native FCM delivery requires a separately integrated native client; the PWA uses Web Push.
@@ -97,14 +97,20 @@ References: [Gmail API quota and billing threshold](https://developers.google.co
 ## API foundation
 
 - `GET /api/health`
-- `GET /api/events?level=200`
+- `GET /api/events?level=200&limit=30`
 - `POST /api/events`
 - `PATCH /api/events/:id`
 - `POST /api/profiles`
 - `GET /api/profiles/:id`
+
+The event feed returns a cursor-paginated response (`events`, `nextCursor`, and `hasMore`). `limit` defaults to 30 and accepts values from 1 to 100; pass the opaque `nextCursor` as `cursor` to load the next page. Event responses include a `revision`. `PATCH /api/events/:id` accepts only editable event fields and requires the current `expectedRevision`; a missing revision returns 428 and a stale revision returns 409. Creation and edits use the same server-side validation rules.
+
+Signup and login are limited to 10 attempts per IP per 15 minutes. Event creation/edits/announcements are limited to 120 requests per account per hour, event reports to 10 per account per hour, and recap-photo uploads to 10 per account per hour; unauthenticated requests are keyed by IP. Mongo-backed deployments persist counters in a TTL-cleaned collection so limits are shared across API instances. Local development uses in-memory counters.
 
 Without `MONGO_URI`, development API data is stored locally in `data/futapulse.json`. If a configured MongoDB connection is unavailable, the API exits rather than splitting data across Atlas and local storage.
 
 Signed-in students with a completed profile may publish campus events without a banner. Exact duplicates (title, venue, category, start time, end time, and event activity) are blocked; close matches are shown so the author can inspect them before confirming that the event is distinct. An edited event is excluded from its own comparison. Event edits are restricted to the account that created the event; legacy events without verified ownership remain read-only.
 
 Draft events are not included in public event or trending feeds. Authenticated event-list requests may retrieve only the requesting user's own drafts.
+
+MongoDB transaction integration coverage is opt-in. Set `FUTAPULSE_TEST_MONGO_URI` to a disposable database on a MongoDB replica set, then run `npm run test:integration`. The test verifies concurrent event edit conflicts and that publishing an event durably writes and processes its notification outbox intent. It is skipped when the variable is unset; do not point it at production data.

@@ -254,7 +254,13 @@ function EventEditor({
     }
     if (publishedAtOpen) return initial
     return savedDraft && typeof savedDraft === 'object'
-      ? { ...initial, ...savedDraft, id: event.id || savedDraft.id || '', clientRequestId: initial.clientRequestId }
+      ? {
+        ...initial,
+        ...savedDraft,
+        id: event.id || savedDraft.id || '',
+        revision: event.revision || initial.revision || 1,
+        clientRequestId: initial.clientRequestId,
+      }
       : initial
   })
   const [banner, setBanner] = useState(() => event.bannerImages?.[0] || event.banner || '')
@@ -336,6 +342,7 @@ function EventEditor({
       .then(() => onAutoSaveRef.current({
         ...snapshot,
         id: snapshot.id || formRef.current.id || '',
+        revision: formRef.current.revision || snapshot.revision,
         date: startDateTime,
         endDateTime,
       }, currentBanner))
@@ -349,12 +356,16 @@ function EventEditor({
       const syncedSnapshot = {
         ...snapshot,
         id: saved.id,
+        revision: saved.revision,
+        updatedAt: saved.updatedAt,
         ...(imagesUnchanged ? { banner: serverImages[0] || '', bannerImages: serverImages } : {}),
       }
       safeSetStored(draftKey, JSON.stringify(syncedSnapshot))
       formRef.current = {
         ...formRef.current,
         id: formRef.current.id || saved.id,
+        revision: saved.revision,
+        updatedAt: saved.updatedAt,
         ...(imagesUnchanged ? { banner: serverImages[0] || '', bannerImages: serverImages } : {}),
       }
       if (imagesUnchanged) {
@@ -366,6 +377,8 @@ function EventEditor({
       setForm((current) => ({
         ...current,
         id: current.id || saved.id,
+        revision: saved.revision,
+        updatedAt: saved.updatedAt,
         ...(imagesUnchanged ? { banner: serverImages[0] || '', bannerImages: serverImages } : {}),
       }))
       setDraftSyncError('')
