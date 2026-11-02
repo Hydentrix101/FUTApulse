@@ -21,7 +21,7 @@ FUTApulse already has a web-push service worker and a server notification queue.
    Keep the private key in Render only. Do not commit it, put it in a `VITE_` variable, or send it in chat.
 
 3. Save the environment changes and let Render restart/redeploy the API. Its startup log should say that Web Push delivery is configured.
-4. On each phone, open the deployed HTTPS site and sign in. During category onboarding, choose **Save & enable device alerts**, or go to **Profile → Notification Preferences → Enable push on this device**, then allow notifications in the browser/OS prompt. Permission and push registration are per device/account: enabling notifications on a laptop does not enable them on a phone. For iOS, install the site to the Home Screen first; iOS web push requires a supported iOS version and an installed web app.
+4. On each device, open the deployed HTTPS site and sign in. During category onboarding, choose **Save & enable device alerts**, or go to **Profile → Notification Preferences → Enable push on this device**, then allow notifications in the browser/OS prompt. Permission and push registration are per device/account: enabling notifications on a laptop does not enable them on a phone. For iOS, install the site to the Home Screen first; iOS web push requires a supported iOS version and an installed web app. Microsoft Edge on Windows uses the Windows push endpoint, which is supported separately from Chrome/Google, Firefox/Mozilla, and Apple endpoints.
 5. Check the same settings panel. It should show provider configured, permission granted, device registered, and shared notification queue available.
 
 ## Delivery requirements

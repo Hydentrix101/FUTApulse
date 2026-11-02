@@ -172,9 +172,15 @@ test("notification scheduling interprets campus-local timestamps as WAT and pres
   ]);
 });
 
-test("Web Push accepts known provider hosts and rejects arbitrary HTTPS endpoints", () => {
+test("Web Push accepts supported provider hosts and rejects arbitrary HTTPS endpoints", () => {
   assert.equal(isAllowedWebPushEndpoint("https://fcm.googleapis.com/fcm/send/subscription"), true);
   assert.equal(isAllowedWebPushEndpoint("https://updates.push.services.mozilla.com/wpush/v2/subscription"), true);
+  assert.equal(isAllowedWebPushEndpoint("https://web.push.apple.com/subscription"), true);
+  assert.equal(isAllowedWebPushEndpoint("https://wns2.notify.windows.com/w/?token=subscription"), true);
+  assert.equal(isAllowedWebPushEndpoint("https://notify.windows.com/subscription"), true);
+  assert.equal(isAllowedWebPushEndpoint("https://notify.windows.com.attacker.example/subscription"), false);
+  assert.equal(isAllowedWebPushEndpoint("https://attacker-notify.windows.com/subscription"), false);
+  assert.equal(isAllowedWebPushEndpoint("http://wns2.notify.windows.com/subscription"), false);
   assert.equal(isAllowedWebPushEndpoint("https://127.0.0.1/admin"), false);
   assert.equal(isAllowedWebPushEndpoint("https://push.attacker.example/subscription"), false);
   assert.equal(isAllowedWebPushEndpoint("https://user:pass@fcm.googleapis.com/path"), false);

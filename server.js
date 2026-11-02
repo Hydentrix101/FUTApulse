@@ -108,6 +108,7 @@ const ALLOWED_WEB_PUSH_HOSTS = new Set([
   "updates.push.services.mozilla.com",
   "web.push.apple.com"
 ]);
+const MICROSOFT_WEB_PUSH_HOST = "notify.windows.com";
 
 function normalizeNotificationPreferences(value) {
   return Object.fromEntries(NOTIFICATION_CATEGORIES.map((category) => [
@@ -632,11 +633,14 @@ function notificationEventLink(event) {
 function isAllowedWebPushEndpoint(endpoint) {
   try {
     const url = new URL(endpoint);
+    const hostname = url.hostname.toLowerCase();
     return url.protocol === "https:"
       && !url.username
       && !url.password
       && (!url.port || url.port === "443")
-      && ALLOWED_WEB_PUSH_HOSTS.has(url.hostname.toLowerCase());
+      && (ALLOWED_WEB_PUSH_HOSTS.has(hostname)
+        || hostname === MICROSOFT_WEB_PUSH_HOST
+        || hostname.endsWith(`.${MICROSOFT_WEB_PUSH_HOST}`));
   } catch {
     return false;
   }
