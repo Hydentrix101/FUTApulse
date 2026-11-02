@@ -37,17 +37,32 @@ let databaseBackend = "local";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const DEFAULT_FRONTEND_URL = process.env.NODE_ENV === "production"
-  ? "https://fut-apulse.vercel.app"
+  ? "https://www.futapulse.com.ng"
   : "http://localhost:5173";
 const FRONTEND_URL = String(process.env.FRONTEND_URL || DEFAULT_FRONTEND_URL).replace(/\/$/, "");
+function normalizeConfiguredOrigin(value) {
+  try {
+    const parsedOrigin = new URL(String(value).trim());
+    if (!["http:", "https:"].includes(parsedOrigin.protocol)) return "";
+    const isLocalOrigin = ["localhost", "127.0.0.1"].includes(parsedOrigin.hostname);
+    if (process.env.NODE_ENV === "production" && parsedOrigin.protocol !== "https:" && !isLocalOrigin) return "";
+    return parsedOrigin.origin;
+  } catch {
+    return "";
+  }
+}
+
+const configuredCorsOrigins = [process.env.CORS_ORIGIN, process.env.CORS_ORIGINS]
+  .flatMap((value) => String(value || "").split(","));
 const CORS_ORIGINS = [...new Set([
   FRONTEND_URL,
+  "https://futapulse.com.ng",
+  "https://www.futapulse.com.ng",
   "https://fut-apulse.vercel.app",
+  ...configuredCorsOrigins,
   "http://localhost:5173",
   "http://127.0.0.1:5173"
-].map((value) => {
-  try { return new URL(value).origin; } catch { return ""; }
-}).filter(Boolean))];
+].map(normalizeConfiguredOrigin).filter(Boolean))];
 // GIS popup code flow must exchange the code using the requesting app origin.
 // Keep this default for non-browser flows, but select the allowlisted request
 // origin for each popup exchange below.
@@ -57,9 +72,7 @@ const GOOGLE_ALLOWED_ORIGINS = new Set([
   GOOGLE_REDIRECT_URI,
   ...CORS_ORIGINS,
   ...(process.env.NODE_ENV === "production" ? [] : ["http://localhost:5173", "http://127.0.0.1:5173"])
-].map((value) => {
-  try { return new URL(value).origin; } catch { return ""; }
-}).filter(Boolean));
+].map(normalizeConfiguredOrigin).filter(Boolean));
 const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === "production" ? "" : "futapulse-dev-only-change-this-secret");
 const REFRESH_COOKIE = "futapulse_refresh";
 const REFRESH_TOKEN_MAX_AGE = 30 * 24 * 60 * 60 * 1000;

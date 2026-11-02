@@ -5,6 +5,8 @@ import { devices, expect, test } from '@playwright/test'
 const PRODUCTION_HOSTS = new Set([
   'fut-apulse.vercel.app',
   'futapulse.onrender.com',
+  'futapulse.com.ng',
+  'www.futapulse.com.ng',
 ])
 
 function getRunConfig() {
@@ -120,11 +122,11 @@ function collectPageFailures(page, failures) {
 test('mobile signup, sign-in, publishing, browsing, and cross-device interaction work on isolated staging', async ({ browser, request }) => {
   test.setTimeout(12 * 60 * 1000)
   const { stagingUrl, email, password } = getRunConfig()
-  const readinessResponse = await request.get(new URL('/api/ready', stagingUrl).toString(), { timeout: 30_000 })
-  expect(readinessResponse.ok(), 'The staging API /api/ready endpoint must respond successfully.').toBeTruthy()
-  const readiness = await readinessResponse.json()
-  expect(readiness.ready, 'The staging API must report ready.').toBe(true)
-  expect(readiness.database, 'Staging must use MongoDB, not the local fallback.').toBe('mongodb')
+  const healthResponse = await request.get(new URL('/api/health', stagingUrl).toString(), { timeout: 30_000 })
+  expect(healthResponse.ok(), 'The staging API /api/health endpoint must respond successfully.').toBeTruthy()
+  const health = await healthResponse.json()
+  expect(health.databaseConnected, 'The staging API must be connected to its database.').toBe(true)
+  expect(health.database, 'Staging must use MongoDB, not the local fallback.').toBe('mongodb')
 
   const failures = []
   let sessionToken = ''

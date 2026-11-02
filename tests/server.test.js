@@ -501,6 +501,18 @@ test("health exposes diagnostics while the readiness endpoint stays small and op
   assert.equal(typeof health.eventImageStorageConfigured, "boolean");
   assert.equal(health.socketRedisConfigured, false);
   assert.equal(health.socketRedisConnected, false);
+  for (const origin of ["https://www.futapulse.com.ng", "https://futapulse.com.ng"]) {
+    const preflight = await fetch(`${baseUrl}/api/health`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: origin,
+        "Access-Control-Request-Method": "GET"
+      }
+    });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
+    assert.equal(preflight.headers.get("access-control-allow-credentials"), "true");
+  }
   assert.equal(readinessResponse.status, 200);
   assert.deepEqual(Object.keys(readiness).sort(), ["ok", "timestamp"]);
   assert.equal(readiness.ok, true);
