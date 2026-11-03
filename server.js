@@ -2982,6 +2982,10 @@ const eventReportRateLimit = createAccountRateLimit({
   limit: 10,
   message: "Too many event reports. Please wait before reporting again."
 });
+const eventInteractionRateLimit = createAccountRateLimit({
+  limit: 120,
+  message: "Too many event interactions. Please wait before changing RSVPs, reminders, or hype again."
+});
 const recapUploadRateLimit = createAccountRateLimit({
   limit: 10,
   message: "Too many recap uploads. Please wait before uploading again."
@@ -5330,7 +5334,7 @@ app.post("/api/admin/event-reports/:eventId/decision", async (request, response)
   }
 });
 
-app.patch("/api/events/:eventId/engagement", async (request, response) => {
+app.patch("/api/events/:eventId/engagement", eventInteractionRateLimit, async (request, response) => {
   try {
   const type = request.body?.type;
   const counter = ENGAGEMENT_COUNTERS[type];
@@ -5454,7 +5458,7 @@ app.patch("/api/events/:eventId/engagement", async (request, response) => {
   }
 });
 
-app.post("/api/events/:eventId/reminders/schedule", async (request, response) => {
+app.post("/api/events/:eventId/reminders/schedule", eventInteractionRateLimit, async (request, response) => {
   try {
     const user = await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in to schedule an event reminder." });
@@ -5481,7 +5485,7 @@ app.post("/api/events/:eventId/reminders/schedule", async (request, response) =>
   }
 });
 
-app.post("/api/events/:eventId/hype", async (request, response) => {
+app.post("/api/events/:eventId/hype", eventInteractionRateLimit, async (request, response) => {
   try {
     const user = await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in to hype this event." });

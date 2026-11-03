@@ -1053,6 +1053,46 @@ test("hype and reminder toggles are account-bound, idempotent, and private to ea
   assert.equal((await unReminded.json()).event.reminderCount, initialReminderCount);
 });
 
+test("event interaction limits are shared across routes, account-scoped, and allow ordinary retries", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const limitedAccount = await createVerifiedAccount(baseUrl, "interaction-limit@futa.edu.ng", "interaction_limit");
+  const otherAccount = await createVerifiedAccount(baseUrl, "interaction-limit-other@futa.edu.ng", "interaction_limit_other");
+  const headers = (account) => ({
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${account.token}`
+  });
+  const hypeRequest = (account) => fetch(`${baseUrl}/api/events/event-zero/hype`, {
+    method: "POST",
+    headers: headers(account),
+    body: JSON.stringify({ enabled: false })
+  });
+
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    assert.equal((await hypeRequest(limitedAccount)).status, 200);
+  }
+  for (const request of [
+    () => hypeRequest(limitedAccount),
+    () => fetch(`${baseUrl}/api/events/event-zero/engagement`, {
+      method: "PATCH",
+      headers: headers(limitedAccount),
+      body: JSON.stringify({ type: "rsvp", attending: false })
+    }),
+    () => fetch(`${baseUrl}/api/events/event-zero/reminders/schedule`, {
+      method: "POST",
+      headers: headers(limitedAccount),
+      body: JSON.stringify({ notifyAt: new Date(Date.now() + 60_000).toISOString() })
+    })
+  ]) {
+    const response = await request();
+    assert.equal(response.status, 429);
+    assert.match((await response.json()).error, /Too many event interactions/);
+  }
+
+  assert.equal((await hypeRequest(otherAccount)).status, 200, "a separate account has its own interaction budget");
+  const retryResponse = await hypeRequest(limitedAccount);
+  assert.equal(retryResponse.status, 429, "repeated state-setting requests count toward the abuse cap");
+});
+
 test("PATCH engagement requires sign-in and applies idempotent attendance changes", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const unauthenticated = await fetch(`${baseUrl}/api/events/event-zero/engagement`, {

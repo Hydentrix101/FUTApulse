@@ -130,6 +130,7 @@ These are accepted product requirements or queued design tasks. They are not all
 - This launch path avoids a custom verified sender domain and is not billed under Google's currently documented 80-million-quota-unit/day billing threshold; `messages.send` costs 100 units and a consumer Gmail account is limited to about 500 sent messages/day. This is suitable only for low-volume use and is not an unlimited no-cost delivery guarantee: sending limits, OAuth policy, account restrictions, and future billing rules may change. Migrate to a transactional mail provider if campus traffic outgrows the sender cap, and budget for its verified domain and paid usage.
 - Restrict the Atlas IP access list to the API host's outbound IP ranges or a private network path. Do not use `0.0.0.0/0` for production unless there is no alternative and the exposure is explicitly accepted.
 - Verify HTTPS, account recovery, signup email, Google sign-in, event share links, and server health on real phones after domain changes.
+- Run the read-only [production smoke-test checklist](./PRODUCTION_SMOKE_TEST_CHECKLIST.md) after each deployment. Never create production test accounts/events or trigger test pushes during that pass.
 - Add basic operational visibility: error logs, database backups, uptime checks, and a simple recovery procedure.
 
 ### Phase 3 production configuration and verification record
