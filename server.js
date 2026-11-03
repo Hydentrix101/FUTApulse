@@ -36,10 +36,16 @@ const httpServer = http.createServer(app);
 let databaseBackend = "local";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const CANONICAL_FRONTEND_URL = "https://www.futapulse.com.ng";
+const LEGACY_VERCEL_ORIGIN = "https://fut-apulse.vercel.app";
 const DEFAULT_FRONTEND_URL = process.env.NODE_ENV === "production"
-  ? "https://www.futapulse.com.ng"
+  ? CANONICAL_FRONTEND_URL
   : "http://localhost:5173";
-const FRONTEND_URL = String(process.env.FRONTEND_URL || DEFAULT_FRONTEND_URL).replace(/\/$/, "");
+const configuredFrontendUrl = String(process.env.FRONTEND_URL || DEFAULT_FRONTEND_URL).replace(/\/$/, "");
+if (process.env.NODE_ENV === "production" && configuredFrontendUrl !== CANONICAL_FRONTEND_URL) {
+  throw new Error(`FRONTEND_URL must be ${CANONICAL_FRONTEND_URL} in production.`);
+}
+const FRONTEND_URL = process.env.NODE_ENV === "production" ? CANONICAL_FRONTEND_URL : configuredFrontendUrl;
 function normalizeConfiguredOrigin(value) {
   try {
     const parsedOrigin = new URL(String(value).trim());
@@ -58,15 +64,20 @@ const CORS_ORIGINS = [...new Set([
   FRONTEND_URL,
   "https://futapulse.com.ng",
   "https://www.futapulse.com.ng",
-  "https://fut-apulse.vercel.app",
   ...configuredCorsOrigins,
   "http://localhost:5173",
   "http://127.0.0.1:5173"
-].map(normalizeConfiguredOrigin).filter(Boolean))];
+].map(normalizeConfiguredOrigin).filter((origin) => Boolean(origin) && origin !== LEGACY_VERCEL_ORIGIN))];
 // GIS popup code flow must exchange the code using the requesting app origin.
 // Keep this default for non-browser flows, but select the allowlisted request
 // origin for each popup exchange below.
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || FRONTEND_URL;
+const configuredGoogleRedirectUri = String(process.env.GOOGLE_REDIRECT_URI || FRONTEND_URL).replace(/\/$/, "");
+if (process.env.NODE_ENV === "production" && configuredGoogleRedirectUri !== CANONICAL_FRONTEND_URL) {
+  throw new Error(`GOOGLE_REDIRECT_URI must be ${CANONICAL_FRONTEND_URL} in production.`);
+}
+const GOOGLE_REDIRECT_URI = process.env.NODE_ENV === "production"
+  ? CANONICAL_FRONTEND_URL
+  : configuredGoogleRedirectUri;
 const GOOGLE_ALLOWED_ORIGINS = new Set([
   FRONTEND_URL,
   GOOGLE_REDIRECT_URI,
@@ -3188,6 +3199,10 @@ app.get("/api/notifications/status", async (request, response) => {
 app.post("/api/notifications/devices/web", async (request, response) => {
   let authenticatedUserId = "";
   try {
+    if (process.env.NODE_ENV === "production"
+      && normalizeConfiguredOrigin(request.get("origin") || "") !== CANONICAL_FRONTEND_URL) {
+      return response.status(403).json({ error: "Web push can only be registered from the FUTApulse custom domain." });
+    }
     const user = await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Authentication required." });
     authenticatedUserId = String(user._id || user.id);

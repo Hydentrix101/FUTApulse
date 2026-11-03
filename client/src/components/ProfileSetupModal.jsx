@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import { isValidUsername } from '../utils/usernames'
+import useDialogFocus from '../hooks/useDialogFocus'
 
 const DEPARTMENTS = {
   SAAT: ['AEC', 'ARE', 'APH', 'CSP', 'FAT', 'EWM', 'FWT', 'FST'],
@@ -29,9 +30,11 @@ function ProfileSetupModal({
   const [level, setLevel] = useState(profile?.level || '')
   const [username, setUsername] = useState(profile?.name || currentUsername)
   const [error, setError] = useState('')
+  const dialogRef = useRef(null)
   const departments = useMemo(() => DEPARTMENTS[faculty] || [], [faculty])
   const usernameChanges = Number(editableFields.usernameChanges) || 0
   const facultyChanges = Number(editableFields.facultyChanges) || 0
+  useDialogFocus(dialogRef, onClose)
 
   const submit = async (event) => {
     event.preventDefault()
@@ -61,7 +64,7 @@ function ProfileSetupModal({
     <div className="sheet-backdrop" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget) onClose()
     }}>
-      <section className="profile-sheet glass-panel" role="dialog" aria-modal="true" aria-labelledby="profile-setup-title">
+      <section ref={dialogRef} className="profile-sheet glass-panel" role="dialog" aria-modal="true" aria-labelledby="profile-setup-title">
         <button className="sheet-close" type="button" onClick={onClose} aria-label="Close profile editor"><X size={18} /></button>
         <span className="eyebrow-label">{profile ? 'YOUR CAMPUS ID' : 'BUILD YOUR CAMPUS ID'}</span>
         <h2 id="profile-setup-title">{profile ? 'Edit your profile' : 'Tell FUTApulse about you'}</h2>

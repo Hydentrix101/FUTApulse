@@ -1173,6 +1173,14 @@ button {
   box-shadow: 0 0 0 3px rgba(244, 63, 94, 0.12);
 }
 
+.auth-field input:focus-visible,
+.auth-subform input:focus-visible {
+  outline: 3px solid #6d28d9;
+  outline-offset: 2px;
+  border-color: #6d28d9;
+  box-shadow: none;
+}
+
 .theme-dark .auth-field input,
 .theme-dark .auth-subform input {
   border-color: rgba(100, 116, 139, 0.42);

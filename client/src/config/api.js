@@ -5,8 +5,8 @@ const isLocalPreview = typeof window !== 'undefined'
 const normalizedApiBaseUrl = configuredApiBaseUrl?.replace(/\/+$/, '')
 const configuredSocketBaseUrl = import.meta.env.VITE_SOCKET_URL?.trim()
 
-// Production uses the Vercel same-origin rewrite, including on the custom
-// domain; local development calls Express directly unless an API origin is set.
+// The custom domain is the production app origin; Vercel proxies its /api
+// requests to Render. Local development calls Express directly unless configured.
 export const API_BASE_URL = import.meta.env.PROD && !isLocalPreview
   ? ''
   : normalizedApiBaseUrl || 'http://localhost:3001'

@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState } from 'react'
+﻿import { useEffect, useId, useRef, useState } from 'react'
 import { CheckCircle2, Eye, EyeOff, LoaderCircle } from 'lucide-react'
 import BrandHeart from './BrandHeart'
 
@@ -111,12 +111,14 @@ function getPasswordStrength(password) {
 
 function PasswordField({ label, value, onChange, autoComplete, minLength = 6, placeholder, ariaInvalid = false, ariaDescribedBy }) {
   const [visible, setVisible] = useState(false)
+  const inputId = useId()
 
   return (
-    <label className="auth-field">
-      <span>{label}</span>
+    <div className="auth-field">
+      <label htmlFor={inputId}><span>{label}</span></label>
       <span className="auth-password-control">
         <input
+          id={inputId}
           type={visible ? 'text' : 'password'}
           autoComplete={autoComplete}
           minLength={minLength}
@@ -132,7 +134,7 @@ function PasswordField({ label, value, onChange, autoComplete, minLength = 6, pl
           {visible ? <EyeOff size={18} /> : <Eye size={18} />}
         </button>
       </span>
-    </label>
+    </div>
   )
 }
 

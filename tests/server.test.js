@@ -317,9 +317,13 @@ test("push registration reassigns one browser device to the currently signed-in 
       endpoint,
       keys: { p256dh: "valid-p256dh-test-key", auth: "valid-auth-test-key" }
     };
-    const register = (account) => fetch(`${baseUrl}/api/notifications/devices/web`, {
+    const register = (account, origin) => fetch(`${baseUrl}/api/notifications/devices/web`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${account.token}` },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${account.token}`,
+        ...(origin ? { Origin: origin } : {})
+      },
       body: JSON.stringify({ subscription })
     });
     const unsupported = await fetch(`${baseUrl}/api/notifications/devices/web`, {
@@ -328,6 +332,15 @@ test("push registration reassigns one browser device to the currently signed-in 
       body: JSON.stringify({ subscription: { ...subscription, endpoint: "https://127.0.0.1/admin" } })
     });
     assert.equal(unsupported.status, 400);
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      assert.equal((await register(firstAccount, "https://fut-apulse.vercel.app")).status, 403);
+      assert.equal((await register(firstAccount, "https://www.futapulse.com.ng")).status, 201);
+    } finally {
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+    }
     const status = (account) => fetch(`${baseUrl}/api/notifications/status?platform=web&deviceKey=${deviceKey}`, {
       headers: { Authorization: `Bearer ${account.token}` }
     }).then((response) => response.json());
@@ -519,6 +532,15 @@ test("health exposes diagnostics while the readiness endpoint stays small and op
     assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
     assert.equal(preflight.headers.get("access-control-allow-credentials"), "true");
   }
+  const legacyPreflight = await fetch(`${baseUrl}/api/health`, {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://fut-apulse.vercel.app",
+      "Access-Control-Request-Method": "GET"
+    }
+  });
+  assert.equal(legacyPreflight.status, 403);
+  assert.equal(legacyPreflight.headers.get("access-control-allow-origin"), null);
   assert.equal(readinessResponse.status, 200);
   assert.deepEqual(Object.keys(readiness).sort(), ["ok", "timestamp"]);
   assert.equal(readiness.ok, true);

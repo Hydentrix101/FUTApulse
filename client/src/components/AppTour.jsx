@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ChevronLeft, ChevronRight, X } from 'lucide-react'
+import useDialogFocus from '../hooks/useDialogFocus'
 
 const STEPS = [
   { id: 'categories', target: '.category-filter-shell', eyebrow: 'STEP 1 OF 5', title: 'Browse the home feed', description: 'Filter campus events by Academic, Tech, Social, or any other category.' },
@@ -22,7 +23,9 @@ export default function AppTour({ onClose, onComplete, onStepChange, accountKey 
   const [targetRect, setTargetRect] = useState(null)
   const [completionError, setCompletionError] = useState('')
   const [finishing, setFinishing] = useState(false)
+  const dialogRef = useRef(null)
   const step = STEPS[index]
+  useDialogFocus(dialogRef, onClose)
 
   const measureTarget = useCallback(() => {
     const target = document.querySelector(step.target)
@@ -74,7 +77,7 @@ export default function AppTour({ onClose, onComplete, onStepChange, accountKey 
         <div className="app-tour-mask app-tour-mask-bottom" style={{ top: targetRect.bottom + 8 }} />
         <div className={`app-tour-spotlight${step.id === 'create' ? ' is-blocking' : ''}`} style={{ top: targetRect.top - 8, left: targetRect.left - 8, width: targetRect.right - targetRect.left + 16, height: targetRect.bottom - targetRect.top + 16 }} />
       </> : <div className="app-tour-mask app-tour-mask-full" />}
-      <section className={`app-tour-card${targetRect ? ' has-target' : ''}`} role="dialog" aria-modal="true" aria-labelledby="app-tour-title">
+      <section ref={dialogRef} className={`app-tour-card${targetRect ? ' has-target' : ''}`} role="dialog" aria-modal="true" aria-labelledby="app-tour-title">
         <button type="button" className="app-tour-close" aria-label="Skip app tour" disabled={finishing} onClick={() => { void finish() }}><X size={18} /></button>
         <span className="app-tour-eyebrow">{step.eyebrow}</span>
         <h2 id="app-tour-title">{step.title}</h2>
