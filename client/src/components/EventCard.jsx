@@ -3,6 +3,7 @@ import { Bell, Building2, CircleHelp, Clock3, ExternalLink, Flame, MapPin, Share
 import CountdownPill from './CountdownPill'
 import { isPublicRecapVisible } from '../utils/eventVisibility'
 import { formatCampusDateTime, parseCampusDateTime } from '../utils/campusTime'
+import { getFacultyLogoPath } from '../utils/faculties'
 
 const categoryStyles = {
   tech: 'tech-badge',
@@ -32,14 +33,10 @@ function safeHttpUrl(value) {
   }
 }
 
-const DEFAULT_FACULTY_LOGO = '/Faculty%20Logo/SEET.png'
+const DEFAULT_FACULTY_LOGO = getFacultyLogoPath('SEET')
 const FACULTY_LOGO_FALLBACK = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="24" fill="#10253d"/><path d="M64 18 104 34v28c0 25-16 40-40 50C40 102 24 87 24 62V34z" fill="#2563eb"/><path d="M64 31 92 42v20c0 18-10 29-28 37-18-8-28-19-28-37V42z" fill="#f8fafc"/><text x="64" y="69" text-anchor="middle" font-family="Arial,sans-serif" font-size="18" font-weight="700" fill="#10253d">FUTA</text></svg>',
 )}`
-
-function getFacultyLogoPath(faculty) {
-  return `/Faculty%20Logo/${encodeURIComponent(faculty || 'SEET')}.png`
-}
 
 function getTargetLabel(audience) {
   const levels = Array.isArray(audience)

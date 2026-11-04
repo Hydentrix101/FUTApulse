@@ -329,11 +329,13 @@ function isValidEventRevision(value) {
 
 function getCurrentOrganizerMetadata(user) {
   const profile = user.profile || {};
+  const faculty = String(profile.faculty || "SEET").toUpperCase();
+  const logoFaculty = faculty === "SIMME" || faculty === "SESE" ? "SEET" : faculty;
   return {
     organizerName: profile.name || user.username || "Campus Organizer",
     organizerUsername: user.username,
     organizerFaculty: profile.faculty || "",
-    organizerPicture: profile.picture || `/Faculty%20Logo/${encodeURIComponent(profile.faculty || "SEET")}.png`
+    organizerPicture: profile.picture || `/Faculty%20Logo/${encodeURIComponent(logoFaculty)}.png`
   };
 }
 

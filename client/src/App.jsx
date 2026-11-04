@@ -11,6 +11,7 @@ import AppTour from './components/AppTour'
 import { API_BASE_URL, SOCKET_BASE_URL } from './config/api'
 import { isPublicRecapVisible, matchesProfileAudience } from './utils/eventVisibility'
 import { formatCampusDateTime, parseCampusDateTime } from './utils/campusTime'
+import { getFacultyLogoPath } from './utils/faculties'
 import { io } from 'socket.io-client'
 
 const EventCard = lazy(() => import('./components/EventCard'))
@@ -261,7 +262,7 @@ function syncEventOrganizerProfile(event, user, profile) {
     organizerName: profile.name || user.username,
     organizerUsername: user.username,
     organizerFaculty: profile.faculty || '',
-    organizerPicture: profile.picture || `/Faculty%20Logo/${encodeURIComponent(profile.faculty || 'SEET')}.png`,
+    organizerPicture: profile.picture || getFacultyLogoPath(profile.faculty),
   }
 }
 
@@ -354,7 +355,7 @@ function EventPreview({ event, onOpen, onView, homeVariant = '' }) {
     : []
   const bannerSource = bannerImages[bannerIndex % Math.max(1, bannerImages.length)] || event.banner || event.image || ''
   const bannerFailed = failedBannerSource === bannerSource
-  const fallback = `/Faculty%20Logo/${encodeURIComponent(event.organizerFaculty || event.faculty || 'SEET')}.png`
+  const fallback = getFacultyLogoPath(event.organizerFaculty || event.faculty)
   const eventId = getEventId(event)
 
   useEffect(() => {
@@ -2892,7 +2893,7 @@ function FutaPulseApp() {
 
   const facultyName = profile?.faculty || 'SEET'
   const facultyLogoFailed = failedFacultyLogo === facultyName
-  const facultyLogoPath = `/Faculty%20Logo/${encodeURIComponent(facultyName)}.png`
+  const facultyLogoPath = getFacultyLogoPath(facultyName)
 
   const themeButton = (
     <button type="button" className="theme-toggle" onClick={toggleTheme} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>
@@ -2958,10 +2959,10 @@ function FutaPulseApp() {
                 ? <User size={17} aria-hidden="true" />
                 : profile?.picture || profile?.faculty
                 ? <img
-                  src={profile.picture || `/Faculty%20Logo/${encodeURIComponent(profile.faculty)}.png`}
+                  src={profile.picture || getFacultyLogoPath(profile.faculty)}
                   alt=""
                   onError={(event) => {
-                    const facultyFallback = `/Faculty%20Logo/${encodeURIComponent(profile?.faculty || 'SEET')}.png`
+                    const facultyFallback = getFacultyLogoPath(profile?.faculty)
                     if (event.currentTarget.dataset.fallback) setProfileAvatarFailed(true)
                     else {
                       event.currentTarget.dataset.fallback = 'true'
@@ -3270,11 +3271,11 @@ function FutaPulseApp() {
               <div className="profile-avatar-block">
                 <div className="profile-avatar-circle-wrap">
                   {profileAvatarFailed ? <span className="profile-avatar-fallback"><Building2 size={38} /></span> : (
-                    <img src={profile?.picture || `/Faculty%20Logo/${encodeURIComponent(profile?.faculty || 'SEET')}.png`} alt="Profile picture" onError={(error) => {
+                    <img src={profile?.picture || getFacultyLogoPath(profile?.faculty)} alt="Profile picture" onError={(error) => {
                       if (error.currentTarget.dataset.fallback) setProfileAvatarFailed(true)
                       else {
                         error.currentTarget.dataset.fallback = 'true'
-                        error.currentTarget.src = `/Faculty%20Logo/${encodeURIComponent(profile?.faculty || 'SEET')}.png`
+                        error.currentTarget.src = getFacultyLogoPath(profile?.faculty)
                       }
                     }} />
                   )}

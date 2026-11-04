@@ -1,21 +1,8 @@
 import { useMemo, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import { isValidUsername } from '../utils/usernames'
+import { DEPARTMENTS, getFacultyLogoPath, LEGACY_SEET_DEPARTMENTS } from '../utils/faculties'
 import useDialogFocus from '../hooks/useDialogFocus'
-
-const DEPARTMENTS = {
-  SAAT: ['AEC', 'ARE', 'APH', 'CSP', 'FAT', 'EWM', 'FWT', 'FST'],
-  SBCS: ['PAT', 'FAR', 'CHE'],
-  SBMS: ['ANA', 'BIM', 'MLS', 'PHS'],
-  SCS: ['MED', 'SUR', 'OBS', 'PED'],
-  SEET: ['AGE', 'BME', 'CEE', 'CVE', 'CPE', 'EEE', 'IPE', 'ICE', 'MEE', 'MCE', 'MNE', 'MME'],
-  SEMS: ['AGY', 'AGP', 'MST', 'MCS', 'RSG'],
-  SET: ['ARC', 'BDG', 'ESM', 'IDD', 'QSV', 'SVG', 'TDT', 'URP'],
-  SLIT: ['BIT', 'BMT', 'EMT', 'LTT', 'PMT', 'SIMT'],
-  SLS: ['BCH', 'BIO', 'BTH', 'MCB'],
-  SOC: ['CSC', 'CYS', 'IFS', 'IFT', 'SEN'],
-  SPS: ['CHM', 'EDT', 'LIS', 'MTS', 'PHY', 'STA'],
-}
 
 function ProfileSetupModal({
   profile,
@@ -31,7 +18,10 @@ function ProfileSetupModal({
   const [username, setUsername] = useState(profile?.name || currentUsername)
   const [error, setError] = useState('')
   const dialogRef = useRef(null)
-  const departments = useMemo(() => DEPARTMENTS[faculty] || [], [faculty])
+  const departments = useMemo(
+    () => DEPARTMENTS[faculty] || (faculty === 'SEET' && profile?.faculty === 'SEET' ? LEGACY_SEET_DEPARTMENTS : []),
+    [faculty, profile?.faculty],
+  )
   const usernameChanges = Number(editableFields.usernameChanges) || 0
   const facultyChanges = Number(editableFields.facultyChanges) || 0
   useDialogFocus(dialogRef, onClose)
@@ -53,7 +43,7 @@ function ProfileSetupModal({
         department,
         level,
         role: 'explorer',
-        picture: profile?.picture || `/Faculty%20Logo/${encodeURIComponent(faculty)}.png`,
+        picture: profile?.picture || getFacultyLogoPath(faculty),
       })
     } catch (saveError) {
       setError(saveError.message || 'Unable to save your profile.')
@@ -85,6 +75,7 @@ function ProfileSetupModal({
           <label htmlFor="profile-faculty">Faculty / school</label>
           <select id="profile-faculty" value={faculty} onChange={(event) => { setFaculty(event.target.value); setDepartment('') }} disabled={facultyChanges >= 2} required>
             <option value="">Select your faculty</option>
+            {faculty === 'SEET' && profile?.faculty === 'SEET' && <option value="SEET">SEET (legacy profile)</option>}
             {Object.keys(DEPARTMENTS).map((name) => <option key={name}>{name}</option>)}
           </select>
           <small className="profile-edit-limit">{facultyChanges >= 2 ? 'Faculty change limit reached; this field is locked.' : `You can change your faculty ${2 - facultyChanges} more time${2 - facultyChanges === 1 ? '' : 's'}.`}</small>
