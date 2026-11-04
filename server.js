@@ -3575,7 +3575,9 @@ app.patch("/api/auth/profile", async (request, response) => {
     if (identityChanged && usernameChanges >= 2) {
       return response.status(403).json({ error: "Your username has reached its two-change limit." });
     }
-    if (facultyChanged && facultyChanges >= 2) {
+    const replacingLegacySeetFaculty = user.profile?.faculty === "SEET"
+      && profileWithUsername.faculty.trim() !== "SEET";
+    if (facultyChanged && facultyChanges >= 2 && !replacingLegacySeetFaculty) {
       return response.status(403).json({ error: "Your faculty has reached its two-change limit." });
     }
     if (usernameChanged) {

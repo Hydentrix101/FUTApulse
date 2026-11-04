@@ -1285,6 +1285,36 @@ test("profile username and faculty changes are capped at two server-enforced edi
   assert.match((await rejected.json()).error, /two-change limit/);
 });
 
+test("legacy SEET profiles can select a current faculty even after reaching the edit cap", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const account = await createVerifiedAccount(baseUrl, "legacy-seet@futa.edu.ng", "legacy_seet");
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${account.token}` };
+  const setup = await fetch(`${baseUrl}/api/profile/setup`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ username: "legacy_seet", displayName: "Legacy SEET", faculty: "SEET", department: "EEE", level: "300", role: "explorer" })
+  });
+  assert.equal(setup.status, 200);
+
+  const database = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+  const storedUser = database.users.find((item) => item.username === "legacy_seet");
+  storedUser.facultyChanges = 2;
+  fs.writeFileSync(dataFile, JSON.stringify(database, null, 2));
+
+  const response = await fetch(`${baseUrl}/api/auth/profile`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({
+      username: "legacy_seet",
+      profile: { name: "Legacy SEET", faculty: "SESE", department: "EEE", level: "300", role: "explorer" }
+    })
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.user.profile.faculty, "SESE");
+  assert.equal(body.user.editableFields.facultyChanges, 3);
+});
+
 test("event organizer details follow the account's current profile", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const account = await createVerifiedAccount(baseUrl, "event-owner@futa.edu.ng", "event_owner");

@@ -13,8 +13,6 @@ export const DEPARTMENTS = {
   SPS: ['CHM', 'EDT', 'LIS', 'MTS', 'PHY', 'STA'],
 }
 
-export const LEGACY_SEET_DEPARTMENTS = ['AGE', 'BME', 'CEE', 'CVE', 'CPE', 'EEE', 'IPE', 'ICE', 'MEE', 'MCE', 'MNE', 'MME']
-
 export function getFacultyLogoPath(faculty) {
   const name = String(faculty || 'SEET').toUpperCase()
   const logoFaculty = name === 'SIMME' || name === 'SESE' ? 'SEET' : name
