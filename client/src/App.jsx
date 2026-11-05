@@ -463,8 +463,17 @@ function App() {
 
 function FutaPulseApp() {
   const initialSearchParams = new URLSearchParams(window.location.search)
+  const pathEventId = window.location.pathname.match(/^\/events\/([^/]+)(?:\/[^/]+)?\/?$/)?.[1] || ''
+  const initialSharedCategory = initialSearchParams.get('category') || ''
+  let decodedPathEventId = ''
+  try {
+    decodedPathEventId = decodeURIComponent(pathEventId)
+  } catch {
+    decodedPathEventId = ''
+  }
+  const initialEventId = initialSearchParams.get('event') || decodedPathEventId
   const requestedAuthMode = initialSearchParams.get('auth')
-  const bypassLaunchSequence = initialSearchParams.has('auth') || initialSearchParams.has('event')
+  const bypassLaunchSequence = initialSearchParams.has('auth') || Boolean(initialEventId)
   const [launchVisible, setLaunchVisible] = useState(!bypassLaunchSequence)
   const [launchSequenceReady, setLaunchSequenceReady] = useState(bypassLaunchSequence)
   const [session, setSession] = useState(null)
@@ -484,7 +493,7 @@ function FutaPulseApp() {
   })
   const [activeTab, setActiveTab] = useState(() => {
     const requestedTab = window.location.hash.replace('#', '') || 'home'
-    if (initialSearchParams.has('event')) return 'home'
+    if (initialEventId) return 'home'
     if (!initialSearchParams.has('auth') && !hasRememberedSession() && !['home', 'search'].includes(requestedTab)) return 'home'
     return requestedTab
   })
@@ -1417,7 +1426,7 @@ function FutaPulseApp() {
 
   useEffect(() => {
     const linkParams = new URLSearchParams(window.location.search)
-    const requestedEventId = linkParams.get('event')
+    const requestedEventId = linkParams.get('event') || decodedPathEventId
     if (!requestedEventId || handledSharedEventId.current === requestedEventId) return
     const sharedEvent = events.find((item) => String(getEventId(item)) === requestedEventId)
     if (!sharedEvent) {
@@ -1472,7 +1481,7 @@ function FutaPulseApp() {
       }
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [events, activeTab, session?.token, notify])
+  }, [events, activeTab, session?.token, notify, decodedPathEventId])
 
   useEffect(() => {
     if (activeTab !== 'reminders') return undefined
@@ -2568,6 +2577,37 @@ function FutaPulseApp() {
     switchTab('home')
     if (!eventId) window.setTimeout(() => document.querySelector('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' }), 0)
   }
+
+  useEffect(() => {
+    if (!initialEventId) return undefined
+    let cancelled = false
+    apiRequest(`/api/events/${encodeURIComponent(initialEventId)}`)
+      .then(({ event }) => {
+        if (cancelled) return
+        if (!event) throw new Error('This event is no longer available.')
+        const category = CATEGORY_DATA.some((item) => item.id === event.category)
+          ? event.category
+          : CATEGORY_DATA.some((item) => item.id === initialSharedCategory)
+            ? initialSharedCategory
+            : 'all'
+        setEvents((current) => [
+          event,
+          ...current.filter((item) => String(getEventId(item)) !== initialEventId),
+        ])
+        setHomeCategory(category)
+        setExpandedHomeCategory(category)
+        setNotificationFeedEventId(initialEventId)
+        setVisibleFullFeedCount(EVENT_LIST_PAGE_SIZE)
+        setPendingFullEventId(initialEventId)
+        setActiveTab('home')
+      })
+      .catch((error) => {
+        if (!cancelled) notify(error.message || 'Unable to load this shared event.', 'error')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [initialEventId, initialSharedCategory, notify])
 
   const focusNotificationEvent = (notification) => {
     if (!notification?.eventId) return

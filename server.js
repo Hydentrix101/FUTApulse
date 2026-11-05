@@ -5569,6 +5569,323 @@ app.get("/api/events/:eventId", async (request, response) => {
   }
 });
 
+const SEO_CATEGORY_DETAILS = {
+  academic: { label: "Academic", color: "#16a34a" },
+  tech: { label: "Tech & Innovation", color: "#2563eb" },
+  social: { label: "Social & Vibes", color: "#ea580c" },
+  religious: { label: "Religious & Fellowship", color: "#64748b" },
+  sports: { label: "Sports & Athletics", color: "#dc2626" },
+  seminars: { label: "Seminars", color: "#9333ea" }
+};
+const SEO_INFORMATION_PAGES = {
+  about: {
+    title: "About FUTApulse | FUTA Campus Events",
+    description: "Learn about FUTApulse, a campus event discovery platform for the Federal University of Technology, Akure."
+  },
+  privacy: {
+    title: "Privacy Policy | FUTApulse",
+    description: "Read how FUTApulse handles account, event, and notification data and learn about your privacy choices."
+  },
+  terms: {
+    title: "Terms of Service | FUTApulse",
+    description: "Review the terms for using FUTApulse to discover and share campus events at FUTA."
+  },
+  guidelines: {
+    title: "Community Guidelines | FUTApulse",
+    description: "Read FUTApulse community guidelines for sharing useful, accurate, and respectful campus events."
+  },
+  contact: {
+    title: "Contact FUTApulse | Support",
+    description: "Contact the FUTApulse team for support, privacy questions, and feedback about campus event discovery."
+  }
+};
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeXml(value) {
+  return escapeHtml(value);
+}
+
+function createEventSlug(value) {
+  return String(value || "campus-event")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 80) || "campus-event";
+}
+
+function safePublicImageUrl(value) {
+  const image = String(value || "").trim();
+  if (!image || image.startsWith("data:")) return "";
+  try {
+    const url = new URL(image, CANONICAL_FRONTEND_URL);
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? url.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function getPublicEventSeoData(event) {
+  const category = SEO_CATEGORY_DETAILS[String(event.category || "").toLowerCase()] || {
+    label: "Campus Event",
+    color: "#9333ea"
+  };
+  const title = String(event.title || "Campus event").trim().slice(0, 120);
+  const organizerName = String(event.organizerName || event.organizer?.name || "FUTA community").trim().slice(0, 120);
+  const start = eventStartDate(event);
+  const end = parseCampusDateTime(event.endTime);
+  const dateFormatter = new Intl.DateTimeFormat("en-NG", {
+    timeZone: "Africa/Lagos",
+    dateStyle: "full",
+    timeStyle: "short"
+  });
+  const schedule = start ? dateFormatter.format(start) : "";
+  const venue = String(event.venue || "").trim().slice(0, 120);
+  const activity = String(event.activity || "").replace(/\s+/g, " ").trim().slice(0, 220);
+  const description = [
+    `${category.label} event at FUTA: ${activity || title}.`,
+    schedule ? `When: ${schedule}${end ? ` – ${dateFormatter.format(end)}` : ""}.` : "",
+    venue ? `Where: ${venue}.` : "",
+    `Organized by ${organizerName}.`
+  ].filter(Boolean).join(" ").slice(0, 500);
+  const eventUrl = new URL(`/events/${encodeURIComponent(String(event.id))}/${createEventSlug(title)}`, CANONICAL_FRONTEND_URL).href;
+  const images = Array.isArray(event.bannerImages) ? event.bannerImages : [];
+  const image = images.map(safePublicImageUrl).find(Boolean)
+    || safePublicImageUrl(event.banner)
+    || safePublicImageUrl(event.organizerPicture || event.organizer?.picture)
+    || `${CANONICAL_FRONTEND_URL}/icon-512.png`;
+  return {
+    category,
+    title,
+    organizerName,
+    description,
+    eventUrl,
+    image,
+    schedule,
+    venue,
+    activity,
+    start,
+    end
+  };
+}
+
+function buildEventStructuredData(event, seo) {
+  const structuredData = {
+    "@context": "https://schema.org",
+    "@type": "Event",
+    name: seo.title,
+    description: seo.description,
+    url: seo.eventUrl,
+    image: [seo.image],
+    eventStatus: event.status === "Cancelled"
+      ? "https://schema.org/EventCancelled"
+      : "https://schema.org/EventScheduled",
+    eventAttendanceMode: event.meetingUrl
+      ? "https://schema.org/MixedEventAttendanceMode"
+      : "https://schema.org/OfflineEventAttendanceMode",
+    organizer: {
+      "@type": "Person",
+      name: seo.organizerName
+    }
+  };
+  if (seo.start) structuredData.startDate = seo.start.toISOString();
+  if (seo.end) structuredData.endDate = seo.end.toISOString();
+  if (seo.venue) {
+    structuredData.location = {
+      "@type": "Place",
+      name: seo.venue,
+      address: {
+        "@type": "PostalAddress",
+        addressLocality: "Akure",
+        addressRegion: "Ondo State",
+        addressCountry: "NG"
+      }
+    };
+  }
+  if (event.meetingUrl) structuredData.location = {
+    "@type": "VirtualLocation",
+    url: event.meetingUrl
+  };
+  return JSON.stringify(structuredData).replace(/</g, "\\u003c");
+}
+
+function renderEventShareHtml(event, seo) {
+  const entryPath = path.join(CLIENT_DIST, "index.html");
+  if (!fs.existsSync(entryPath)) return "";
+  const canonicalUrl = escapeHtml(seo.eventUrl);
+  const title = escapeHtml(`${seo.title} | ${seo.category.label} | FUTApulse`);
+  const description = escapeHtml(seo.description);
+  const image = escapeHtml(seo.image);
+  const organizerName = escapeHtml(seo.organizerName);
+  const category = escapeHtml(seo.category.label);
+  const activity = escapeHtml(seo.activity);
+  const schedule = escapeHtml(seo.schedule);
+  const venue = escapeHtml(seo.venue);
+  const categoryColor = escapeHtml(seo.category.color);
+  const schema = buildEventStructuredData(event, seo);
+  const metadata = `
+    <link rel="canonical" href="${canonicalUrl}" />
+    <meta name="description" content="${description}" />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="FUTApulse" />
+    <meta property="og:title" content="${title}" />
+    <meta property="og:description" content="${description}" />
+    <meta property="og:url" content="${canonicalUrl}" />
+    <meta property="og:image" content="${image}" />
+    <meta property="og:image:alt" content="${escapeHtml(seo.title)} — ${category}" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="${title}" />
+    <meta name="twitter:description" content="${description}" />
+    <meta name="twitter:image" content="${image}" />
+    <meta name="twitter:image:alt" content="${escapeHtml(seo.title)} — ${category}" />
+    <script type="application/ld+json">${schema}</script>`;
+  const landingPage = `
+      <main class="seo-event-share" style="--event-category-color:${categoryColor};max-width:760px;margin:6vh auto;padding:24px;color:#f8fafc;background:#0f172a;border-radius:24px;font-family:system-ui,sans-serif">
+        <article>
+          <a href="https://www.futapulse.com.ng/" style="color:#c4b5fd;text-decoration:none;font-weight:800">FUTApulse · Campus events</a>
+          <p style="display:inline-block;margin:24px 0 8px;padding:7px 12px;border-radius:999px;background:var(--event-category-color);font-size:.8rem;font-weight:800">${category}</p>
+          <h1 style="margin:0 0 12px;font-size:clamp(2rem,7vw,3.5rem);line-height:1.08">${escapeHtml(seo.title)}</h1>
+          <p style="color:#cbd5e1;line-height:1.6">${activity}</p>
+          ${image ? `<img src="${image}" alt="${escapeHtml(seo.title)} — ${category}" style="display:block;width:100%;max-height:430px;object-fit:cover;border-radius:18px;margin:20px 0" />` : ""}
+          <p style="color:#e2e8f0">${schedule ? `<strong>When:</strong> ${schedule}<br />` : ""}${venue ? `<strong>Where:</strong> ${venue}<br />` : ""}<strong>Organized by:</strong> ${organizerName}</p>
+          <a href="${canonicalUrl}?category=${encodeURIComponent(String(event.category || ""))}#home" style="display:inline-block;margin-top:12px;padding:12px 18px;border-radius:12px;background:var(--event-category-color);color:white;text-decoration:none;font-weight:800">View event on FUTApulse</a>
+        </article>
+      </main>`;
+  return fs.readFileSync(entryPath, "utf8")
+    .replace(/<title>[\s\S]*?<\/title>/i, `<title>${title}</title>`)
+    .replace(/<meta name="description"[^>]*>/i, "")
+    .replace(/<meta name="robots"[^>]*>/i, "")
+    .replace(/<link rel="canonical"[^>]*>/i, "")
+    .replace(/<meta (?:property|name)="(?:og:[^"]+|twitter:[^"]+)"[^>]*>\s*/gi, "")
+    .replace(/<\/head>/i, `${metadata}\n  </head>`)
+    .replace(/<div id="root">[\s\S]*?<\/div>/i, `<div id="root">${landingPage}</div>`);
+}
+
+function renderInformationPageHtml(pageKey, page) {
+  const entryPath = path.join(CLIENT_DIST, "index.html");
+  if (!fs.existsSync(entryPath)) return "";
+  const pageUrl = new URL(`/${pageKey}`, CANONICAL_FRONTEND_URL).href;
+  const title = escapeHtml(page.title);
+  const description = escapeHtml(page.description);
+  const image = `${CANONICAL_FRONTEND_URL}/icon-512.png`;
+  const metadata = `
+    <link rel="canonical" href="${escapeHtml(pageUrl)}" />
+    <meta name="description" content="${description}" />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="FUTApulse" />
+    <meta property="og:title" content="${title}" />
+    <meta property="og:description" content="${description}" />
+    <meta property="og:url" content="${escapeHtml(pageUrl)}" />
+    <meta property="og:image" content="${image}" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="${title}" />
+    <meta name="twitter:description" content="${description}" />
+    <meta name="twitter:image" content="${image}" />`;
+  const pageContent = `
+      <main>
+        <h1>${title}</h1>
+        <p>${description}</p>
+        <a href="${escapeHtml(pageUrl)}">Read ${escapeHtml(page.title.replace(" | FUTApulse", ""))}</a>
+        <p><a href="https://www.futapulse.com.ng/">Explore FUTApulse events</a></p>
+      </main>`;
+  return fs.readFileSync(entryPath, "utf8")
+    .replace(/<title>[\s\S]*?<\/title>/i, `<title>${title}</title>`)
+    .replace(/<meta name="description"[^>]*>/i, "")
+    .replace(/<meta name="robots"[^>]*>/i, "")
+    .replace(/<link rel="canonical"[^>]*>/i, "")
+    .replace(/<meta (?:property|name)="(?:og:[^"]+|twitter:[^"]+)"[^>]*>\s*/gi, "")
+    .replace(/<\/head>/i, `${metadata}\n  </head>`)
+    .replace(/<div id="root">[\s\S]*?<\/div>/i, `<div id="root">${pageContent}</div>`);
+}
+
+app.get("/seo/pages/:page", (request, response) => {
+  const pageKey = String(request.params.page || "").toLowerCase();
+  const page = SEO_INFORMATION_PAGES[pageKey];
+  if (!page) return response.status(404).type("text/plain").send("Page not found.");
+  const html = renderInformationPageHtml(pageKey, page);
+  if (!html) return response.status(503).type("text/plain").send("FUTApulse frontend is not built.");
+  response.set("Cache-Control", "public, max-age=300, s-maxage=3600, stale-while-revalidate=600")
+    .type("html").send(html);
+});
+
+app.get("/robots.txt", (request, response) => {
+  response.type("text/plain").set("Cache-Control", "public, max-age=300, s-maxage=3600")
+    .send([
+      "User-agent: *",
+      "Allow: /",
+      "Disallow: /api/",
+      "Disallow: /*?auth=",
+      "Sitemap: https://www.futapulse.com.ng/sitemap.xml",
+      ""
+    ].join("\n"));
+});
+
+app.get("/sitemap.xml", async (request, response) => {
+  try {
+    const now = Date.now();
+    const events = (await listStoredEvents()).filter((event) =>
+      ["Published", "Live"].includes(event.status)
+      && (parseCampusDateTime(event.endTime)?.getTime() ?? NaN) > now
+      && Number.isFinite(eventStartDate(event)?.getTime())
+    );
+    const staticUrls = ["/", "/about", "/privacy", "/terms", "/guidelines", "/contact"];
+    const entries = [
+      ...staticUrls.map((url) => `<url><loc>${escapeXml(new URL(url, CANONICAL_FRONTEND_URL).href)}</loc></url>`),
+      ...events.map((event) => {
+        const url = new URL(`/events/${encodeURIComponent(String(event.id))}/${createEventSlug(event.title)}`, CANONICAL_FRONTEND_URL).href;
+        const updatedAt = new Date(event.updatedAt || event.generatedAt || "");
+        const lastmod = Number.isFinite(updatedAt.getTime()) ? `<lastmod>${updatedAt.toISOString().slice(0, 10)}</lastmod>` : "";
+        return `<url><loc>${escapeXml(url)}</loc>${lastmod}</url>`;
+      })
+    ];
+    response.type("application/xml").set("Cache-Control", "public, max-age=60, s-maxage=300")
+      .send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${entries.join("")}</urlset>`);
+  } catch (error) {
+    console.error("SEO sitemap could not be generated.", error);
+    return response.status(503).type("text/plain").send("Sitemap temporarily unavailable.");
+  }
+});
+
+app.get("/seo/events/:eventId/:slug?", async (request, response) => {
+  try {
+    const event = await findStoredEvent(request.params.eventId);
+    if (!event || !["Published", "Live"].includes(event.status) || !isWithinEventDisplayWindow(event)) {
+      return response.status(404).type("text/html").send(
+        '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>Event unavailable | FUTApulse</title></head><body><main><h1>This event is no longer available.</h1><a href="https://www.futapulse.com.ng/">Explore FUTApulse events</a></main></body></html>'
+      );
+    }
+    const [decoratedEvent] = await decorateEventsWithCurrentOrganizers(
+      [event],
+      isMongoConnected() ? { users: [], events: [] } : readDatabase()
+    );
+    const seo = getPublicEventSeoData(decoratedEvent);
+    const requestedUrl = new URL(request.originalUrl, CANONICAL_FRONTEND_URL);
+    const requestedSlug = String(request.params.slug || "");
+    const canonicalSlug = createEventSlug(decoratedEvent.title);
+    if (requestedSlug !== canonicalSlug) {
+      return response.redirect(308, `${seo.eventUrl}${requestedUrl.search}`);
+    }
+    const html = renderEventShareHtml(decoratedEvent, seo);
+    if (!html) return response.status(503).type("text/plain").send("FUTApulse frontend is not built.");
+    response.set("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600")
+      .type("html").send(html);
+  } catch (error) {
+    console.error("SEO event preview could not be rendered.", error);
+    return response.status(503).type("text/plain").send("Event preview temporarily unavailable.");
+  }
+});
+
 app.use("/Faculty Logo", express.static(path.join(__dirname, "Faculty Logo")));
 app.use("/Faculty%20Logo", express.static(path.join(__dirname, "Faculty Logo")));
 app.use(express.static(CLIENT_DIST));

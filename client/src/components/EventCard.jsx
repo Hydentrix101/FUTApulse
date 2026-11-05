@@ -22,7 +22,25 @@ const categoryLabels = {
   sports: 'SPORTS / ATHLETICS',
   seminars: 'SEMINARS',
 }
+const categoryNames = {
+  tech: 'Tech & Innovation',
+  academic: 'Academic',
+  social: 'Social & Vibes',
+  religious: 'Religious & Fellowship',
+  sports: 'Sports & Athletics',
+  seminars: 'Seminars',
+}
 const EVENT_VIEW_THRESHOLDS = [0, 0.25]
+
+function eventSlug(value) {
+  return String(value || 'campus-event')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 80) || 'campus-event'
+}
 
 function safeHttpUrl(value) {
   try {
@@ -219,11 +237,24 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
 
   const shareEvent = async () => {
     setShareFeedback('')
-    const shareUrl = new URL(window.location.pathname, window.location.origin)
-    shareUrl.hash = 'home'
-    shareUrl.searchParams.set('event', String(eventId || ''))
+    const shareUrl = new URL(
+      `/events/${encodeURIComponent(String(eventId || ''))}/${eventSlug(title)}`,
+      window.location.origin,
+    )
     shareUrl.searchParams.set('category', category)
+    const shareTitle = `${title} | ${categoryNames[category] || 'Campus Event'} | FUTApulse`
+    const eventSchedule = formatCampusDateTime(event.startTime || event.date)
+    const shareText = [
+      `${title} — ${categoryNames[category] || 'Campus Event'}`,
+      [eventSchedule, event.venue].filter(Boolean).join(' · '),
+      `Discover this event on FUTApulse: ${shareUrl.toString()}`,
+    ].filter(Boolean).join('\n')
     try {
+      if (navigator.share) {
+        await navigator.share({ title: shareTitle, text: shareText, url: shareUrl.toString() })
+        setShareFeedback('Event shared.')
+        return
+      }
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(shareUrl.toString())
       } else {
@@ -240,6 +271,7 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
       }
       setShareFeedback('Event link copied.')
     } catch (error) {
+      if (error.name === 'AbortError') return
       console.error('Unable to share this event.', error)
       setShareFeedback(error.message || 'Unable to share this event.')
     }

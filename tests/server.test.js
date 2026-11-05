@@ -1008,6 +1008,112 @@ test("GET /api/events preserves the shared grace window and omits legacy invalid
   assert.ok(!ids.has("event-invalid-window"));
 });
 
+test("SEO event previews render public metadata, category details, and safe image fallbacks", async () => {
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const originalDatabase = fs.readFileSync(dataFile, "utf8");
+  const now = Date.now();
+  const publicEvent = createEvent({
+    id: "seo-public-event",
+    title: "FUTA Tech & Build Night",
+    category: "tech",
+    activity: "A student-led night of demos, building, and collaboration.",
+    date: new Date(now + 2 * 86400_000).toISOString(),
+    startTime: new Date(now + 2 * 86400_000).toISOString(),
+    endTime: new Date(now + 2 * 86400_000 + 3_600_000).toISOString(),
+    venue: "FUTA Innovation Hub",
+    banner: "https://cdn.example.test/futa-tech-banner.webp",
+    bannerImages: ["https://cdn.example.test/futa-tech-banner.webp"],
+    createdByUserId: "seo-organizer"
+  });
+  const draftEvent = createEvent({ id: "seo-private-draft", title: "Private draft", status: "Draft" });
+  const expiredEvent = createEvent({
+    id: "seo-expired-event",
+    title: "Expired event",
+    date: new Date(now - 2 * 86400_000).toISOString(),
+    startTime: new Date(now - 2 * 86400_000).toISOString(),
+    endTime: new Date(now - 86400_000).toISOString()
+  });
+  fs.writeFileSync(dataFile, JSON.stringify({
+    profiles: [],
+    users: [{
+      id: "seo-organizer",
+      username: "event_builder",
+      profile: { name: "Ada Event Builder", picture: "https://cdn.example.test/ada-profile.webp" }
+    }],
+    events: [publicEvent, draftEvent, expiredEvent]
+  }, null, 2));
+
+  try {
+    const previewResponse = await fetch(`${baseUrl}/seo/events/seo-public-event/futa-tech-build-night?category=tech`);
+    assert.equal(previewResponse.status, 200);
+    const html = await previewResponse.text();
+    assert.match(html, /<title>FUTA Tech &amp; Build Night \| Tech &amp; Innovation \| FUTApulse<\/title>/);
+    assert.match(html, /property="og:title" content="FUTA Tech &amp; Build Night \| Tech &amp; Innovation \| FUTApulse"/);
+    assert.match(html, /property="og:description"[^>]*Tech &amp; Innovation event at FUTA/);
+    assert.match(html, /property="og:image" content="https:\/\/cdn\.example\.test\/futa-tech-banner\.webp"/);
+    assert.match(html, /rel="canonical" href="https:\/\/www\.futapulse\.com\.ng\/events\/seo-public-event\/futa-tech-build-night"/);
+    assert.match(html, /"name":"FUTA Tech & Build Night"/);
+    assert.match(html, /FUTA Innovation Hub/);
+    assert.match(html, /Ada Event Builder/);
+    assert.match(html, /<main class="seo-event-share"/);
+    assert.match(html, /View event on FUTApulse/);
+    assert.doesNotMatch(html, /FUTA CAMPUS EVENT DISCOVERY/);
+    assert.doesNotMatch(html, /attendeeUserIds|hypedUserIds|reminderUserIds/);
+
+    publicEvent.banner = "";
+    publicEvent.bannerImages = [];
+    fs.writeFileSync(dataFile, JSON.stringify({
+      profiles: [],
+      users: [{
+        id: "seo-organizer",
+        username: "event_builder",
+        profile: { name: "Ada Event Builder", picture: "https://cdn.example.test/ada-profile.webp" }
+      }],
+      events: [publicEvent, draftEvent, expiredEvent]
+    }, null, 2));
+    const fallbackResponse = await fetch(`${baseUrl}/seo/events/seo-public-event/futa-tech-build-night`);
+    assert.equal(fallbackResponse.status, 200);
+    const fallbackHtml = await fallbackResponse.text();
+    assert.match(fallbackHtml, /property="og:image" content="https:\/\/cdn\.example\.test\/ada-profile\.webp"/);
+
+    const draftResponse = await fetch(`${baseUrl}/seo/events/seo-private-draft/private-draft`);
+    assert.equal(draftResponse.status, 404);
+    assert.match(await draftResponse.text(), /noindex,nofollow/);
+    const expiredResponse = await fetch(`${baseUrl}/seo/events/seo-expired-event/expired-event`);
+    assert.equal(expiredResponse.status, 404);
+
+    const sitemapResponse = await fetch(`${baseUrl}/sitemap.xml`);
+    assert.equal(sitemapResponse.status, 200);
+    const sitemap = await sitemapResponse.text();
+    assert.match(sitemap, /https:\/\/www\.futapulse\.com\.ng\/events\/seo-public-event\/futa-tech-build-night/);
+    assert.doesNotMatch(sitemap, /seo-private-draft|seo-expired-event/);
+
+    const robotsResponse = await fetch(`${baseUrl}/robots.txt`);
+    assert.equal(robotsResponse.status, 200);
+    const robots = await robotsResponse.text();
+    assert.match(robots, /Disallow: \/api\//);
+    assert.match(robots, /Sitemap: https:\/\/www\.futapulse\.com\.ng\/sitemap\.xml/);
+    assert.match(sitemap, /https:\/\/www\.futapulse\.com\.ng\/contact/);
+
+    const aboutResponse = await fetch(`${baseUrl}/seo/pages/about`);
+    assert.equal(aboutResponse.status, 200);
+    const aboutHtml = await aboutResponse.text();
+    assert.match(aboutHtml, /<title>About FUTApulse \| FUTA Campus Events<\/title>/);
+    assert.match(aboutHtml, /rel="canonical" href="https:\/\/www\.futapulse\.com\.ng\/about"/);
+    assert.match(aboutHtml, /property="og:description"/);
+    assert.match(aboutHtml, /<h1>About FUTApulse \| FUTA Campus Events<\/h1>/);
+    assert.doesNotMatch(aboutHtml, /FUTA CAMPUS EVENT DISCOVERY/);
+    const unknownPageResponse = await fetch(`${baseUrl}/seo/pages/not-a-page`);
+    assert.equal(unknownPageResponse.status, 404);
+
+    const redirectResponse = await fetch(`${baseUrl}/seo/events/seo-public-event/old-event-title?category=tech`, { redirect: "manual" });
+    assert.equal(redirectResponse.status, 308);
+    assert.equal(redirectResponse.headers.get("location"), "https://www.futapulse.com.ng/events/seo-public-event/futa-tech-build-night?category=tech");
+  } finally {
+    fs.writeFileSync(dataFile, originalDatabase);
+  }
+});
+
 test("hype and reminder toggles are account-bound, idempotent, and private to each viewer", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const first = await createVerifiedAccount(baseUrl, "toggle-first@futa.edu.ng", "toggle_first");

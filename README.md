@@ -22,6 +22,15 @@ cd client
 npm run build
 ```
 
+## Search visibility and event sharing
+
+The canonical homepage and public event share links provide crawler-readable
+metadata, and `/robots.txt` plus `/sitemap.xml` are served through the API.
+Only current public events are included; drafts and expired events are excluded.
+See [SEO and search indexing](./docs/SEO_AND_SEARCH_INDEXING.md) for deployment
+verification and Google/Bing webmaster setup. Search engines decide whether
+and when to index pages or show rich previews.
+
 ## Authentication and persistence
 
 - `POST /api/auth/signup` validates email, username, and a password with more than 6 characters, at least one uppercase letter, and at least one number; passwords are hashed with bcrypt.
