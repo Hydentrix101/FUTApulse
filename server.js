@@ -1923,7 +1923,7 @@ mongoose.connection.on("error", (error) => {
 function buildFacultyTurnoutBreakdown(attendees, facultyByUserId = new Map()) {
   const turnoutBreakdown = new Map();
   for (const action of attendees) {
-    const faculty = String(action.faculty || facultyByUserId.get(String(action.userId)) || "").trim();
+    const faculty = String(facultyByUserId.get(String(action.userId)) || action.faculty || "").trim();
     if (faculty) turnoutBreakdown.set(faculty, (turnoutBreakdown.get(faculty) || 0) + 1);
   }
   return [...turnoutBreakdown].map(([faculty, count]) => ({ faculty, count }));
@@ -1987,7 +1987,21 @@ function isEventVisibleToFeed(event, viewerId, now = Date.now()) {
 
 async function listStoredEvents(viewerId = "", onlyVisible = false, pageOptions = null) {
   if (!isMongoConnected()) {
-    const localEvents = readDatabase().events;
+    const database = readDatabase();
+    const facultyByUserId = new Map((database.users || [])
+      .map((user) => [String(user.id), String(user.profile?.faculty || "").trim()])
+      .filter(([, faculty]) => faculty));
+    const localEvents = database.events.map((event) => {
+      const attendees = Array.isArray(event.attendeeUserIds)
+        ? [...new Set(event.attendeeUserIds.map(String))].map((userId) => ({ userId }))
+        : [];
+      return attendees.length
+        ? {
+          ...event,
+          turnoutBreakdown: buildFacultyTurnoutBreakdown(attendees, facultyByUserId)
+        }
+        : event;
+    });
     if (!pageOptions) return localEvents;
     const selected = localEvents
       .filter((event) => !pageOptions.category || pageOptions.category === "all" || event.category === pageOptions.category)
@@ -2087,13 +2101,13 @@ async function listStoredEvents(viewerId = "", onlyVisible = false, pageOptions 
     if (!actionsByEvent.has(action.eventId)) actionsByEvent.set(action.eventId, []);
     actionsByEvent.get(action.eventId).push(action);
   }
-  const attendeesMissingFaculty = actions
-    .filter((action) => action.type === "rsvp" && !String(action.faculty || "").trim())
+  const attendees = actions.filter((action) => action.type === "rsvp");
+  const attendeeUserIds = attendees
     .map((action) => String(action.userId || ""));
-  const missingFacultyUserIds = [...new Set(attendeesMissingFaculty)].filter((id) => mongoose.isValidObjectId(id));
+  const currentFacultyUserIds = [...new Set(attendeeUserIds)].filter((id) => mongoose.isValidObjectId(id));
   const facultyByUserId = new Map();
-  if (missingFacultyUserIds.length) {
-    const attendeeUsers = await User.find({ _id: { $in: missingFacultyUserIds } })
+  if (currentFacultyUserIds.length) {
+    const attendeeUsers = await User.find({ _id: { $in: currentFacultyUserIds } })
       .select("_id profile.faculty")
       .lean()
       .exec();

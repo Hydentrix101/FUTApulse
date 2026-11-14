@@ -418,21 +418,60 @@ test("dead-letter replay is secret-protected and validates IDs before database a
   }
 });
 
-test("faculty turnout groups attendance and recovers faculty from the attendee account when an action has no snapshot", () => {
+test("faculty turnout prefers current attendee profiles over RSVP-time faculty snapshots", () => {
   const turnout = buildFacultyTurnoutBreakdown([
-    { userId: "attendee-one", faculty: "" },
+    { userId: "attendee-one", faculty: "SIMME" },
     { userId: "attendee-two", faculty: "SEET" },
     { userId: "attendee-three", faculty: "" },
     { userId: "unknown-attendee", faculty: "" }
   ], new Map([
-    ["attendee-one", "SEET"],
+    ["attendee-one", "SESE"],
     ["attendee-three", "SPS"]
   ]));
 
   assert.deepEqual(turnout, [
-    { faculty: "SEET", count: 2 },
+    { faculty: "SESE", count: 1 },
+    { faculty: "SEET", count: 1 },
     { faculty: "SPS", count: 1 }
   ]);
+});
+
+test("event faculty turnout uses current attendee profiles instead of stored breakdown snapshots", async () => {
+  const originalDatabase = fs.readFileSync(dataFile, "utf8");
+  const attendeeId = "attendee-current-faculty";
+  const event = createEvent({
+    id: "event-current-faculty",
+    attendeeUserIds: [attendeeId],
+    rsvpCount: 1,
+    turnoutCount: 1,
+    turnoutBreakdown: [{ faculty: "SIMME", count: 1 }]
+  });
+  fs.writeFileSync(dataFile, JSON.stringify({
+    profiles: [],
+    users: [{
+      id: attendeeId,
+      username: "current_faculty_attendee",
+      profile: { name: "Current Faculty Attendee", faculty: "SESE" }
+    }],
+    events: [event]
+  }, null, 2));
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/events`);
+    assert.equal(response.status, 200);
+    const { events } = await response.json();
+    assert.deepEqual(events.find((item) => item.id === event.id).turnoutBreakdown, [
+      { faculty: "SESE", count: 1 }
+    ]);
+    const engagementResponse = await fetch(`http://127.0.0.1:${server.address().port}/api/events/engagement`);
+    assert.equal(engagementResponse.status, 200);
+    const { updates } = await engagementResponse.json();
+    assert.deepEqual(updates.find((item) => item.id === event.id).turnoutBreakdown, [
+      { faculty: "SESE", count: 1 }
+    ]);
+  } finally {
+    fs.writeFileSync(dataFile, originalDatabase);
+  }
 });
 
 test("RSVP reminders use default intervals or the custom override while retaining the start-time reminder", () => {

@@ -479,7 +479,8 @@ function FutaPulseApp() {
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
   const [user, setUser] = useState(null)
-  const [guestSignInRequested] = useState(() => initialSearchParams.has('auth'))
+  const hasActiveSession = Boolean(session?.token)
+  const [guestSignInRequested, setGuestSignInRequested] = useState(() => initialSearchParams.has('auth'))
   const isGuestSharedView = (!session?.token || !user) && !guestSignInRequested
   const [profile, setProfile] = useState(null)
   const [profileOpen, setProfileOpen] = useState(false)
@@ -642,6 +643,8 @@ function FutaPulseApp() {
   const recapPhotoInput = useRef(null)
   const engagementInFlight = useRef(false)
   const viewedEventIdsRef = useRef(new Set())
+  const userRef = useRef(user)
+  userRef.current = user
 
   const notify = useCallback((message, type = 'info') => {
     setToast({ message, type })
@@ -781,27 +784,68 @@ function FutaPulseApp() {
   const feedExpiryEventsRef = useRef(events)
   useEffect(() => { feedExpiryEventsRef.current = events }, [events])
 
-  const logout = useCallback((message = 'You have been logged out.', clearServerCookie = true) => {
+  const logout = useCallback((message = 'You’re signed out. You can continue browsing public campus events.', clearServerCookie = true) => {
     if (clearServerCookie) {
       fetch(`${API_BASE_URL}/api/auth/logout`, { method: 'POST', credentials: 'include' })
         .catch((error) => console.error('Unable to clear the server session cookie.', error))
     }
-    localStorage.removeItem('futapulse-auth-session')
-    localStorage.removeItem('futapulse-auth-user')
-    localStorage.removeItem('futapulse-remember-me')
-    localStorage.removeItem('futapulse-remembered-username')
-    localStorage.removeItem('futapulse-profile')
-    sessionStorage.removeItem('futapulse-auth-session')
+    try {
+      localStorage.removeItem('futapulse-auth-session')
+      localStorage.removeItem('futapulse-auth-user')
+      localStorage.removeItem('futapulse-remember-me')
+      localStorage.removeItem('futapulse-remembered-username')
+      localStorage.removeItem('futapulse-profile')
+    } catch (error) {
+      console.warn('Unable to clear all saved FUTApulse sign-in details.', error)
+    }
+    try {
+      sessionStorage.removeItem('futapulse-auth-session')
+    } catch (error) {
+      console.warn('Unable to clear the temporary FUTApulse sign-in details.', error)
+    }
+    setGuestSignInRequested(false)
     appTourAutoStarted.current = ''
     setAppTourOpen(false)
     setSession(null)
     setUser(null)
     setProfile(null)
+    setRememberedUsername('')
+    setSessionLoading(false)
+    setActiveTab('home')
+    setExpandedHomeCategory('')
+    setHomeCategory('all')
+    setDetailEvent(null)
+    setActiveEventAlert(null)
+    setPendingFullEventId('')
+    setNotificationFeedEventId('')
+    setHomeAnnouncement(null)
+    setGoingIds([])
+    setReminderIds([])
+    setEvents((current) => current.map((event) => ({
+      ...event,
+      isGoing: false,
+      isHyped: false,
+      isReminded: false,
+      viewCount: undefined,
+      recapPromptDismissed: undefined,
+    })))
     setCategoryPreferencesDraft(null)
     setCategoryPreferencesOpen(false)
     setProfileMenuOpen(false)
     setProfileOpen(false)
-    notify(typeof message === 'string' ? message : 'You have been logged out.')
+    setEventEditor(null)
+    setReminderTarget(null)
+    setReportTarget(null)
+    setGuidelinesOpen(false)
+    setOrganizerBroadcastTarget(null)
+    setReportReviewCases([])
+    setSettingsPage('menu')
+    setEventDuplicateState({ code: '', matches: [] })
+    const currentUrl = new URL(window.location.href)
+    currentUrl.searchParams.delete('auth')
+    currentUrl.hash = 'home'
+    window.history.replaceState(window.history.state || {}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`)
+    notify(typeof message === 'string' ? message : 'You’re signed out. You can continue browsing public campus events.')
   }, [notify, setProfileMenuOpen])
 
   useEffect(() => {
@@ -1217,23 +1261,76 @@ function FutaPulseApp() {
   }, [notify])
 
   useEffect(() => {
-    if (!session?.token) return undefined
-    const refreshTimer = window.setInterval(async () => {
+    if (!hasActiveSession) return undefined
+    let refreshing = false
+    let lastSuccessfulRefreshAt = 0
+    const controller = new AbortController()
+    const refreshCurrentSession = async () => {
+      if (refreshing || controller.signal.aborted || !navigator.onLine
+        || Date.now() - lastSuccessfulRefreshAt < 30_000) return
+      refreshing = true
       try {
-        const response = await fetch(`${API_BASE_URL}/api/auth/refresh`, { method: 'POST', credentials: 'include' })
+        const response = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
+          method: 'POST',
+          credentials: 'include',
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
+        })
+        if (controller.signal.aborted) return
         if (response.status === 401) {
-          logout()
+          logout('Your session has ended. You can continue browsing public campus events.', false)
           return
         }
         const result = await response.json().catch(() => ({}))
+        if (controller.signal.aborted) return
         if (!response.ok || !result.token || !result.user) throw new Error(result.error || 'Session refresh was not confirmed.')
-        setSession({ token: result.token, user: result.user })
+        if (String(result.user.id) !== String(userRef.current?.id)) {
+          logout('Your signed-in account changed. Please sign in again to continue.', false)
+          return
+        }
+        lastSuccessfulRefreshAt = Date.now()
+        const editingProfile = profileOpen || profileSaving || categoryPreferencesOpen || categoryPreferencesSaving
+        const refreshedUser = editingProfile
+          ? { ...result.user, profile: userRef.current?.profile || {} }
+          : result.user
+        setSession({ token: result.token, user: refreshedUser })
+        setUser(refreshedUser)
+        if (!editingProfile) {
+          const refreshedProfile = result.user.profile || null
+          setProfile(refreshedProfile)
+          setCategoryPreferencesDraft(null)
+          setProfileAvatarFailed(false)
+          setEvents((current) => current.map((event) => syncEventOrganizerProfile(event, result.user, refreshedProfile || {})))
+        }
       } catch (error) {
-        console.warn('Unable to refresh the active FUTApulse session.', error)
+        if (!controller.signal.aborted) console.warn('Unable to refresh the active FUTApulse session.', error)
+      } finally {
+        refreshing = false
       }
-    }, 10 * 60 * 1000)
-    return () => window.clearInterval(refreshTimer)
-  }, [session?.token, logout])
+    }
+    const refreshWhenVisible = () => {
+      if (!document.hidden) void refreshCurrentSession()
+    }
+    const refreshTimer = window.setInterval(refreshCurrentSession, 2 * 60 * 1000)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    window.addEventListener('focus', refreshCurrentSession)
+    window.addEventListener('online', refreshCurrentSession)
+    void refreshCurrentSession()
+    return () => {
+      controller.abort()
+      window.clearInterval(refreshTimer)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+      window.removeEventListener('focus', refreshCurrentSession)
+      window.removeEventListener('online', refreshCurrentSession)
+    }
+  }, [
+    hasActiveSession,
+    user?.id,
+    profileOpen,
+    profileSaving,
+    categoryPreferencesOpen,
+    categoryPreferencesSaving,
+    logout,
+  ])
 
   useEffect(() => {
     if (!session?.token || !isFutapulseAdmin) return undefined
@@ -2986,7 +3083,12 @@ function FutaPulseApp() {
   }
 
   if (isGuestSharedView && !['home', 'search'].includes(activeTab)) {
-    return <div className={`app-root theme-${theme} session-restore-screen`} role="status" aria-live="polite"><a href="/">Return to public campus events</a></div>
+    return (
+      <div className={`app-root theme-${theme} session-restore-screen`}>
+        <p role="status">Sign in to view your profile, or continue with public events.</p>
+        <button type="button" onClick={() => setActiveTab('home')}>Browse public events</button>
+      </div>
+    )
   }
 
   return (

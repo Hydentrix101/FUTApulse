@@ -258,7 +258,7 @@ function EventEditor({
         ...initial,
         ...savedDraft,
         id: event.id || savedDraft.id || '',
-        revision: event.revision || initial.revision || 1,
+        revision: Math.max(Number(event.revision) || 0, Number(savedDraft.revision) || 0, Number(initial.revision) || 0, 1),
         clientRequestId: initial.clientRequestId,
       }
       : initial
@@ -463,12 +463,19 @@ function EventEditor({
           const syncedDraft = {
             ...currentForm,
             id: saved.id,
+            revision: saved.revision,
+            updatedAt: saved.updatedAt,
             status: 'Draft',
             banner: savedImages[0] || currentBanner,
             bannerImages: savedImages,
           }
           formRef.current = syncedDraft
-          setForm((current) => current.id ? current : { ...current, id: saved.id })
+          setForm((current) => ({
+            ...current,
+            id: current.id || saved.id,
+            revision: saved.revision,
+            updatedAt: saved.updatedAt,
+          }))
           safeSetStored(draftKey, JSON.stringify(syncedDraft))
         }
       } catch (saveError) {
