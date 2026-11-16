@@ -9,7 +9,12 @@ test("the frontend exposes canonical share rewrites and homepage crawler metadat
   const vercel = JSON.parse(fs.readFileSync(path.join(root, "client", "vercel.json"), "utf8"));
   const homepage = fs.readFileSync(path.join(root, "client", "index.html"), "utf8");
   const rewrites = vercel.rewrites;
+  const legacyRedirect = vercel.redirects.find((rule) => rule.source === "/:path*"
+    && rule.has?.some((condition) => condition.type === "host" && condition.value === "fut-apulse.vercel.app"));
 
+  assert.ok(legacyRedirect, "the legacy Vercel host should have a global redirect");
+  assert.equal(legacyRedirect.destination, "https://www.futapulse.com.ng/:path*");
+  assert.equal(legacyRedirect.statusCode, 308);
   assert.ok(rewrites.some((rule) => rule.source === "/events/:eventId/:slug"
     && rule.destination === "https://futapulse.onrender.com/seo/events/:eventId/:slug"));
   assert.ok(rewrites.some((rule) => rule.source === "/robots.txt"

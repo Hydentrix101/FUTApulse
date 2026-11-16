@@ -110,7 +110,8 @@ const ALLOWED_EVENT_AUDIENCE = new Set(["all", "100", "200", "300", "400", "500"
 const EVENT_EDITABLE_FIELDS = new Set([
   "title", "category", "activity", "date", "startTime", "endTime", "venue",
   "venueLandmark", "meetingUrl", "infoUrl", "audience", "status", "banner",
-  "bannerImages", "clientRequestId", "expectedRevision", "allowSimilar"
+  "bannerImages", "clientRequestId", "expectedRevision", "allowSimilar",
+  "requiresCustomRegistration", "registrationFields"
 ]);
 const NOTIFICATION_CATEGORIES = ["academic", "tech", "social", "religious", "sports", "seminars"];
 const DEFAULT_NOTIFICATION_PREFERENCES = Object.freeze(Object.fromEntries(NOTIFICATION_CATEGORIES.map((category) => [category, true])));
@@ -180,7 +181,7 @@ function isValidUsername(value) {
 function ensureDatabase() {
   fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
   if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ profiles: [], users: [], emailChallenges: [], eventReports: [], events: [] }, null, 2));
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ profiles: [], users: [], emailChallenges: [], eventReports: [], eventRegistrations: [], events: [] }, null, 2));
     return;
   }
   try {
@@ -207,9 +208,13 @@ function ensureDatabase() {
       data.eventReports = [];
       changed = true;
     }
+    if (!Array.isArray(data.eventRegistrations)) {
+      data.eventRegistrations = [];
+      changed = true;
+    }
     if (changed) fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
   } catch {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ profiles: [], users: [], emailChallenges: [], eventReports: [], events: [] }, null, 2));
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ profiles: [], users: [], emailChallenges: [], eventReports: [], eventRegistrations: [], events: [] }, null, 2));
   }
 }
 
@@ -317,6 +322,118 @@ function validateEvent(event) {
   if (!Number.isFinite(start) || !Number.isFinite(end)) return "Published events require valid start and end times.";
   if (end <= start) return "The event end time must be later than the start time.";
   return null;
+}
+
+function validateRegistrationConfiguration(event) {
+  const requiresCustomRegistration = event.requiresCustomRegistration === undefined
+    ? false
+    : event.requiresCustomRegistration;
+  const fields = event.registrationFields === undefined ? [] : event.registrationFields;
+  if (typeof requiresCustomRegistration !== "boolean") {
+    return { error: "requiresCustomRegistration must be true or false." };
+  }
+  if (!Array.isArray(fields) || fields.length > 30) {
+    return { error: "registrationFields must contain no more than 30 fields." };
+  }
+  const ids = new Set();
+  const normalizedFields = [];
+  for (const field of fields) {
+    if (!field || typeof field !== "object" || Array.isArray(field)) {
+      return { error: "Each registration field must be an object." };
+    }
+    const id = typeof field.id === "string" ? field.id.trim() : "";
+    const label = typeof field.label === "string" ? field.label.trim() : "";
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id) || ids.has(id)) {
+      return { error: "Each registration field must have a unique valid id." };
+    }
+    if (!label || label.length > 120) {
+      return { error: "Each registration field needs a label no longer than 120 characters." };
+    }
+    if (!["text", "select", "number"].includes(field.type)) {
+      return { error: "Registration field type must be text, select, or number." };
+    }
+    if (field.required !== undefined && typeof field.required !== "boolean") {
+      return { error: `The required setting for "${label}" must be true or false.` };
+    }
+    const options = field.options === undefined ? [] : field.options;
+    if (!Array.isArray(options) || options.length > 30
+      || options.some((option) => typeof option !== "string" || !option.trim() || option.trim().length > 120)) {
+      return { error: `Options for "${label}" must be non-empty strings no longer than 120 characters.` };
+    }
+    const normalizedOptions = options.map((option) => option.trim());
+    if (new Set(normalizedOptions.map((option) => option.toLowerCase())).size !== normalizedOptions.length) {
+      return { error: `Options for "${label}" must be unique.` };
+    }
+    if (field.type === "select" && normalizedOptions.length < 2) {
+      return { error: `Select field "${label}" must have at least two options.` };
+    }
+    if (field.type !== "select" && normalizedOptions.length) {
+      return { error: `Only select fields may define options ("${label}").` };
+    }
+    ids.add(id);
+    normalizedFields.push({
+      id,
+      label,
+      type: field.type,
+      options: normalizedOptions,
+      required: field.required !== false
+    });
+  }
+  if (requiresCustomRegistration && !normalizedFields.length) {
+    return { error: "Add at least one registration field or turn off custom registration." };
+  }
+  return { value: { requiresCustomRegistration, registrationFields: normalizedFields } };
+}
+
+function validateRegistrationAnswers(fields, submittedAnswers) {
+  const answersById = new Map();
+  if (Array.isArray(submittedAnswers)) {
+    for (const item of submittedAnswers) {
+      if (!item || typeof item !== "object" || Array.isArray(item)
+        || typeof item.fieldId !== "string" || answersById.has(item.fieldId)) {
+        return { error: "Answers must contain one entry per registration field." };
+      }
+      answersById.set(item.fieldId, item.answer);
+    }
+  } else if (submittedAnswers && typeof submittedAnswers === "object") {
+    for (const [fieldId, answer] of Object.entries(submittedAnswers)) answersById.set(fieldId, answer);
+  } else {
+    return { error: "Provide answers for the event's registration fields." };
+  }
+  const knownFields = new Map(fields.map((field) => [field.id, field]));
+  if ([...answersById.keys()].some((fieldId) => !knownFields.has(fieldId))) {
+    return { error: "Answers include a field that is not part of this event's registration form." };
+  }
+  const answers = [];
+  for (const field of fields) {
+    const submitted = answersById.get(field.id);
+    const isEmpty = submitted === undefined || submitted === null
+      || typeof submitted === "string" && !submitted.trim();
+    if (isEmpty) {
+      if (field.required) return { error: `Please answer "${field.label}".` };
+      continue;
+    }
+    let answer;
+    if (field.type === "text") {
+      if (typeof submitted !== "string" || submitted.trim().length > 2000) {
+        return { error: `"${field.label}" must be text no longer than 2000 characters.` };
+      }
+      answer = submitted.trim();
+      if (!answer && field.required) return { error: `Please answer "${field.label}".` };
+      if (!answer) continue;
+    } else if (field.type === "number") {
+      answer = typeof submitted === "number" ? submitted
+        : typeof submitted === "string" && submitted.trim() ? Number(submitted) : NaN;
+      if (!Number.isFinite(answer)) return { error: `"${field.label}" must be a valid number.` };
+    } else {
+      if (typeof submitted !== "string" || !field.options.includes(submitted.trim())) {
+        return { error: `Choose a valid option for "${field.label}".` };
+      }
+      answer = submitted.trim();
+    }
+    answers.push({ fieldId: field.id, label: field.label, answer });
+  }
+  return { value: answers };
 }
 
 function getUnsupportedEventFields(payload) {
@@ -521,12 +638,41 @@ const eventRecordSchema = new mongoose.Schema({
   startsAt: { type: Date, default: null, index: true },
   endsAt: { type: Date, default: null, index: true },
   lastAnnouncementAt: { type: Date, default: null },
+  requiresCustomRegistration: { type: Boolean, default: false },
+  registrationFields: {
+    type: [{
+      _id: false,
+      id: { type: String, required: true },
+      label: { type: String, required: true },
+      type: { type: String, enum: ["text", "select", "number"], required: true },
+      options: { type: [String], default: [] },
+      required: { type: Boolean, default: true }
+    }],
+    default: []
+  },
   record: { type: mongoose.Schema.Types.Mixed, required: true }
 }, { timestamps: true, minimize: false });
 eventRecordSchema.index({ status: 1, endsAt: 1 });
 eventRecordSchema.index({ category: 1, status: 1, startsAt: 1 });
 eventRecordSchema.index({ createdAt: -1, eventId: -1 });
 const EventRecord = mongoose.models.FutapulseEvent || mongoose.model("FutapulseEvent", eventRecordSchema, "events");
+const eventRegistrationSchema = new mongoose.Schema({
+  eventId: { type: mongoose.Schema.Types.ObjectId, ref: "FutapulseEvent", required: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "FutapulseUser", required: true },
+  answers: {
+    type: [{
+      _id: false,
+      fieldId: { type: String, required: true },
+      label: { type: String, required: true },
+      answer: { type: mongoose.Schema.Types.Mixed, required: true }
+    }],
+    default: []
+  },
+  createdAt: { type: Date, default: Date.now }
+}, { versionKey: false });
+eventRegistrationSchema.index({ eventId: 1, userId: 1 }, { unique: true });
+const EventRegistration = mongoose.models.FutapulseEventRegistration
+  || mongoose.model("FutapulseEventRegistration", eventRegistrationSchema, "event_registrations");
 
 const engagementActionSchema = new mongoose.Schema({
   eventId: { type: String, required: true },
@@ -1932,6 +2078,8 @@ function buildFacultyTurnoutBreakdown(attendees, facultyByUserId = new Map()) {
 function eventDocumentFromRecord(event) {
   const startsAt = eventStartDate(event);
   const endsAt = parseCampusDateTime(event.endTime);
+  const registrationConfiguration = validateRegistrationConfiguration(event).value
+    || { requiresCustomRegistration: false, registrationFields: [] };
   return {
     eventId: String(event.id),
     revision: isValidEventRevision(event.revision) ? event.revision : 1,
@@ -1940,6 +2088,7 @@ function eventDocumentFromRecord(event) {
     category: String(event.category || ""),
     startsAt,
     endsAt,
+    ...registrationConfiguration,
     record: event
   };
 }
@@ -2086,6 +2235,8 @@ async function listStoredEvents(viewerId = "", onlyVisible = false, pageOptions 
   }
   const events = records.map((item) => item.record && ({
     ...item.record,
+    requiresCustomRegistration: item.requiresCustomRegistration ?? item.record.requiresCustomRegistration ?? false,
+    registrationFields: item.registrationFields ?? item.record.registrationFields ?? [],
     revision: isValidEventRevision(item.revision) ? item.revision : isValidEventRevision(item.record.revision) ? item.record.revision : 1
   })).filter(Boolean);
   if (!events.length) return pageOptions
@@ -2196,7 +2347,11 @@ async function decorateOwnerRecapDismissals(events, viewerId) {
 async function findStoredEvent(eventId) {
   if (!isMongoConnected()) return readDatabase().events.find((item) => String(item.id) === String(eventId)) || null;
   const record = await EventRecord.findOne({ eventId: String(eventId) }).lean().exec();
-  return record?.record || null;
+  return record ? {
+    ...record.record,
+    requiresCustomRegistration: record.requiresCustomRegistration ?? record.record?.requiresCustomRegistration ?? false,
+    registrationFields: record.registrationFields ?? record.record?.registrationFields ?? []
+  } : null;
 }
 
 function getIdempotentEventId(ownerUserId, clientRequestId) {
@@ -2334,6 +2489,7 @@ async function deleteStoredEvent(eventId) {
   if (!isMongoConnected()) {
     const database = readDatabase();
     database.events = database.events.filter((item) => String(item.id) !== String(eventId));
+    database.eventRegistrations = (database.eventRegistrations || []).filter((item) => String(item.eventId) !== String(eventId));
     database.eventReports = (database.eventReports || []).filter((item) => String(item.eventId) !== String(eventId));
     database.eventViews = (database.eventViews || []).filter((item) => String(item.eventId) !== String(eventId));
     database.recapPromptDismissals = (database.recapPromptDismissals || []).filter((item) => String(item.eventId) !== String(eventId));
@@ -2345,8 +2501,10 @@ async function deleteStoredEvent(eventId) {
     await cancelEventEndedRecapPrompts(eventId);
     return;
   }
+  const eventRecord = await EventRecord.findOne({ eventId: String(eventId) }).select("_id").lean().exec();
   await Promise.all([
     EventRecord.deleteOne({ eventId: String(eventId) }).exec(),
+    eventRecord ? EventRegistration.deleteMany({ eventId: eventRecord._id }).exec() : Promise.resolve(),
     EventReport.deleteOne({ eventId: String(eventId) }).exec(),
     EngagementAction.deleteMany({ eventId: String(eventId) }).exec(),
     EventView.deleteMany({ eventId: String(eventId) }).exec(),
@@ -2365,6 +2523,7 @@ async function deleteStoredEventsForOwner(ownerUserId) {
     const database = readDatabase();
     const ownedIds = new Set(database.events.filter((event) => String(event.createdByUserId || "") === ownerId).map((event) => String(event.id)));
     database.events = database.events.filter((event) => !ownedIds.has(String(event.id)));
+    database.eventRegistrations = (database.eventRegistrations || []).filter((item) => !ownedIds.has(String(item.eventId)) && String(item.userId) !== ownerId);
     database.eventReports = (database.eventReports || []).filter((item) => !ownedIds.has(String(item.eventId)));
     database.notificationJobs = (database.notificationJobs || []).filter((item) => !ownedIds.has(String(item.eventId)));
     database.eventViews = (database.eventViews || []).filter((item) => !ownedIds.has(String(item.eventId)) && String(item.userId) !== ownerId);
@@ -2378,6 +2537,13 @@ async function deleteStoredEventsForOwner(ownerUserId) {
   }
   const ownedRecords = await EventRecord.find({ ownerUserId }).select("eventId").lean().exec();
   const eventIds = ownedRecords.map((item) => item.eventId);
+  const ownedEventDocuments = eventIds.length
+    ? await EventRecord.find({ eventId: { $in: eventIds } }).select("_id").lean().exec()
+    : [];
+  const registrationFilters = [
+    ...(mongoose.isValidObjectId(ownerId) ? [{ userId: new mongoose.Types.ObjectId(ownerId) }] : []),
+    ...(ownedEventDocuments.length ? [{ eventId: { $in: ownedEventDocuments.map((item) => item._id) } }] : [])
+  ];
   await Promise.all([
     eventIds.length ? EventRecord.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
     eventIds.length ? EventReport.deleteMany({ eventId: { $in: eventIds } }).exec() : Promise.resolve(),
@@ -2393,7 +2559,8 @@ async function deleteStoredEventsForOwner(ownerUserId) {
     EngagementAction.deleteMany({ $or: [
       { userId: ownerId },
       ...(eventIds.length ? [{ eventId: { $in: eventIds } }] : [])
-    ] }).exec()
+    ] }).exec(),
+    registrationFilters.length ? EventRegistration.deleteMany({ $or: registrationFilters }).exec() : Promise.resolve()
   ]);
 }
 
@@ -4789,11 +4956,20 @@ app.post("/api/events", eventMutationRateLimit, async (request, response) => {
       infoUrl: typeof payload.infoUrl === "string" ? payload.infoUrl.trim() : "",
       turnoutCount: existing ? Number(existing.turnoutCount) || 0 : 0,
       turnoutBreakdown: existing && Array.isArray(existing.turnoutBreakdown) ? existing.turnoutBreakdown : [],
+      requiresCustomRegistration: payload.requiresCustomRegistration === undefined
+        ? existing?.requiresCustomRegistration ?? false
+        : payload.requiresCustomRegistration,
+      registrationFields: payload.registrationFields === undefined
+        ? existing?.registrationFields ?? []
+        : payload.registrationFields,
       status: requestedStatus,
       revision: existing ? existing.revision || 1 : 1,
       createdAt: existing?.createdAt || now,
       updatedAt: now
     };
+    const registrationConfiguration = validateRegistrationConfiguration(event);
+    if (registrationConfiguration.error) return response.status(400).json({ error: registrationConfiguration.error });
+    Object.assign(event, registrationConfiguration.value);
     const validationError = validateEvent(event);
     if (validationError) return response.status(400).json({ error: validationError });
     const database = isMongoConnected() ? { users: [], events: [] } : readDatabase();
@@ -4841,7 +5017,7 @@ app.post("/api/events", eventMutationRateLimit, async (request, response) => {
   }
 });
 
-app.patch("/api/events/:eventId", eventMutationRateLimit, async (request, response) => {
+const updateEventHandler = async (request, response) => {
   try {
     const user = request.rateLimitUser || await getAuthenticatedUser(request);
     if (!user) return response.status(401).json({ error: "Sign in before editing an event." });
@@ -4888,6 +5064,9 @@ app.patch("/api/events/:eventId", eventMutationRateLimit, async (request, respon
       infoUrl: typeof changes.infoUrl === "string" ? changes.infoUrl.trim() : current.infoUrl || "",
       updatedAt: new Date().toISOString()
     };
+    const registrationConfiguration = validateRegistrationConfiguration(updated);
+    if (registrationConfiguration.error) return response.status(400).json({ error: registrationConfiguration.error });
+    Object.assign(updated, registrationConfiguration.value);
     if (!["Draft", "Published", "Live"].includes(updated.status)) {
       return response.status(400).json({ error: "An event can only be saved as a draft or published event." });
     }
@@ -4953,7 +5132,9 @@ app.patch("/api/events/:eventId", eventMutationRateLimit, async (request, respon
     console.error("Event update failed.", error);
     return response.status(500).json({ error: "Unable to update this event right now." });
   }
-});
+};
+app.patch("/api/events/:eventId", eventMutationRateLimit, updateEventHandler);
+app.put("/api/events/:eventId", eventMutationRateLimit, updateEventHandler);
 
 app.delete("/api/events/:eventId", async (request, response) => {
   try {
@@ -5352,6 +5533,175 @@ app.post("/api/admin/event-reports/:eventId/decision", async (request, response)
   }
 });
 
+app.post("/api/events/:eventId/register", eventInteractionRateLimit, async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in to register for this event." });
+    const eventId = String(request.params.eventId);
+    const event = await findStoredEvent(eventId);
+    if (!event || !["Published", "Live"].includes(event.status)) {
+      return response.status(404).json({ error: "This event is no longer available for registration." });
+    }
+    if (!event.requiresCustomRegistration) {
+      return response.status(409).json({ error: "This event does not require custom registration." });
+    }
+    const validatedAnswers = validateRegistrationAnswers(event.registrationFields || [], request.body?.answers);
+    if (validatedAnswers.error) return response.status(400).json({ error: validatedAnswers.error });
+    const userId = String(user._id || user.id);
+    const now = new Date();
+    let registration;
+    let newlyAttending = false;
+    if (isMongoConnected()) {
+      if (!mongoose.isValidObjectId(userId)) {
+        return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
+      }
+      const eventDocument = await EventRecord.findOne({ eventId }).select("_id").lean().exec();
+      if (!eventDocument) return response.status(404).json({ error: "Event not found." });
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(async () => {
+          [registration] = await EventRegistration.create([{
+            eventId: eventDocument._id,
+            userId: new mongoose.Types.ObjectId(userId),
+            answers: validatedAnswers.value,
+            createdAt: now
+          }], { session });
+          const action = { eventId, userId, type: "rsvp" };
+          newlyAttending = !(await EngagementAction.exists(action).session(session));
+          await EngagementAction.updateOne(action, {
+            $set: {
+              faculty: String(user.profile?.faculty || "").trim().slice(0, 80),
+              department: String(user.profile?.department || "").trim().slice(0, 100)
+            }
+          }, { upsert: true, session }).exec();
+        });
+      } catch (error) {
+        if (error.code === 11000) {
+          return response.status(409).json({ error: "You are already registered for this event." });
+        }
+        throw error;
+      } finally {
+        await session.endSession();
+      }
+      if (newlyAttending) {
+        try {
+          const customReminder = await EngagementAction.findOne({ eventId, userId, type: "reminder" })
+            .select("customReminderAt").lean().exec();
+          await scheduleDefaultRsvpReminders(event, userId, Boolean(customReminder?.customReminderAt));
+          await notifyRsvpSocialProof(event);
+        } catch (error) {
+          console.error("Custom event registration succeeded, but RSVP notifications could not be scheduled.", error);
+        }
+      }
+    } else {
+      const database = readDatabase();
+      const registrations = Array.isArray(database.eventRegistrations) ? database.eventRegistrations : [];
+      if (registrations.some((item) => String(item.eventId) === eventId && String(item.userId) === userId)) {
+        return response.status(409).json({ error: "You are already registered for this event." });
+      }
+      registration = {
+        id: crypto.randomUUID(),
+        eventId,
+        userId,
+        answers: validatedAnswers.value,
+        createdAt: now.toISOString()
+      };
+      registrations.push(registration);
+      database.eventRegistrations = registrations;
+      const storedEvent = database.events.find((item) => String(item.id) === eventId);
+      if (!storedEvent) return response.status(404).json({ error: "Event not found." });
+      const attendees = Array.isArray(storedEvent.attendeeUserIds) ? storedEvent.attendeeUserIds.map(String) : [];
+      newlyAttending = !attendees.includes(userId);
+      if (newlyAttending) {
+        storedEvent.attendeeUserIds = [...new Set([...attendees, userId])];
+        storedEvent.rsvpCount = storedEvent.attendeeUserIds.length;
+        storedEvent.turnoutCount = storedEvent.rsvpCount;
+      }
+      writeDatabase(database);
+    }
+    const updatedEvent = (await listStoredEvents(userId)).find((item) => String(item.id) === eventId);
+    if (!updatedEvent) return response.status(404).json({ error: "Event not found." });
+    const [decoratedEvent] = await decorateEventsWithCurrentOrganizers([updatedEvent], { users: [], events: [] });
+    const hotEligibleUserCount = await getHotEligibleUserCount();
+    const publicRegistration = {
+      id: String(registration._id || registration.id),
+      answers: registration.answers,
+      createdAt: new Date(registration.createdAt).toISOString()
+    };
+    return response.status(201).json({
+      registration: publicRegistration,
+      event: toPublicEvent(withHotStatus(decoratedEvent, hotEligibleUserCount), userId)
+    });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
+    }
+    console.error("Custom event registration failed.", error);
+    return response.status(500).json({ error: "Unable to complete this event registration right now." });
+  }
+});
+
+app.get("/api/events/:eventId/registrations", async (request, response) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return response.status(401).json({ error: "Sign in to view event registrations." });
+    const eventId = String(request.params.eventId);
+    const event = await findStoredEvent(eventId);
+    if (!event) return response.status(404).json({ error: "Event not found." });
+    if (String(event.createdByUserId || "") !== String(user._id || user.id)) {
+      return response.status(403).json({ error: "Only the event organizer can view attendee registrations." });
+    }
+    let registrations;
+    if (isMongoConnected()) {
+      const eventDocument = await EventRecord.findOne({ eventId }).select("_id").lean().exec();
+      if (!eventDocument) return response.status(404).json({ error: "Event not found." });
+      const records = await EventRegistration.find({ eventId: eventDocument._id })
+        .populate({ path: "userId", select: "username profile" })
+        .sort({ createdAt: 1 })
+        .lean()
+        .exec();
+      registrations = records.map((item) => ({
+        user: item.userId ? {
+          id: String(item.userId._id),
+          username: item.userId.username,
+          name: item.userId.profile?.name || item.userId.username,
+          faculty: item.userId.profile?.faculty || "",
+          level: item.userId.profile?.level || ""
+        } : null,
+        answers: item.answers,
+        createdAt: new Date(item.createdAt).toISOString()
+      }));
+    } else {
+      const database = readDatabase();
+      const usersById = new Map((database.users || []).map((item) => [String(item.id), item]));
+      registrations = (database.eventRegistrations || [])
+        .filter((item) => String(item.eventId) === eventId)
+        .sort((first, second) => new Date(first.createdAt) - new Date(second.createdAt))
+        .map((item) => {
+          const attendee = usersById.get(String(item.userId));
+          return {
+            user: attendee ? {
+              id: String(attendee.id),
+              username: attendee.username,
+              name: attendee.profile?.name || attendee.username,
+              faculty: attendee.profile?.faculty || "",
+              level: attendee.profile?.level || ""
+            } : null,
+            answers: item.answers,
+            createdAt: new Date(item.createdAt).toISOString()
+          };
+        });
+    }
+    return response.json({ registrations });
+  } catch (error) {
+    if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
+      return response.status(401).json({ error: "Your session is no longer valid. Sign in again." });
+    }
+    console.error("Event registrations could not be fetched.", error);
+    return response.status(500).json({ error: "Unable to load event registrations right now." });
+  }
+});
+
 app.patch("/api/events/:eventId/engagement", eventInteractionRateLimit, async (request, response) => {
   try {
   const type = request.body?.type;
@@ -5382,6 +5732,12 @@ app.patch("/api/events/:eventId/engagement", eventInteractionRateLimit, async (r
   if (isMongoConnected()) {
     const event = await findStoredEvent(eventId);
     if (!event) return response.status(404).json({ error: "Event not found." });
+    if (type === "rsvp" && enabled && event.requiresCustomRegistration) {
+      return response.status(409).json({
+        code: "CUSTOM_REGISTRATION_REQUIRED",
+        error: "Complete this event's custom registration form before confirming attendance."
+      });
+    }
     const action = { eventId, userId, type };
     const wasEnabled = Boolean(await EngagementAction.exists(action));
     if (enabled && !wasEnabled) {
@@ -5398,6 +5754,15 @@ app.patch("/api/events/:eventId/engagement", eventInteractionRateLimit, async (r
       }
     } else if (!enabled) {
       await EngagementAction.deleteOne(action).exec();
+      if (type === "rsvp") {
+        const eventDocument = await EventRecord.findOne({ eventId }).select("_id").lean().exec();
+        if (eventDocument) {
+          await EventRegistration.deleteOne({
+            eventId: eventDocument._id,
+            userId: new mongoose.Types.ObjectId(userId)
+          }).exec();
+        }
+      }
     }
     if (type === "rsvp" && enabled && !wasEnabled) {
       try {
@@ -5435,6 +5800,12 @@ app.patch("/api/events/:eventId/engagement", eventInteractionRateLimit, async (r
   const eventIndex = database.events.findIndex((item) => String(item.id) === eventId);
   if (eventIndex < 0) return response.status(404).json({ error: "Event not found." });
   const event = database.events[eventIndex];
+  if (type === "rsvp" && enabled && event.requiresCustomRegistration) {
+    return response.status(409).json({
+      code: "CUSTOM_REGISTRATION_REQUIRED",
+      error: "Complete this event's custom registration form before confirming attendance."
+    });
+  }
   let changed = false;
   if (type === "rsvp") {
     const attendeeUserIds = Array.isArray(event.attendeeUserIds) ? event.attendeeUserIds.map(String) : [];
@@ -5448,6 +5819,11 @@ app.patch("/api/events/:eventId/engagement", eventInteractionRateLimit, async (r
       event.turnoutCount = event.rsvpCount;
       const faculty = String(user.profile?.faculty || "").trim().slice(0, 80);
       if (faculty) event.turnoutBreakdown = updateFacultyTurnoutBreakdown(event.turnoutBreakdown, faculty, attendanceDelta);
+      changed = true;
+    }
+    if (!enabled) {
+      database.eventRegistrations = (database.eventRegistrations || []).filter((item) =>
+        String(item.eventId) !== eventId || String(item.userId) !== userId);
       changed = true;
     }
   } else {
@@ -6020,7 +6396,7 @@ async function startServer() {
   })
     .then(async () => {
       await Promise.all([
-        User.init(), EmailChallenge.init(), EventRecord.init(), EngagementAction.init(), EventReport.init(),
+        User.init(), EmailChallenge.init(), EventRecord.init(), EventRegistration.init(), EngagementAction.init(), EventReport.init(),
         EventView.init(), RecapPromptDismissal.init(),
         PushDevice.init(), NotificationJob.init(), NotificationOutbox.init(), NotificationDeadLetter.init(),
         ApiRateLimitBucket.init()
@@ -6044,7 +6420,7 @@ if (require.main === module) {
 module.exports = {
   app,
   startServer,
-  models: { User, EmailChallenge, EventRecord, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob, NotificationOutbox, NotificationDeadLetter, ApiRateLimitBucket },
+  models: { User, EmailChallenge, EventRecord, EventRegistration, EngagementAction, EventReport, EventView, RecapPromptDismissal, PushDevice, NotificationJob, NotificationOutbox, NotificationDeadLetter, ApiRateLimitBucket },
   buildFacultyTurnoutBreakdown,
   buildRsvpReminderSchedule,
   buildCriticalEventUpdateDetails,

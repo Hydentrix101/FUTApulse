@@ -3,35 +3,11 @@ import { CheckCircle2, Eye, EyeOff, LoaderCircle } from 'lucide-react'
 import BrandHeart from './BrandHeart'
 
 import { API_BASE_URL } from '../config/api'
+import { authRequest } from '../utils/authApi'
 import { isValidUsername } from '../utils/usernames'
 let googleIdentityServicesPromise
 
-async function request(endpoint, options = {}) {
-  const { timeoutMs = 30000, ...requestOptions } = options
-  let response
-  try {
-    response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      ...requestOptions,
-      credentials: 'include',
-      headers: {
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-        ...options.headers,
-      },
-      signal: requestOptions.signal || AbortSignal.timeout(timeoutMs),
-    })
-  } catch (error) {
-    if (error.name === 'AbortError' || error.name === 'TimeoutError') {
-      throw new Error('The FUTApulse server took too long to respond. Your details were not confirmed; please retry.', { cause: error })
-    }
-    if (error instanceof TypeError) {
-      throw new Error('FUTApulse could not reach its server. Check your connection and retry; no action was confirmed.', { cause: error })
-    }
-    throw error
-  }
-  const result = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(result.error || `Request failed (${response.status}).`)
-  return result
-}
+const request = (endpoint, options = {}) => authRequest(endpoint, options, API_BASE_URL)
 
 function requireSessionResponse(result) {
   if (!result?.token || !result?.user) {
@@ -305,7 +281,6 @@ function AuthScreen({ onAuthenticated, initialUsername = '', initialMode = 'logi
         }
         const result = await request(mode === 'signup' ? '/api/auth/signup' : '/api/auth/login', {
           method: 'POST',
-          timeoutMs: mode === 'signup' ? 60000 : 30000,
           body: JSON.stringify(mode === 'signup'
             ? { email: email.trim().toLowerCase(), username: enteredUsername, password, remember }
             : { username: enteredUsername, password, remember }),

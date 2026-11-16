@@ -10,7 +10,7 @@
         }
       ],
       "destination": "https://www.futapulse.com.ng/:path*",
-      "permanent": true
+      "statusCode": 308
     }
   ],
   "rewrites": [

@@ -30,7 +30,51 @@ function createClientRequestId() {
 }
 
 function createEmptyEvent() {
-  return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', infoUrl: '', audience: [], status: 'Draft', banner: '', bannerImages: [], turnoutCount: 0, turnoutBreakdown: [] }
+  return { id: '', title: '', category: '', activity: '', date: '', startClock: '', endDateTime: '', endClock: '', venue: '', venueLandmark: '', meetingUrl: '', infoUrl: '', audience: [], status: 'Draft', banner: '', bannerImages: [], requiresCustomRegistration: false, registrationFields: [], turnoutCount: 0, turnoutBreakdown: [] }
+}
+
+function createRegistrationField(index) {
+  return {
+    id: globalThis.crypto?.randomUUID?.() || `registration-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    label: `Question ${index + 1}`,
+    type: 'text',
+    options: [],
+    required: true,
+  }
+}
+
+function parseRegistrationOptions(value) {
+  return (typeof value === 'string' ? value : '').split(',').map((option) => option.trim()).filter(Boolean)
+}
+
+function getRegistrationConfigurationError(form, optionsTextById = {}) {
+  const fields = Array.isArray(form.registrationFields) ? form.registrationFields : []
+  if (form.requiresCustomRegistration && !fields.length) {
+    return 'Add at least one field to the custom registration form.'
+  }
+  const ids = new Set()
+  for (const field of fields) {
+    if (typeof field.id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(field.id) || ids.has(field.id)) {
+      return 'Each registration field needs a unique identifier.'
+    }
+    ids.add(field.id)
+    if (typeof field.label !== 'string' || !field.label.trim()) return 'Enter a label for every registration field.'
+    if (field.label.trim().length > 120) return 'Question labels must be no longer than 120 characters.'
+    if (!['text', 'select', 'number'].includes(field.type)) return 'Choose a supported answer type for every question.'
+    const options = field.type === 'select'
+      ? parseRegistrationOptions(optionsTextById[field.id] ?? (Array.isArray(field.options) ? field.options.join(', ') : ''))
+      : []
+    if (field.type === 'select' && options.length < 2) {
+      return `Add at least two comma-separated options for "${field.label.trim()}".`
+    }
+    if (options.length > 30 || options.some((option) => option.length > 120)) {
+      return `Use no more than 30 options of 120 characters each for "${field.label.trim()}".`
+    }
+    if (new Set(options.map((option) => option.toLowerCase())).size !== options.length) {
+      return `Options for "${field.label.trim()}" must be unique.`
+    }
+  }
+  return ''
 }
 
 function getEventId(event) {
@@ -263,6 +307,11 @@ function EventEditor({
       }
       : initial
   })
+  const [registrationOptionsText, setRegistrationOptionsText] = useState(() =>
+    Object.fromEntries((form.registrationFields || []).map((field) => [
+      field.id,
+      Array.isArray(field.options) ? field.options.join(', ') : '',
+    ])))
   const [banner, setBanner] = useState(() => event.bannerImages?.[0] || event.banner || '')
   const formRef = useRef(form)
   const bannerRef = useRef(banner)
@@ -311,6 +360,29 @@ function EventEditor({
     formRef.current = next
     setForm(next)
   }
+  const updateRegistrationField = (fieldId, changes) => {
+    const fields = (formRef.current.registrationFields || []).map((field) =>
+      field.id === fieldId ? { ...field, ...changes } : field)
+    update('registrationFields', fields)
+  }
+  const addRegistrationField = () => {
+    const fields = formRef.current.registrationFields || []
+    const field = createRegistrationField(fields.length)
+    setRegistrationOptionsText((current) => ({ ...current, [field.id]: '' }))
+    update('registrationFields', [...fields, field])
+  }
+  const removeRegistrationField = (fieldId) => {
+    update('registrationFields', (formRef.current.registrationFields || []).filter((field) => field.id !== fieldId))
+    setRegistrationOptionsText((current) => {
+      const next = { ...current }
+      delete next[fieldId]
+      return next
+    })
+  }
+  const setRegistrationEnabled = (enabled) => {
+    if (enabled && !(formRef.current.registrationFields || []).length) addRegistrationField()
+    update('requiresCustomRegistration', enabled)
+  }
   const updateBannerImages = (images) => {
     const nextImages = images.slice(0, MAX_EVENT_BANNERS)
     const primaryBanner = nextImages[0] || ''
@@ -333,6 +405,12 @@ function EventEditor({
       bannerImages: Array.isArray(currentForm.bannerImages) ? currentForm.bannerImages : (currentBanner ? [currentBanner] : []),
     }
     persistLocalDraft(snapshot, currentBanner)
+    const registrationError = getRegistrationConfigurationError(snapshot, registrationOptionsText)
+    if (registrationError) {
+      setDraftSyncing(false)
+      setDraftSyncError('Finish the custom registration fields before syncing this draft.')
+      return
+    }
     const startDateTime = snapshot.date && snapshot.startClock ? `${snapshot.date}T${snapshot.startClock}` : ''
     const endDateTime = snapshot.endDateTime && snapshot.endClock ? `${snapshot.endDateTime}T${snapshot.endClock}` : ''
     draftSyncCountRef.current += 1
@@ -401,7 +479,13 @@ function EventEditor({
   const createSavePayload = (status, allowSimilar = false, sourceForm = form) => {
     const startDateTime = sourceForm.date && sourceForm.startClock ? `${sourceForm.date}T${sourceForm.startClock}` : ''
     const endDateTime = sourceForm.endDateTime && sourceForm.endClock ? `${sourceForm.endDateTime}T${sourceForm.endClock}` : ''
-    return { ...sourceForm, date: startDateTime, endDateTime, status, allowSimilar }
+    const registrationFields = (sourceForm.registrationFields || []).map((field) => ({
+      ...field,
+      options: field.type === 'select'
+        ? parseRegistrationOptions(registrationOptionsText[field.id] ?? (Array.isArray(field.options) ? field.options.join(', ') : ''))
+        : [],
+    }))
+    return { ...sourceForm, registrationFields, date: startDateTime, endDateTime, status, allowSimilar }
   }
 
   useEffect(() => {
@@ -489,6 +573,8 @@ function EventEditor({
     eventSubmit.preventDefault()
     setError('')
     try {
+      const registrationError = getRegistrationConfigurationError(formRef.current, registrationOptionsText)
+      if (registrationError) throw new Error(registrationError)
       if (bannerProcessing) throw new Error('Wait for the event banners to finish preparing before publishing.')
       const status = eventSubmit.nativeEvent.submitter?.dataset.status || 'Published'
       if (!publishedAtOpen) await draftSyncQueueRef.current.catch(() => undefined)
@@ -517,6 +603,8 @@ function EventEditor({
       return
     }
     try {
+      const registrationError = getRegistrationConfigurationError(formRef.current, registrationOptionsText)
+      if (registrationError) throw new Error(registrationError)
       await draftSyncQueueRef.current.catch(() => undefined)
       const draftForm = formRef.current
       const draftBanner = bannerRef.current || banner
@@ -549,6 +637,91 @@ function EventEditor({
           <label htmlFor="event-landmark">Landmark &amp; directions <span className="optional-field-label">Optional</span></label><textarea id="event-landmark" rows={2} value={form.venueLandmark} onChange={(eventChange) => update('venueLandmark', eventChange.target.value)} maxLength={240} placeholder="Add a nearby landmark or directions students can follow" />
           {form.category === 'seminars' && <><label htmlFor="event-meeting-url">Online seminar link (optional)</label><input id="event-meeting-url" type="url" inputMode="url" autoComplete="url" maxLength={2048} value={form.meetingUrl || ''} onChange={(eventChange) => update('meetingUrl', eventChange.target.value)} placeholder="https://meet.google.com/..." /><small className="profile-edit-limit">Students can open this link from the full event card.</small></>}
           <label htmlFor="event-info-url">More event info <span className="optional-field-label">Optional</span></label><input id="event-info-url" type="url" inputMode="url" autoComplete="url" maxLength={2048} value={form.infoUrl || ''} onChange={(eventChange) => update('infoUrl', eventChange.target.value)} placeholder="https://..." /><small className="profile-edit-limit">Add a page with registration, updates, or more details. Students can open it from the event card.</small>
+          <section className="registration-builder" aria-labelledby="registration-builder-title">
+            <div className="registration-builder-heading">
+              <div>
+                <h3 id="registration-builder-title">Custom attendee registration</h3>
+                <p>Collect details from attendees before confirming their RSVP.</p>
+              </div>
+              <label className="registration-builder-toggle" htmlFor="event-requires-registration">
+                <input
+                  id="event-requires-registration"
+                  type="checkbox"
+                  checked={form.requiresCustomRegistration === true}
+                  onChange={(eventChange) => setRegistrationEnabled(eventChange.target.checked)}
+                />
+                <span>Require form</span>
+              </label>
+            </div>
+            {form.requiresCustomRegistration && (
+              <div className="registration-builder-fields">
+                {(form.registrationFields || []).map((field, index) => (
+                  <fieldset className="registration-builder-field" key={field.id}>
+                    <legend>Question {index + 1}</legend>
+                    <label htmlFor={`registration-label-${field.id}`}>Question label</label>
+                    <input
+                      id={`registration-label-${field.id}`}
+                      type="text"
+                      maxLength={120}
+                      value={field.label || ''}
+                      onChange={(eventChange) => updateRegistrationField(field.id, { label: eventChange.target.value })}
+                      placeholder="e.g. Department"
+                      required
+                    />
+                    <label htmlFor={`registration-type-${field.id}`}>Answer type</label>
+                    <select
+                      id={`registration-type-${field.id}`}
+                      value={field.type}
+                      onChange={(eventChange) => {
+                        const type = eventChange.target.value
+                        updateRegistrationField(field.id, { type, options: type === 'select' ? field.options || [] : [] })
+                        if (type !== 'select') {
+                          setRegistrationOptionsText((current) => ({ ...current, [field.id]: '' }))
+                        }
+                      }}
+                    >
+                      <option value="text">Short text</option>
+                      <option value="select">Dropdown select</option>
+                      <option value="number">Number</option>
+                    </select>
+                    {field.type === 'select' && (
+                      <>
+                        <label htmlFor={`registration-options-${field.id}`}>Dropdown options</label>
+                        <input
+                          id={`registration-options-${field.id}`}
+                          type="text"
+                          value={registrationOptionsText[field.id] ?? (Array.isArray(field.options) ? field.options.join(', ') : '')}
+                          onChange={(eventChange) => {
+                            const value = eventChange.target.value
+                            setRegistrationOptionsText((current) => ({ ...current, [field.id]: value }))
+                            updateRegistrationField(field.id, { options: parseRegistrationOptions(value) })
+                          }}
+                          maxLength={3650}
+                          placeholder="e.g. 100, 200, 300"
+                          aria-describedby={`registration-options-hint-${field.id}`}
+                          required
+                        />
+                        <small id={`registration-options-hint-${field.id}`} className="registration-builder-hint">Separate each option with a comma. Add at least two.</small>
+                      </>
+                    )}
+                    <label className="registration-builder-required" htmlFor={`registration-required-${field.id}`}>
+                      <input
+                        id={`registration-required-${field.id}`}
+                        type="checkbox"
+                        checked={field.required !== false}
+                        onChange={(eventChange) => updateRegistrationField(field.id, { required: eventChange.target.checked })}
+                      />
+                      Required question
+                    </label>
+                    <button type="button" className="registration-builder-remove" onClick={() => removeRegistrationField(field.id)}>
+                      Remove question
+                    </button>
+                  </fieldset>
+                ))}
+                <button type="button" className="registration-builder-add" onClick={addRegistrationField}>＋ Add question</button>
+              </div>
+            )}
+          </section>
           <label htmlFor="event-banner">Event banner (optional)</label>
           <input ref={bannerInput} id="event-banner" type="file" accept="image/*" multiple hidden onChange={async (eventChange) => {
             const files = Array.from(eventChange.target.files || [])

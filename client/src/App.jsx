@@ -492,6 +492,9 @@ function FutaPulseApp() {
     const knownAccounts = readStored('futapulse-known-accounts', [])
     return Boolean((Array.isArray(knownAccounts) && knownAccounts.length) || readStoredValue('futapulse-remembered-username'))
   })
+  const [authWelcomeMode, setAuthWelcomeMode] = useState(() => requestedAuthMode === 'signup'
+    ? 'signup'
+    : requestedAuthMode === 'login' || hasDeviceAccount ? 'login' : 'signup')
   const [activeTab, setActiveTab] = useState(() => {
     const requestedTab = window.location.hash.replace('#', '') || 'home'
     if (initialEventId) return 'home'
@@ -803,7 +806,7 @@ function FutaPulseApp() {
     } catch (error) {
       console.warn('Unable to clear the temporary FUTApulse sign-in details.', error)
     }
-    setGuestSignInRequested(false)
+    setGuestSignInRequested(true)
     appTourAutoStarted.current = ''
     setAppTourOpen(false)
     setSession(null)
@@ -811,6 +814,7 @@ function FutaPulseApp() {
     setProfile(null)
     setRememberedUsername('')
     setSessionLoading(false)
+    setAuthWelcomeMode('login')
     setActiveTab('home')
     setExpandedHomeCategory('')
     setHomeCategory('all')
@@ -842,7 +846,7 @@ function FutaPulseApp() {
     setSettingsPage('menu')
     setEventDuplicateState({ code: '', matches: [] })
     const currentUrl = new URL(window.location.href)
-    currentUrl.searchParams.delete('auth')
+    currentUrl.searchParams.set('auth', 'login')
     currentUrl.hash = 'home'
     window.history.replaceState(window.history.state || {}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`)
     notify(typeof message === 'string' ? message : 'You’re signed out. You can continue browsing public campus events.')
@@ -973,6 +977,7 @@ function FutaPulseApp() {
 
   const persistSession = useCallback((auth, remember = false) => {
     const nextSession = { token: auth.token, user: auth.user }
+    setGuestSignInRequested(false)
     setSession(nextSession)
     setUser(auth.user)
     const nextProfile = auth.user.profile || null
@@ -993,6 +998,10 @@ function FutaPulseApp() {
       setRememberedUsername('')
     }
     setSessionLoading(false)
+    const currentUrl = new URL(window.location.href)
+    currentUrl.searchParams.delete('auth')
+    currentUrl.hash = 'home'
+    window.history.replaceState(window.history.state || {}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`)
   }, [])
 
   useEffect(() => {
@@ -2841,6 +2850,8 @@ function FutaPulseApp() {
       venueLandmark: eventData.venueLandmark || '',
       meetingUrl: eventData.meetingUrl || '',
       infoUrl: eventData.infoUrl || '',
+      requiresCustomRegistration: eventData.requiresCustomRegistration === true,
+      registrationFields: Array.isArray(eventData.registrationFields) ? eventData.registrationFields : [],
       status: 'Draft',
       ...(eventData.clientRequestId ? { clientRequestId: eventData.clientRequestId } : {}),
       ...(editing ? { expectedRevision: eventData.revision } : {}),
@@ -2944,6 +2955,8 @@ function FutaPulseApp() {
         venueLandmark: eventData.venueLandmark || '',
         meetingUrl: eventData.meetingUrl || '',
         infoUrl: eventData.infoUrl || '',
+        requiresCustomRegistration: eventData.requiresCustomRegistration === true,
+        registrationFields: Array.isArray(eventData.registrationFields) ? eventData.registrationFields : [],
         status,
         allowSimilar,
         ...(eventData.clientRequestId ? { clientRequestId: eventData.clientRequestId } : {}),
@@ -3063,7 +3076,7 @@ function FutaPulseApp() {
         <div className="auth-app-frame">
           <AuthScreen
             initialUsername={rememberedUsername}
-            initialMode={requestedAuthMode === 'login' ? 'login' : requestedAuthMode === 'signup' || !hasDeviceAccount ? 'signup' : 'login'}
+            initialMode={authWelcomeMode}
             onAuthenticated={(auth, remember, message) => {
               persistSession(auth, remember)
               notify(message, 'success')
@@ -3073,6 +3086,7 @@ function FutaPulseApp() {
           />
         </div>
         <footer className="auth-legal-footer" aria-label="Legal and information links">
+          <a href="/">Browse public events</a>
           <a href="/privacy">Privacy</a>
           <a href="/terms">Terms</a>
           <a href="/about">About &amp; Contact</a>

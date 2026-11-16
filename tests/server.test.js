@@ -123,6 +123,7 @@ test("Phase 2 migration plan includes only Immanuel's approved accounts and thei
 
 test("Phase 2 Mongo models define event lookup and per-account action uniqueness indexes", () => {
   const eventIndexes = models.EventRecord.schema.indexes();
+  const registrationIndexes = models.EventRegistration.schema.indexes();
   const actionIndexes = models.EngagementAction.schema.indexes();
   const reportIndexes = models.EventReport.schema.indexes();
   const viewIndexes = models.EventView.schema.indexes();
@@ -132,6 +133,11 @@ test("Phase 2 Mongo models define event lookup and per-account action uniqueness
 
   assert.ok(eventIndexes.some(([fields]) => fields.eventId === 1));
   assert.ok(eventIndexes.some(([fields]) => fields.status === 1 && fields.endsAt === 1));
+  assert.equal(models.EventRecord.schema.path("requiresCustomRegistration").defaultValue, false);
+  assert.equal(models.EventRecord.schema.path("registrationFields").defaultValue.length, 0);
+  assert.ok(registrationIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && options.unique));
+  assert.equal(models.EventRegistration.schema.path("eventId").options.ref, "FutapulseEvent");
+  assert.equal(models.EventRegistration.schema.path("userId").options.ref, "FutapulseUser");
   assert.ok(actionIndexes.some(([fields, options]) => fields.eventId === 1 && fields.userId === 1 && fields.type === 1 && options.unique));
   assert.ok(actionIndexes.some(([fields]) => fields.eventId === 1 && fields.type === 1 && fields.updatedAt === 1));
   assert.ok(reportIndexes.some(([fields]) => fields.eventId === 1));
@@ -805,6 +811,182 @@ test.before(async () => {
 test.after(async () => {
   await new Promise((resolve) => server.close(resolve));
   fs.rmSync(dataDirectory, { recursive: true, force: true });
+});
+
+test("custom event registration validates event forms, records attendee answers, and protects organizer responses", async () => {
+  const originalDatabase = fs.readFileSync(dataFile, "utf8");
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const organizer = await createVerifiedAccount(baseUrl, "registration-organizer@futa.edu.ng", "registration_organizer");
+    const attendee = await createVerifiedAccount(baseUrl, "registration-attendee@futa.edu.ng", "registration_attendee");
+    const database = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+    const organizerRecord = database.users.find((item) => item.id === organizer.user.id);
+    organizerRecord.profile = {
+      name: "Registration Organizer",
+      faculty: "SESE",
+      department: "Computer Science",
+      level: "400",
+      role: "explorer"
+    };
+    fs.writeFileSync(dataFile, JSON.stringify(database, null, 2));
+    const organizerHeaders = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${organizer.token}`
+    };
+    const attendeeHeaders = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${attendee.token}`
+    };
+    assert.equal((await fetch(`${baseUrl}/api/events/registration-test/register`, { method: "POST" })).status, 401);
+    assert.equal((await fetch(`${baseUrl}/api/events/registration-test/registrations`)).status, 401);
+    const fields = [
+      { id: "department", label: "Department", type: "text", required: true },
+      { id: "level", label: "Level", type: "select", options: ["200", "300", "400"], required: true },
+      { id: "groupSize", label: "Group size", type: "number", required: false }
+    ];
+    const invalidConfiguration = await fetch(`${baseUrl}/api/events`, {
+      method: "POST",
+      headers: organizerHeaders,
+      body: JSON.stringify({
+        title: "Invalid registration form",
+        status: "Draft",
+        requiresCustomRegistration: true,
+        registrationFields: [{ id: "faculty", label: "Faculty", type: "select", options: ["SESE"] }]
+      })
+    });
+    assert.equal(invalidConfiguration.status, 400);
+
+    const createResponse = await fetch(`${baseUrl}/api/events`, {
+      method: "POST",
+      headers: organizerHeaders,
+      body: JSON.stringify({
+        title: "Native registration integration",
+        status: "Draft",
+        requiresCustomRegistration: true,
+        registrationFields: fields
+      })
+    });
+    assert.equal(createResponse.status, 201);
+    const createdEvent = (await createResponse.json()).event;
+    assert.equal(createdEvent.requiresCustomRegistration, true);
+    assert.deepEqual(createdEvent.registrationFields, fields.map((field) => ({ ...field, options: field.options || [], required: field.required !== false })));
+
+    const invalidUpdate = await fetch(`${baseUrl}/api/events/${createdEvent.id}`, {
+      method: "PUT",
+      headers: organizerHeaders,
+      body: JSON.stringify({
+        expectedRevision: createdEvent.revision,
+        registrationFields: [{ id: "level", label: "Level", type: "select", options: ["300"] }]
+      })
+    });
+    assert.equal(invalidUpdate.status, 400);
+
+    const updateResponse = await fetch(`${baseUrl}/api/events/${createdEvent.id}`, {
+      method: "PUT",
+      headers: organizerHeaders,
+      body: JSON.stringify({
+        expectedRevision: createdEvent.revision,
+        registrationFields: fields.map((field) => field.id === "groupSize" ? { ...field, required: true } : field)
+      })
+    });
+    assert.equal(updateResponse.status, 200);
+    const updatedEvent = (await updateResponse.json()).event;
+    assert.equal(updatedEvent.registrationFields.find((field) => field.id === "groupSize").required, true);
+
+    const startTime = new Date(Date.now() + 60 * 60_000).toISOString();
+    const publishResponse = await fetch(`${baseUrl}/api/events/${createdEvent.id}`, {
+      method: "PATCH",
+      headers: organizerHeaders,
+      body: JSON.stringify({
+        expectedRevision: updatedEvent.revision,
+        title: "Native registration integration",
+        category: "social",
+        activity: "Custom registration test",
+        date: startTime,
+        startTime,
+        endTime: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+        venue: "Registration Hall",
+        audience: ["all"],
+        status: "Published",
+        allowSimilar: true
+      })
+    });
+    assert.equal(publishResponse.status, 200);
+
+    const registrationUrl = `${baseUrl}/api/events/${createdEvent.id}/register`;
+    const missingAnswer = await fetch(registrationUrl, {
+      method: "POST",
+      headers: attendeeHeaders,
+      body: JSON.stringify({ answers: { department: "EEE", level: "300" } })
+    });
+    assert.equal(missingAnswer.status, 400);
+    const invalidChoice = await fetch(registrationUrl, {
+      method: "POST",
+      headers: attendeeHeaders,
+      body: JSON.stringify({ answers: { department: "EEE", level: "100", groupSize: 2 } })
+    });
+    assert.equal(invalidChoice.status, 400);
+
+    const bypassRsvp = await fetch(`${baseUrl}/api/events/${createdEvent.id}/engagement`, {
+      method: "PATCH",
+      headers: attendeeHeaders,
+      body: JSON.stringify({ type: "rsvp", attending: true })
+    });
+    assert.equal(bypassRsvp.status, 409);
+    assert.equal((await bypassRsvp.json()).code, "CUSTOM_REGISTRATION_REQUIRED");
+
+    const registrationResponse = await fetch(registrationUrl, {
+      method: "POST",
+      headers: attendeeHeaders,
+      body: JSON.stringify({ answers: { department: " EEE ", level: "300", groupSize: 2 } })
+    });
+    assert.equal(registrationResponse.status, 201);
+    const registrationBody = await registrationResponse.json();
+    assert.equal(registrationBody.event.rsvpCount, 1);
+    assert.deepEqual(registrationBody.registration.answers, [
+      { fieldId: "department", label: "Department", answer: "EEE" },
+      { fieldId: "level", label: "Level", answer: "300" },
+      { fieldId: "groupSize", label: "Group size", answer: 2 }
+    ]);
+
+    const duplicateResponse = await fetch(registrationUrl, {
+      method: "POST",
+      headers: attendeeHeaders,
+      body: JSON.stringify({ answers: { department: "EEE", level: "300", groupSize: 2 } })
+    });
+    assert.equal(duplicateResponse.status, 409);
+    assert.match((await duplicateResponse.json()).error, /already registered/i);
+
+    const cancelAttendance = await fetch(`${baseUrl}/api/events/${createdEvent.id}/engagement`, {
+      method: "PATCH",
+      headers: attendeeHeaders,
+      body: JSON.stringify({ type: "rsvp", attending: false })
+    });
+    assert.equal(cancelAttendance.status, 200);
+    assert.equal((await cancelAttendance.json()).event.rsvpCount, 0);
+    const reRegistration = await fetch(registrationUrl, {
+      method: "POST",
+      headers: attendeeHeaders,
+      body: JSON.stringify({ answers: { department: "EEE", level: "300", groupSize: 2 } })
+    });
+    assert.equal(reRegistration.status, 201);
+    assert.equal((await reRegistration.json()).event.rsvpCount, 1);
+
+    const attendeeRead = await fetch(`${baseUrl}/api/events/${createdEvent.id}/registrations`, {
+      headers: attendeeHeaders
+    });
+    assert.equal(attendeeRead.status, 403);
+    const organizerRead = await fetch(`${baseUrl}/api/events/${createdEvent.id}/registrations`, {
+      headers: { Authorization: `Bearer ${organizer.token}` }
+    });
+    assert.equal(organizerRead.status, 200);
+    const organizerReadBody = await organizerRead.json();
+    assert.equal(organizerReadBody.registrations.length, 1);
+    assert.equal(organizerReadBody.registrations[0].user.username, attendee.user.username);
+    assert.equal(organizerReadBody.registrations[0].user.email, undefined);
+  } finally {
+    fs.writeFileSync(dataFile, originalDatabase);
+  }
 });
 
 test("GET /api/events/hot includes every event with RSVPs from over half of profile-complete verified accounts", async () => {

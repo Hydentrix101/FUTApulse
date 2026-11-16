@@ -16,6 +16,7 @@ test("Mongo replica-set event edits and notification outbox are durable and conf
   const ownerEmail = `integration-${crypto.randomUUID()}@example.test`;
   const eventIds = [];
   let owner;
+  let attendee;
   let server;
   let accountRateLimitHash = "";
 
@@ -37,6 +38,12 @@ test("Mongo replica-set event edits and notification outbox are durable and conf
         hasCompletedTour: true
       }
     });
+    attendee = await models.User.create({
+      email: `registrant-${crypto.randomUUID()}@example.test`,
+      emailVerified: true,
+      username: `reg_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`,
+      profile: { name: "Mongo Registrant", faculty: "SESE", department: "EEE", level: "300" }
+    });
     accountRateLimitHash = crypto.createHash("sha256").update(`user:${owner._id}`).digest("hex");
     const accessToken = jwt.sign({
       sub: String(owner._id),
@@ -48,6 +55,15 @@ test("Mongo replica-set event edits and notification outbox are durable and conf
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`
+    };
+    const attendeeHeaders = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${jwt.sign({
+        sub: String(attendee._id),
+        username: attendee.username,
+        sessionVersion: 0,
+        tokenUse: "access"
+      }, process.env.JWT_SECRET, { expiresIn: "15m" })}`
     };
 
     const draftResponse = await fetch(`${baseUrl}/api/events`, {
@@ -88,7 +104,12 @@ test("Mongo replica-set event edits and notification outbox are durable and conf
         endTime: endsAt.toISOString(),
         venue: "Integration venue",
         status: "Published",
-        audience: ["all"]
+        audience: ["all"],
+        requiresCustomRegistration: true,
+        registrationFields: [
+          { id: "department", label: "Department", type: "text", required: true, options: [] },
+          { id: "level", label: "Level", type: "select", required: true, options: ["200", "300", "400"] }
+        ]
       })
     });
     assert.equal(publishResponse.status, 201);
@@ -101,7 +122,32 @@ test("Mongo replica-set event edits and notification outbox are durable and conf
       type: "new-event"
     }).lean().exec();
     assert.ok(persistedEvent, "event record should be committed");
+    assert.equal(persistedEvent.requiresCustomRegistration, true);
     assert.ok(outboxEntry, "notification intent should be committed with the event");
+
+    const registrationUrl = `${baseUrl}/api/events/${published.id}/register`;
+    const registrationResponse = await fetch(registrationUrl, {
+      method: "POST",
+      headers: attendeeHeaders,
+      body: JSON.stringify({ answers: { department: "EEE", level: "300" } })
+    });
+    assert.equal(registrationResponse.status, 201);
+    assert.equal((await registrationResponse.json()).event.rsvpCount, 1);
+    const duplicateRegistration = await fetch(registrationUrl, {
+      method: "POST",
+      headers: attendeeHeaders,
+      body: JSON.stringify({ answers: { department: "EEE", level: "300" } })
+    });
+    assert.equal(duplicateRegistration.status, 409);
+    const attendeeRead = await fetch(`${baseUrl}/api/events/${published.id}/registrations`, {
+      headers: attendeeHeaders
+    });
+    assert.equal(attendeeRead.status, 403);
+    const organizerRead = await fetch(`${baseUrl}/api/events/${published.id}/registrations`, { headers });
+    assert.equal(organizerRead.status, 200);
+    assert.equal((await organizerRead.json()).registrations[0].user.username, attendee.username);
+    assert.ok(await models.EventRegistration.exists({ eventId: persistedEvent._id, userId: attendee._id }));
+    assert.ok(await models.EngagementAction.exists({ eventId: published.id, userId: String(attendee._id), type: "rsvp" }));
     const rateLimitWindowStart = Math.floor(Date.now() / (60 * 60 * 1000)) * (60 * 60 * 1000);
     const rateLimitBucket = await models.ApiRateLimitBucket.findById(`${rateLimitWindowStart}:${accountRateLimitHash}`).lean().exec();
     assert.ok(rateLimitBucket?.totalHits >= 4, "event mutation limits should be stored in MongoDB per account");
@@ -121,11 +167,17 @@ test("Mongo replica-set event edits and notification outbox are durable and conf
     assert.equal(completedOutbox.status, "completed");
   } finally {
     if (owner && mongoose.connection.readyState === 1) {
+      const eventRecords = await models.EventRecord.find({ eventId: { $in: eventIds } }).select("_id").lean().exec();
       await Promise.all([
+        eventRecords.length
+          ? models.EventRegistration.deleteMany({ eventId: { $in: eventRecords.map((item) => item._id) } }).exec()
+          : Promise.resolve(),
         models.EventRecord.deleteMany({ eventId: { $in: eventIds } }).exec(),
+        models.EngagementAction.deleteMany({ eventId: { $in: eventIds } }).exec(),
         models.NotificationOutbox.deleteMany({ eventId: { $in: eventIds } }).exec(),
         models.NotificationJob.deleteMany({ eventId: { $in: eventIds } }).exec(),
         ...(accountRateLimitHash ? [models.ApiRateLimitBucket.deleteMany({ keyHash: accountRateLimitHash }).exec()] : []),
+        attendee ? models.User.deleteOne({ _id: attendee._id }).exec() : Promise.resolve(),
         models.User.deleteOne({ _id: owner._id }).exec()
       ]);
     }
