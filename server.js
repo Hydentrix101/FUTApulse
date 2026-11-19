@@ -2137,6 +2137,10 @@ function isEventVisibleToFeed(event, viewerId, now = Date.now()) {
 async function listStoredEvents(viewerId = "", onlyVisible = false, pageOptions = null) {
   if (!isMongoConnected()) {
     const database = readDatabase();
+    const eventRegistrations = database.eventRegistrations || [];
+    const registeredEventIds = new Set(eventRegistrations
+      .filter((registration) => viewerId && String(registration.userId) === String(viewerId))
+      .map((registration) => String(registration.eventId)));
     const facultyByUserId = new Map((database.users || [])
       .map((user) => [String(user.id), String(user.profile?.faculty || "").trim()])
       .filter(([, faculty]) => faculty));
@@ -2144,12 +2148,21 @@ async function listStoredEvents(viewerId = "", onlyVisible = false, pageOptions 
       const attendees = Array.isArray(event.attendeeUserIds)
         ? [...new Set(event.attendeeUserIds.map(String))].map((userId) => ({ userId }))
         : [];
-      return attendees.length
+      const eventWithRegistration = viewerId
         ? {
           ...event,
-          turnoutBreakdown: buildFacultyTurnoutBreakdown(attendees, facultyByUserId)
+          isRegistered: Boolean(event.requiresCustomRegistration && registeredEventIds.has(String(event.id))),
+          ...(event.requiresCustomRegistration && String(event.createdByUserId || "") === String(viewerId)
+            ? { registrationCount: eventRegistrations.filter((registration) => String(registration.eventId) === String(event.id)).length }
+            : {})
         }
         : event;
+      return attendees.length
+        ? {
+          ...eventWithRegistration,
+          turnoutBreakdown: buildFacultyTurnoutBreakdown(attendees, facultyByUserId)
+        }
+        : eventWithRegistration;
     });
     if (!pageOptions) return localEvents;
     const selected = localEvents
@@ -2243,10 +2256,41 @@ async function listStoredEvents(viewerId = "", onlyVisible = false, pageOptions 
     ? { events: [], ...pageResult }
     : events;
   const eventIds = events.map((event) => String(event.id));
-  const actions = await EngagementAction.find({ eventId: { $in: eventIds } })
-    .select("eventId userId type faculty department")
-    .lean()
-    .exec();
+  const customEventRecords = records.filter((record) => (
+    record.requiresCustomRegistration ?? record.record?.requiresCustomRegistration
+  ));
+  const customRecordIds = customEventRecords.map((record) => record._id).filter(Boolean);
+  const ownerCustomEventRecords = customEventRecords.filter((record) => (
+    viewerId && String(record.ownerUserId || record.record?.createdByUserId || "") === String(viewerId)
+  ));
+  const ownerCustomRecordIds = ownerCustomEventRecords.map((record) => record._id).filter(Boolean);
+  const [actions, registrations, registrationCounts] = await Promise.all([
+    EngagementAction.find({ eventId: { $in: eventIds } })
+      .select("eventId userId type faculty department")
+      .lean()
+      .exec(),
+    viewerId && mongoose.isValidObjectId(viewerId) && customRecordIds.length
+      ? EventRegistration.find({
+        eventId: { $in: customRecordIds },
+        userId: new mongoose.Types.ObjectId(viewerId)
+      }).select("eventId").lean().exec()
+      : Promise.resolve([]),
+    ownerCustomRecordIds.length
+      ? EventRegistration.aggregate([
+        { $match: { eventId: { $in: ownerCustomRecordIds } } },
+        { $group: { _id: "$eventId", count: { $sum: 1 } } }
+      ]).exec()
+      : Promise.resolve([])
+  ]);
+  const eventIdByRecordId = new Map(customEventRecords.map((record) => [String(record._id), String(record.eventId)]));
+  const registeredEventIds = new Set(registrations
+    .map((registration) => eventIdByRecordId.get(String(registration.eventId)))
+    .filter(Boolean));
+  const eventIdByOwnerRecordId = new Map(ownerCustomEventRecords.map((record) => [String(record._id), String(record.eventId)]));
+  const registrationCountsByEventId = new Map(registrationCounts.map((item) => [
+    eventIdByOwnerRecordId.get(String(item._id)),
+    item.count
+  ]));
   const actionsByEvent = new Map();
   for (const action of actions) {
     if (!actionsByEvent.has(action.eventId)) actionsByEvent.set(action.eventId, []);
@@ -2282,7 +2326,11 @@ async function listStoredEvents(viewerId = "", onlyVisible = false, pageOptions 
       turnoutBreakdown: buildFacultyTurnoutBreakdown(attendees, facultyByUserId),
       attendeeUserIds: viewerId && attendees.some((action) => String(action.userId) === String(viewerId)) ? [String(viewerId)] : [],
       hypedUserIds: viewerId && hyped.some((action) => String(action.userId) === String(viewerId)) ? [String(viewerId)] : [],
-      reminderUserIds: viewerId && reminders.some((action) => String(action.userId) === String(viewerId)) ? [String(viewerId)] : []
+      reminderUserIds: viewerId && reminders.some((action) => String(action.userId) === String(viewerId)) ? [String(viewerId)] : [],
+      ...(viewerId ? { isRegistered: registeredEventIds.has(String(event.id)) } : {}),
+      ...(registrationCountsByEventId.has(String(event.id))
+        ? { registrationCount: registrationCountsByEventId.get(String(event.id)) }
+        : {})
     };
   });
   return pageOptions

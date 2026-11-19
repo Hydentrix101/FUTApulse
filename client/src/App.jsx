@@ -4,6 +4,8 @@ import {
   MapPin, Search, Shield, Sparkles, Trash2, User, X,
 } from 'lucide-react'
 import AuthScreen from './components/AuthScreen'
+import CustomRegistrationModal from './components/CustomRegistrationModal'
+import OrganizerRegistrationsModal from './components/OrganizerRegistrationsModal'
 import CountdownPill from './components/CountdownPill'
 import AdSlot from './components/AdSlot'
 import BrandHeart from './components/BrandHeart'
@@ -150,7 +152,10 @@ function readInitialEventCache() {
   }
   const cachedEvents = readStored('futapulse-events', [])
   return Array.isArray(cachedEvents)
-    ? cachedEvents.filter((event) => ['Published', 'Live'].includes(event?.status)).slice(0, MAX_CACHED_EVENTS)
+    ? cachedEvents
+      .filter((event) => ['Published', 'Live'].includes(event?.status))
+      .slice(0, MAX_CACHED_EVENTS)
+      .map((event) => ({ ...event, isRegistered: false }))
     : []
 }
 const reportedStorageWriteFailures = new Set()
@@ -204,7 +209,7 @@ function storeEventCache(events) {
   let cacheCharacters = 2
   const publicEvents = (Array.isArray(events) ? events : []).filter((event) => ['Published', 'Live'].includes(event?.status))
   for (const event of publicEvents.slice(0, MAX_CACHED_EVENTS)) {
-    const serializedEvent = JSON.stringify(withoutInlineImages(event))
+    const serializedEvent = JSON.stringify(withoutInlineImages({ ...event, isRegistered: undefined }))
     const nextSize = cacheCharacters + serializedEvent.length + (compactEvents.length ? 1 : 0)
     if (nextSize > MAX_EVENT_CACHE_CHARACTERS) break
     compactEvents.push(serializedEvent)
@@ -564,6 +569,11 @@ function FutaPulseApp() {
   const [engagementRetryTick, setEngagementRetryTick] = useState(0)
   const [reminderTarget, setReminderTarget] = useState(null)
   const [detailEvent, setDetailEvent] = useState(null)
+  const [customRegistrationTarget, setCustomRegistrationTarget] = useState(null)
+  const [organizerRegistrationTarget, setOrganizerRegistrationTarget] = useState(null)
+  const [organizerRegistrations, setOrganizerRegistrations] = useState([])
+  const [organizerRegistrationsLoading, setOrganizerRegistrationsLoading] = useState(false)
+  const [organizerRegistrationsError, setOrganizerRegistrationsError] = useState('')
   const [reportTarget, setReportTarget] = useState(null)
   const [reportReason, setReportReason] = useState('inappropriate')
   const [reportDetails, setReportDetails] = useState('')
@@ -646,8 +656,11 @@ function FutaPulseApp() {
   const recapPhotoInput = useRef(null)
   const engagementInFlight = useRef(false)
   const viewedEventIdsRef = useRef(new Set())
+  const organizerRegistrationRequestVersion = useRef(0)
   const userRef = useRef(user)
-  userRef.current = user
+  useEffect(() => {
+    userRef.current = user
+  }, [user])
 
   const notify = useCallback((message, type = 'info') => {
     setToast({ message, type })
@@ -819,6 +832,12 @@ function FutaPulseApp() {
     setExpandedHomeCategory('')
     setHomeCategory('all')
     setDetailEvent(null)
+    setCustomRegistrationTarget(null)
+    organizerRegistrationRequestVersion.current += 1
+    setOrganizerRegistrationTarget(null)
+    setOrganizerRegistrations([])
+    setOrganizerRegistrationsError('')
+    setOrganizerRegistrationsLoading(false)
     setActiveEventAlert(null)
     setPendingFullEventId('')
     setNotificationFeedEventId('')
@@ -828,6 +847,7 @@ function FutaPulseApp() {
     setEvents((current) => current.map((event) => ({
       ...event,
       isGoing: false,
+      isRegistered: false,
       isHyped: false,
       isReminded: false,
       viewCount: undefined,
@@ -850,7 +870,22 @@ function FutaPulseApp() {
     currentUrl.hash = 'home'
     window.history.replaceState(window.history.state || {}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`)
     notify(typeof message === 'string' ? message : 'You’re signed out. You can continue browsing public campus events.')
-  }, [notify, setProfileMenuOpen])
+  }, [
+    notify,
+    setActiveEventAlert,
+    setDetailEvent,
+    setEventDuplicateState,
+    setEventEditor,
+    setOrganizerRegistrationTarget,
+    setOrganizerRegistrations,
+    setOrganizerRegistrationsError,
+    setOrganizerRegistrationsLoading,
+    setOrganizerBroadcastTarget,
+    setProfileMenuOpen,
+    setReminderTarget,
+    setReportTarget,
+    setSettingsPage,
+  ])
 
   useEffect(() => {
     const updateVisibility = () => setDocumentVisible(!document.hidden)
@@ -1766,9 +1801,112 @@ function FutaPulseApp() {
     if (!silent) notify(nextValue ? 'Event reminder saved.' : 'Event reminder removed.', nextValue ? 'success' : 'info')
   }, [reminderIds, remindEventIds, notify, queueEngagement, session])
 
-  const handleRsvp = useCallback(async (id) => {
+  const closeCustomRegistration = useCallback(() => setCustomRegistrationTarget(null), [])
+
+  const loadOrganizerRegistrations = useCallback(async (event) => {
+    const rawEventId = getEventId(event)
+    if (!rawEventId || !session?.token) {
+      setOrganizerRegistrationsError('Sign in again to view attendee registrations.')
+      return
+    }
+    const requestVersion = ++organizerRegistrationRequestVersion.current
+    setOrganizerRegistrationsLoading(true)
+    setOrganizerRegistrationsError('')
+    try {
+      const result = await apiRequest(`/api/events/${encodeURIComponent(String(rawEventId))}/registrations`, {
+        timeoutMs: 15000,
+      }, session.token)
+      if (requestVersion !== organizerRegistrationRequestVersion.current) return
+      if (!Array.isArray(result.registrations)) throw new Error('The server returned an invalid registrations response.')
+      setOrganizerRegistrations(result.registrations)
+      setEvents((current) => current.map((item) => String(getEventId(item)) === String(rawEventId)
+        ? { ...item, registrationCount: result.registrations.length }
+        : item))
+    } catch (error) {
+      if (requestVersion !== organizerRegistrationRequestVersion.current) return
+      setOrganizerRegistrationsError(error.message || 'Unable to load registrations. Check your connection and try again.')
+    } finally {
+      if (requestVersion === organizerRegistrationRequestVersion.current) setOrganizerRegistrationsLoading(false)
+    }
+  }, [session])
+
+  const openOrganizerRegistrations = useCallback((event) => {
+    setOrganizerRegistrationTarget(event)
+    setOrganizerRegistrations([])
+    setOrganizerRegistrationsError('')
+    void loadOrganizerRegistrations(event)
+  }, [loadOrganizerRegistrations])
+
+  const closeOrganizerRegistrations = useCallback(() => {
+    organizerRegistrationRequestVersion.current += 1
+    setOrganizerRegistrationsLoading(false)
+    setOrganizerRegistrationTarget(null)
+  }, [])
+
+  const handleCustomRegistration = useCallback(async (answers) => {
+    if (!customRegistrationTarget) {
+      throw new Error('This event is no longer available for registration.')
+    }
+    const rawEventId = getEventId(customRegistrationTarget)
+    if (!rawEventId) throw new Error('This event is no longer available for registration.')
+    const eventId = String(rawEventId)
+    if (!session?.token) throw new Error('Sign in to register for this event.')
+    try {
+      const result = await apiRequest(`/api/events/${encodeURIComponent(eventId)}/register`, {
+        method: 'POST',
+        body: JSON.stringify({ answers }),
+        timeoutMs: 15000,
+      }, session.token)
+      if (!result.event) throw new Error('The server did not confirm your registration.')
+      setGoingIds((current) => current.includes(eventId) ? current : [...current, eventId])
+      setEvents((current) => current.map((event) => String(getEventId(event)) === eventId
+        ? { ...event, ...result.event, isGoing: true }
+        : event))
+      setDetailEvent((current) => current && String(getEventId(current)) === eventId
+        ? { ...current, ...result.event, isGoing: true }
+        : current)
+      if (notifications.reminders !== false) primeAlarmAudio()
+      notify('Your registration and attendance were confirmed.', 'success')
+      return { success: true }
+    } catch (error) {
+      if (error.status === 409 && /already registered/i.test(error.message)) {
+        setGoingIds((current) => current.includes(eventId) ? current : [...current, eventId])
+        setEvents((current) => current.map((event) => String(getEventId(event)) === eventId
+          ? { ...event, isGoing: true, isRegistered: true }
+          : event))
+        setDetailEvent((current) => current && String(getEventId(current)) === eventId
+          ? { ...current, isGoing: true, isRegistered: true }
+          : current)
+        notify('You are already registered for this event.', 'info')
+        return { alreadyRegistered: true }
+      }
+      notify(error.message || 'Unable to submit your registration. Please try again.', 'error')
+      throw error
+    }
+  }, [customRegistrationTarget, notifications.reminders, notify, primeAlarmAudio, session, setDetailEvent])
+
+  const handleRsvp = useCallback(async (id, _position, eventData) => {
     if (id === undefined || id === null) return
     const eventId = String(id)
+    const targetEvent = eventData
+      || events.find((event) => String(getEventId(event)) === eventId)
+      || (detailEvent && String(getEventId(detailEvent)) === eventId ? detailEvent : null)
+    if (targetEvent?.requiresCustomRegistration === true) {
+      if (!session?.token) {
+        notify('Sign in to register for this event.', 'error')
+        return
+      }
+      if (targetEvent.isRegistered !== true) {
+        if (targetEvent.isRegistered !== false && (goingIds.includes(eventId) || targetEvent.isGoing === true)) {
+          notify('You are already registered for this event.', 'info')
+          return
+        }
+        if (!customRegistrationTarget || String(getEventId(customRegistrationTarget)) !== eventId) {
+          setCustomRegistrationTarget(targetEvent)
+        }
+        return
+      }
+    }
     if (onlineEngagementsInFlight.current.has(`rsvp:${eventId}`)) return
     if (!navigator.onLine) {
       notify('Connect to the internet to update the attendance count. No change was made.', 'error')
@@ -1796,7 +1934,7 @@ function FutaPulseApp() {
     } finally {
       onlineEngagementsInFlight.current.delete(`rsvp:${eventId}`)
     }
-  }, [goingIds, notifications.reminders, primeAlarmAudio, notify, session])
+  }, [customRegistrationTarget, detailEvent, events, goingIds, notifications.reminders, primeAlarmAudio, notify, session])
 
   const showEventAlert = useCallback((event, kind) => {
     if (!event) return
@@ -3238,7 +3376,7 @@ function FutaPulseApp() {
                         : listedEvents
                       return fullEvents.length ? <>{fullEvents.slice(0, visibleFullFeedCount).map((event, index) => <Fragment key={getEventId(event)}>
                         <div id={`home-full-event-${getEventId(event)}`} className={`home-full-event-anchor ${homeCategory !== 'all' ? 'is-below-sticky-filter' : ''} ${String(getEventId(event)) === highlightedNotificationEventId ? 'is-notification-highlighted' : ''}`}>
-                          <LazyEventCard isHot={event.isHot === true} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id) => handleRsvp(id)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
+                          <LazyEventCard isHot={event.isHot === true} readOnly={isGuestSharedView} event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: reminderIds.includes(String(getEventId(event))) }} viewerProfile={profile} onView={recordEventView} onComing={(id, position, eventData) => handleRsvp(id, position, eventData)} onRemind={(id) => setReminderTarget(String(id))} onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }} />
                         </div>
                         {(fullEvents.length === 1 || (index + 1) % 3 === 0) && <AdSlot placement="category-full-feed" onHouseAction={() => notify('Sponsored links will be available when ad partners are configured.', 'info')} />}
                       </Fragment>)}{(visibleFullFeedCount < fullEvents.length || eventFeedHasMore) && <button type="button" className="feed-load-more" disabled={eventFeedPageLoading} onClick={() => {
@@ -3374,7 +3512,7 @@ function FutaPulseApp() {
                             event={{ ...event, startTime: getStartTime(event), isGoing: true, isReminded: false }}
                             viewerProfile={profile}
                             onView={recordEventView}
-                            onComing={(id) => handleRsvp(id)}
+                            onComing={(id, position, eventData) => handleRsvp(id, position, eventData)}
                             onRemind={(id) => setReminderTarget(String(id))}
                             onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }}
                           />
@@ -3400,7 +3538,7 @@ function FutaPulseApp() {
                             event={{ ...event, startTime: getStartTime(event), isGoing: Boolean(event.isGoing ?? goingIds.includes(String(getEventId(event)))), isReminded: true }}
                             viewerProfile={profile}
                             onView={recordEventView}
-                            onComing={(id) => handleRsvp(id)}
+                            onComing={(id, position, eventData) => handleRsvp(id, position, eventData)}
                             onRemind={(id) => setReminderTarget(String(id))}
                             onReport={() => { setReportTarget(event); setReportReason('inappropriate'); setReportDetails('') }}
                           />
@@ -3538,6 +3676,15 @@ function FutaPulseApp() {
                             <p className="profile-recap-unavailable" role="status">Look-back photo uploads are temporarily unavailable. {recapUploadMissingVariables.length ? `Check these Render variables: ${recapUploadMissingVariables.join(', ')}.` : 'Check the Cloudinary configuration in Render and redeploy the server.'}</p>
                           )}
                           {ownerEvent && <div className={`profile-event-actions ${canUploadRecap && recapWindowOpen ? 'profile-ended-actions' : ''}`}>
+                            {organizerTab === 'events' && event.requiresCustomRegistration === true && (
+                              <button
+                                type="button"
+                                className="btn-item-edit profile-registration-view"
+                                onClick={() => openOrganizerRegistrations(event)}
+                              >
+                                View Registrations ({Number(event.registrationCount) || 0})
+                              </button>
+                            )}
                             {isDraft && <>
                               <button type="button" className="btn-item-edit" onClick={() => { setEventDuplicateState({ code: '', matches: [] }); setEventEditor(event) }}>Edit</button>
                               <button type="button" className="btn-item-delete" onClick={() => setEventDeleteTarget(event)} aria-label={`Delete draft ${event.title}`}><Trash2 size={17} /><span>Delete</span></button>
@@ -3750,12 +3897,31 @@ function FutaPulseApp() {
               viewerProfile={profile}
               readOnly={isGuestSharedView}
               onView={recordEventView}
-              onComing={(id) => handleRsvp(id)}
+              onComing={(id, position, eventData) => handleRsvp(id, position, eventData)}
               onRemind={(id) => setReminderTarget(String(id))}
               onReport={() => { setReportTarget(detailEvent); setReportReason('inappropriate'); setReportDetails('') }}
             />
           </section>
         </div>
+      )}
+
+      {customRegistrationTarget && (
+        <CustomRegistrationModal
+          event={customRegistrationTarget}
+          onClose={closeCustomRegistration}
+          onSubmit={handleCustomRegistration}
+        />
+      )}
+
+      {organizerRegistrationTarget && (
+        <OrganizerRegistrationsModal
+          event={organizerRegistrationTarget}
+          registrations={organizerRegistrations}
+          loading={organizerRegistrationsLoading}
+          error={organizerRegistrationsError}
+          onRetry={() => { void loadOrganizerRegistrations(organizerRegistrationTarget) }}
+          onClose={closeOrganizerRegistrations}
+        />
       )}
 
       {profileMenuOpen && (

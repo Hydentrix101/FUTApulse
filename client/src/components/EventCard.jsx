@@ -112,6 +112,8 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
   const reminderNudgeTimer = useRef(null)
   const isReminded = Boolean(event.isReminded || event.reminded)
   const isComing = Boolean(event.isGoing ?? event.hasHyped)
+  const isCustomRegistered = event.requiresCustomRegistration === true
+    && Boolean(event.isRegistered ?? isComing)
   const [unavailableBannerSource, setUnavailableBannerSource] = useState('')
   const [organizerFallback, setOrganizerFallback] = useState({ source: '', stage: 0 })
 
@@ -287,7 +289,7 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
       setShowReminderNudge(false)
     }
     const rect = clickEvent.currentTarget.getBoundingClientRect()
-    onComing?.(eventId, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 })
+    onComing?.(eventId, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }, event)
   }
 
   const handleRemind = () => {
@@ -468,10 +470,14 @@ function EventCard({ event, onComing, onRemind, onReport, onView, viewerProfile,
               }`}
               onClick={handleComing}
               aria-pressed={isComing}
-              aria-label={isComing ? `You are coming to ${title}; click to undo` : `Mark that you are coming to ${title}`}
+              aria-label={event.requiresCustomRegistration
+                ? isCustomRegistered ? `You are registered for ${title}` : `Complete registration for ${title}`
+                : isComing ? `You are coming to ${title}; click to undo` : `Mark that you are coming to ${title}`}
             >
               <Flame size={17} aria-hidden="true" />
-              <span>{isComing ? 'Coming!' : 'Coming?'}</span>
+              <span>{event.requiresCustomRegistration
+                ? isCustomRegistered ? 'Registered' : isComing ? 'Complete form' : 'Register'
+                : isComing ? 'Coming!' : 'Coming?'}</span>
             </button>
             <button
               type="button"

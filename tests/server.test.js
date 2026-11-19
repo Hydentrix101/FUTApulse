@@ -913,6 +913,23 @@ test("custom event registration validates event forms, records attendee answers,
     });
     assert.equal(publishResponse.status, 200);
 
+    const databaseWithLegacyRsvp = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+    const publishedRegistrationEvent = databaseWithLegacyRsvp.events.find((event) => event.id === createdEvent.id);
+    publishedRegistrationEvent.attendeeUserIds = [attendee.user.id];
+    publishedRegistrationEvent.rsvpCount = 1;
+    publishedRegistrationEvent.turnoutCount = 1;
+    fs.writeFileSync(dataFile, JSON.stringify(databaseWithLegacyRsvp, null, 2));
+
+    const beforeRegistrationFeed = await fetch(`${baseUrl}/api/events`, { headers: attendeeHeaders });
+    const beforeRegistrationEvent = (await beforeRegistrationFeed.json()).events
+      .find((event) => event.id === createdEvent.id);
+    assert.equal(beforeRegistrationEvent.isRegistered, false);
+    assert.equal(beforeRegistrationEvent.isGoing, true);
+    assert.equal(beforeRegistrationEvent.registrationCount, undefined, "attendees must not receive the organizer-only registration count");
+    const organizerEventFeed = await fetch(`${baseUrl}/api/events`, { headers: organizerHeaders });
+    const organizerEvent = (await organizerEventFeed.json()).events.find((event) => event.id === createdEvent.id);
+    assert.equal(organizerEvent.registrationCount, 0);
+
     const registrationUrl = `${baseUrl}/api/events/${createdEvent.id}/register`;
     const missingAnswer = await fetch(registrationUrl, {
       method: "POST",
@@ -943,6 +960,7 @@ test("custom event registration validates event forms, records attendee answers,
     assert.equal(registrationResponse.status, 201);
     const registrationBody = await registrationResponse.json();
     assert.equal(registrationBody.event.rsvpCount, 1);
+    assert.equal(registrationBody.event.isRegistered, true);
     assert.deepEqual(registrationBody.registration.answers, [
       { fieldId: "department", label: "Department", answer: "EEE" },
       { fieldId: "level", label: "Level", answer: "300" },
@@ -984,6 +1002,8 @@ test("custom event registration validates event forms, records attendee answers,
     assert.equal(organizerReadBody.registrations.length, 1);
     assert.equal(organizerReadBody.registrations[0].user.username, attendee.user.username);
     assert.equal(organizerReadBody.registrations[0].user.email, undefined);
+    const updatedOrganizerFeed = await fetch(`${baseUrl}/api/events`, { headers: organizerHeaders });
+    assert.equal((await updatedOrganizerFeed.json()).events.find((event) => event.id === createdEvent.id).registrationCount, 1);
   } finally {
     fs.writeFileSync(dataFile, originalDatabase);
   }

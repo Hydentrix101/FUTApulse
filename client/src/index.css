@@ -3485,6 +3485,438 @@ button {
   cursor: pointer;
 }
 
+.custom-registration-backdrop {
+  position: fixed;
+  z-index: 2400;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+  background: rgba(2, 6, 23, 0.78);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+
+.custom-registration-modal {
+  position: relative;
+  box-sizing: border-box;
+  width: min(100%, 520px);
+  max-height: 90dvh;
+  padding: 28px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 22px;
+  color: #f8fafc;
+  background: linear-gradient(155deg, #17243b, #0f172a);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+}
+
+.custom-registration-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 50%;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.7);
+  cursor: pointer;
+}
+
+.custom-registration-eyebrow {
+  color: #93c5fd;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+}
+
+.custom-registration-modal h2 {
+  margin: 8px 42px 0 0;
+  color: #fff;
+  font-size: 1.35rem;
+  font-weight: 850;
+  line-height: 1.25;
+}
+
+.custom-registration-description {
+  margin: 8px 0 20px;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.custom-registration-form {
+  display: grid;
+  gap: 16px;
+}
+
+.custom-registration-field {
+  display: grid;
+  gap: 7px;
+  color: #e2e8f0;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.custom-registration-field strong { color: #fca5a5; }
+
+.custom-registration-field input,
+.custom-registration-field select {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 46px;
+  padding: 10px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  border-radius: 11px;
+  outline: none;
+  color: #f8fafc;
+  background: rgba(15, 23, 42, 0.8);
+}
+
+.custom-registration-field input:focus,
+.custom-registration-field select:focus {
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+}
+
+.custom-registration-field select option { color: #0f172a; }
+
+.custom-registration-error {
+  margin: 0;
+  padding: 11px 12px;
+  border: 1px solid rgba(248, 113, 113, 0.42);
+  border-radius: 10px;
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.25);
+  font-size: 0.84rem;
+}
+
+.custom-registration-submit,
+.custom-registration-cancel {
+  display: inline-flex;
+  min-height: 46px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.custom-registration-submit {
+  margin-top: 2px;
+  color: #fff;
+  background: linear-gradient(120deg, #2563eb, #7c3aed);
+}
+
+.custom-registration-cancel {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  color: #cbd5e1;
+  background: transparent;
+}
+
+.custom-registration-submit:disabled,
+.custom-registration-cancel:disabled,
+.custom-registration-close:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
+.custom-registration-spinner { animation: custom-registration-spin 0.9s linear infinite; }
+
+@keyframes custom-registration-spin {
+  to { transform: rotate(360deg); }
+}
+
+body.registration-modal-open { overflow: hidden; }
+
+.futa-app.theme-light .custom-registration-modal {
+  border-color: rgba(148, 163, 184, 0.45);
+  color: #0f172a;
+  background: linear-gradient(155deg, #fff, #eff6ff);
+}
+
+.futa-app.theme-light .custom-registration-modal h2 { color: #0f172a; }
+.futa-app.theme-light .custom-registration-description,
+.futa-app.theme-light .custom-registration-field { color: #334155; }
+.futa-app.theme-light .custom-registration-field input,
+.futa-app.theme-light .custom-registration-field select {
+  border-color: #cbd5e1;
+  color: #0f172a;
+  background: #fff;
+}
+.futa-app.theme-light .custom-registration-cancel { color: #334155; }
+
+@media (max-width: 520px) {
+  .custom-registration-backdrop {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+
+  .custom-registration-modal {
+    padding: 24px 18px;
+    border-radius: 18px;
+  }
+}
+
+.organizer-registrations-backdrop {
+  position: fixed;
+  z-index: 2450;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+  background: rgba(2, 6, 23, 0.8);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+
+.organizer-registrations-modal {
+  position: relative;
+  display: grid;
+  box-sizing: border-box;
+  width: min(100%, 720px);
+  max-height: 90dvh;
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 26px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  border-radius: 22px;
+  color: #f8fafc;
+  background: linear-gradient(155deg, #17243b, #0f172a);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.48);
+}
+
+.organizer-registrations-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 50%;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.72);
+  cursor: pointer;
+}
+
+.organizer-registrations-eyebrow {
+  color: #93c5fd;
+  font-size: 0.66rem;
+  font-weight: 850;
+  letter-spacing: 0.14em;
+}
+
+.organizer-registrations-modal h2 {
+  margin: 0;
+  color: #fff;
+  font-size: 1.35rem;
+  font-weight: 900;
+}
+
+.organizer-registrations-event-title {
+  margin: -6px 45px 2px 0;
+  overflow: hidden;
+  color: #cbd5e1;
+  font-size: 0.83rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.organizer-registrations-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+  color: #cbd5e1;
+  font-size: 0.78rem;
+  font-weight: 750;
+}
+
+.organizer-registrations-export,
+.organizer-registrations-retry {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  border-radius: 11px;
+  color: #dbeafe;
+  background: rgba(37, 99, 235, 0.2);
+  font-size: 0.75rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.organizer-registrations-export:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.organizer-registrations-list {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 4px 2px 0;
+}
+
+.organizer-registration-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 15px;
+  background: rgba(15, 23, 42, 0.62);
+}
+
+.organizer-registration-attendee {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.organizer-registration-attendee > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.organizer-registration-attendee strong {
+  overflow-wrap: anywhere;
+  color: #f8fafc;
+  font-size: 0.88rem;
+}
+
+.organizer-registration-attendee span,
+.organizer-registration-attendee time {
+  color: #aebdd0;
+  font-size: 0.68rem;
+}
+
+.organizer-registration-attendee time {
+  flex: 0 0 auto;
+  text-align: right;
+}
+
+.organizer-registration-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.organizer-registration-badges span {
+  padding: 4px 8px;
+  border: 1px solid rgba(96, 165, 250, 0.25);
+  border-radius: 999px;
+  color: #bfdbfe;
+  background: rgba(30, 64, 175, 0.18);
+  font-size: 0.64rem;
+  font-weight: 800;
+}
+
+.organizer-registration-answers {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+}
+
+.organizer-registration-answers > div {
+  display: grid;
+  grid-template-columns: minmax(100px, 0.7fr) minmax(0, 1.3fr);
+  gap: 8px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+  font-size: 0.75rem;
+}
+
+.organizer-registration-answers dt { color: #aebdd0; }
+.organizer-registration-answers dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #f1f5f9;
+  white-space: pre-wrap;
+}
+
+.organizer-registration-empty,
+.organizer-registrations-empty,
+.organizer-registrations-loading,
+.organizer-registrations-error {
+  margin: 0;
+  padding: 24px 12px;
+  color: #cbd5e1;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.organizer-registrations-error {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+}
+
+.organizer-registrations-error p { margin: 0; color: #fecaca; }
+
+.organizer-registrations-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+}
+
+.organizer-registrations-spinner { animation: custom-registration-spin 0.9s linear infinite; }
+
+.futa-app.theme-light .organizer-registrations-modal {
+  border-color: rgba(148, 163, 184, 0.5);
+  color: #0f172a;
+  background: linear-gradient(155deg, #fff, #eff6ff);
+}
+
+.futa-app.theme-light .organizer-registrations-modal h2,
+.futa-app.theme-light .organizer-registration-attendee strong,
+.futa-app.theme-light .organizer-registration-answers dd { color: #0f172a; }
+
+.futa-app.theme-light .organizer-registrations-event-title,
+.futa-app.theme-light .organizer-registrations-toolbar,
+.futa-app.theme-light .organizer-registration-attendee span,
+.futa-app.theme-light .organizer-registration-attendee time,
+.futa-app.theme-light .organizer-registration-answers dt { color: #475569; }
+
+.futa-app.theme-light .organizer-registration-card { background: rgba(248, 250, 252, 0.9); }
+.futa-app.theme-light .organizer-registration-badges span { color: #1d4ed8; background: #eff6ff; }
+.futa-app.theme-light .organizer-registrations-export,
+.futa-app.theme-light .organizer-registrations-retry { color: #1d4ed8; background: #eff6ff; }
+.futa-app.theme-light .organizer-registrations-empty,
+.futa-app.theme-light .organizer-registrations-loading { color: #475569; }
+
+.profile-event-actions .profile-registration-view { grid-column: 1 / -1; }
+
+@media (max-width: 560px) {
+  .organizer-registrations-backdrop { padding-right: 10px; padding-left: 10px; }
+  .organizer-registrations-modal { max-height: 90dvh; padding: 22px 16px 16px; }
+  .organizer-registration-attendee { flex-direction: column; gap: 4px; }
+  .organizer-registration-attendee time { text-align: left; }
+  .organizer-registration-answers > div { grid-template-columns: minmax(80px, 0.65fr) minmax(0, 1.35fr); }
+}
+
 .event-detail-backdrop {
   position: fixed;
   z-index: 1500;
